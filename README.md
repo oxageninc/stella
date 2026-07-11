@@ -1,6 +1,12 @@
-# Stella
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/stella-logo-dark-transparent.svg">
+    <source media="(prefers-color-scheme: light)" srcset="assets/stella-logo-light.svg">
+    <img src="assets/stella-logo-light.svg" alt="Stella" width="420">
+  </picture>
+</p>
 
-A fast, BYOK, model-agnostic terminal coding agent built in Rust.
+<p align="center"><strong>A fast, BYOK, model-agnostic terminal coding agent built in Rust.</strong></p>
 
 ## Set your API key
 
