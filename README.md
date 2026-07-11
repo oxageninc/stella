@@ -8,6 +8,30 @@
 
 <p align="center"><strong>A fast, BYOK, model-agnostic terminal coding agent built in Rust.</strong></p>
 
+# Stella
+
+A fast, BYOK, model-agnostic terminal coding agent built in Rust, from the makers of [Oxagen](https://docs.oxagen.sh).
+
+**Website:** [docs.oxagen.sh/stella](https://docs.oxagen.sh/stella) · **Docs:** [Getting started](https://docs.oxagen.sh/docs/stella) / [Installation](https://docs.oxagen.sh/docs/stella/installation) / [Quickstart](https://docs.oxagen.sh/docs/stella/quickstart) / [Commands](https://docs.oxagen.sh/docs/stella/commands) / [Models](https://docs.oxagen.sh/docs/stella/models) · **License:** MIT OR Apache-2.0
+
+## Install
+
+Requires Rust 1.90+ (via [rustup](https://rustup.rs)) and git. Prebuilt binaries, Homebrew, and a curl|sh installer are on the roadmap (Phase 7); today Stella installs with cargo:
+
+```bash
+cargo install --locked --git https://github.com/oxageninc/stella-cli stella-cli
+stella --version
+```
+
+Or build from source:
+
+```bash
+git clone https://github.com/oxageninc/stella-cli.git
+cd stella-cli
+cargo build --release
+./target/release/stella --version
+```
+
 ## Set your API key
 
 Stella is bring-your-own-key. Set one or more of these environment variables:
@@ -186,7 +210,6 @@ Key design principles (from docs/specs/oxagen-rust-cli/):
 ## Development
 
 ```bash
-cd crates
 cargo build --workspace
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
