@@ -1617,6 +1617,15 @@ mod tests {
             // `description:` is trimmed on parse, so an all-whitespace one
             // would fail to load — skip those (never produced by mining).
             proptest::prop_assume!(!description.trim().is_empty());
+            // `parse_domains` intentionally dedups case-insensitively (matching
+            // `union_domains`), so a round-trip only preserves duplicate-free
+            // lists — normalize the input to that real-world invariant.
+            let mut seen = std::collections::HashSet::new();
+            let domains: Vec<String> = domains
+                .iter()
+                .filter(|d| seen.insert(d.to_ascii_lowercase()))
+                .cloned()
+                .collect();
 
             let candidate = SkillCandidate {
                 name: name.clone(),
