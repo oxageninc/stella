@@ -1168,25 +1168,28 @@ mod tests {
             model_id,
             api_key: ApiKey::new("dummy-key-unused-offline"),
             workspace_root: std::path::PathBuf::from("/tmp"),
+            base_url_override: None,
         }
     }
 
     #[test]
     fn existing_providers_still_route_to_their_current_adapter() {
-        // Regression: switching the catalog check to resolve_for, the
-        // (provider, id) dedup, and the inserted vertex/bedrock arms must NOT
-        // change selection for any provider that worked before. OpenAI keeps
-        // its Responses-API adapter ahead of the openai_compatible flag;
-        // every OpenAI-compatible provider still routes to the shared
-        // ZaiProvider shim (id "zai"); Anthropic keeps the Messages adapter.
+        // Regression: switching the catalog check to resolve_for and the
+        // (provider, id) dedup must NOT change selection for any provider that
+        // worked before. OpenAI keeps its Responses-API adapter and Anthropic
+        // its Messages adapter; Gemini now has its own native adapter. The
+        // remaining OpenAI-compatible providers share the Chat Completions
+        // implementation but are re-identified per provider via
+        // `with_identity`, so each reports its own id (not the bare "zai"
+        // shim id) for telemetry/attribution.
         for (provider_id, expected_adapter) in [
             ("openai", "openai"),
             ("anthropic", "anthropic"),
             ("zai", "zai"),
-            ("xai", "zai"),
-            ("deepseek", "zai"),
-            ("gemini", "zai"),
-            ("openrouter", "zai"),
+            ("xai", "xai"),
+            ("deepseek", "deepseek"),
+            ("gemini", "gemini"),
+            ("openrouter", "openrouter"),
         ] {
             let provider = build_provider(&cfg_for(provider_id))
                 .unwrap_or_else(|e| panic!("build_provider({provider_id}) failed: {e}"));

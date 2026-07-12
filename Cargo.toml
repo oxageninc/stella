@@ -17,13 +17,6 @@ members = [
   "stella-fleet",
   "stella-tui",
   "stella-cli",
-  "stella-context",
-  "stella-graph",
-  "stella-pipeline",
-  "stella-mcp",
-  "stella-media",
-  "stella-fleet",
-  "stella-tui",
 ]
 
 [workspace.package]
@@ -52,6 +45,7 @@ toml = "0.9"
 rpassword = "7"
 base64 = "0.22"
 crossterm = "0.28"
+hmac = "0.12"
 notify = "8"
 ratatui = "0.29"
 roxmltree = "0.20"
