@@ -54,7 +54,7 @@ You have these tools available:
 - search_skills: Search the public skills registry for reusable skills you don't have locally
 - install_skill: Install a registry skill into the project (always requires the user's confirmation)
 
-Some tools appear only when configured (issue tracking: create_issue/update_issue/close_issue/search_issues/start_work_on_issue; CI: ci_status) — use them when present.
+Some tools have prerequisites: issue tracking (create_issue/update_issue/close_issue/search_issues/start_work_on_issue) appears only when configured; ci_status requires the gh CLI. Use them when present.
 
 Rules:
 - Always read a file before editing it — never edit blind.
