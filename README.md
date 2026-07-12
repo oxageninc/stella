@@ -16,7 +16,25 @@ A fast, BYOK, model-agnostic terminal coding agent built in Rust, from the maker
 
 ## Install
 
-Requires Rust 1.90+ (via [rustup](https://rustup.rs)) and git. Prebuilt binaries, Homebrew, and a curl|sh installer are on the roadmap (Phase 7); today Stella installs with cargo:
+The fastest way — downloads a prebuilt binary for your platform, verifies its
+checksum, and adds `stella` to your PATH:
+
+```bash
+curl -fsSL https://oxagen.sh/install | sh
+stella --version
+```
+
+The installer takes options via env vars or `sh -s --`:
+
+```bash
+# Pin a version, or change the install dir
+curl -fsSL https://oxagen.sh/install | sh -s -- --version v0.1.0
+curl -fsSL https://oxagen.sh/install | STELLA_INSTALL_DIR=/usr/local/bin sh
+```
+
+It falls back to a source build when no prebuilt binary exists for your
+platform. To install with cargo instead (requires Rust 1.90+ via
+[rustup](https://rustup.rs) and git):
 
 ```bash
 cargo install --locked --git https://github.com/oxageninc/stella-cli stella-cli
@@ -233,4 +251,5 @@ MIT OR Apache-2.0
 - Phase 5: Fleet, TUI polish, media generation (vision-grade judge
   evidence: screenshots attached to judge calls)
 - Phase 6: Benchmark proof (SWE-bench Verified)
-- Phase 7: OSS release (cargo-dist, Homebrew, curl|sh)
+- Phase 7: OSS release — curl|sh installer (`install.sh`) + tagged release
+  workflow shipping prebuilt binaries (done); Homebrew tap and cargo-dist next
