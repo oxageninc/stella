@@ -124,6 +124,36 @@ pub static PROVIDERS: &[ProviderConfig] = &[
         // by the adapter.
         base_url: "https://bedrock-runtime.<AWS_REGION>.amazonaws.com",
     },
+    // Vertex and Bedrock are appended LAST so auto-detection (the no-`--model`
+    // path picks the first provider with a resolvable credential) never
+    // prefers them over an explicitly-configured provider — AWS_ACCESS_KEY_ID
+    // in particular is commonly present in a shell for unrelated reasons.
+    // Both speak a native, non-OpenAI wire shape, so `build_provider`
+    // (agent.rs) routes them to their own adapters rather than the generic
+    // Chat Completions client.
+    ProviderConfig {
+        id: "vertex",
+        env_var: "VERTEX_ACCESS_TOKEN",
+        env_var_aliases: &[],
+        display_name: "Google Vertex AI",
+        default_model: "gemini-3-pro",
+        // Native generateContent, project/location-scoped. The VertexProvider
+        // adapter builds its own addressing from VERTEX_PROJECT_ID /
+        // VERTEX_LOCATION, so this base_url is shown in `stella models` for
+        // reference only — build_provider does not pass it to the adapter.
+        base_url: "https://aiplatform.googleapis.com",
+    },
+    ProviderConfig {
+        id: "bedrock",
+        env_var: "AWS_ACCESS_KEY_ID",
+        env_var_aliases: &[],
+        display_name: "Amazon Bedrock",
+        default_model: "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+        // Region-templated at request time by the BedrockProvider adapter
+        // (bedrock-runtime.<AWS_REGION>.amazonaws.com); shown here for
+        // reference only.
+        base_url: "https://bedrock-runtime.us-east-1.amazonaws.com",
+    },
 ];
 
 /// The `local` pseudo-provider: any OpenAI-compatible endpoint the user
@@ -500,6 +530,52 @@ fn resolve_provider_key(
         }
         Err(other) => Err(other),
     }
+}
+
+/// A provider whose BYOK credential currently resolves, paired with the
+/// resolved key. Produced by [`discover_configured_providers`] and consumed
+/// by the goal loop's role Router: the `config` supplies the id/family/model
+/// for a `stella_core::router::ProviderProfile`, the `api_key` builds the
+/// concrete judge adapter when this provider is routed as judge. `api_key`
+/// is an [`ApiKey`] (H3) so the derived `Debug` never leaks the secret.
+#[derive(Debug, Clone)]
+pub struct ConfiguredProvider {
+    pub config: ProviderConfig,
+    pub api_key: ApiKey,
+}
+
+/// Enumerate every provider in [`PROVIDERS`] whose credential currently
+/// resolves, in preference order, pairing each with its resolved key. Uses
+/// the SAME credential chain [`Config::load`] uses ([`resolve_provider_key`],
+/// non-interactively — env var / alias / credentials file, never a prompt),
+/// so a provider is "configured" here iff `Config` could have auto-selected
+/// it. Never fails: an unreadable credentials file degrades to whatever the
+/// environment alone provides.
+///
+/// The goal loop calls this to build a role Router that can pick a
+/// cross-family JUDGE (`07-model-matrix.md` §1); with one configured family
+/// it returns a single entry and the judge stays the worker provider.
+pub fn discover_configured_providers() -> Vec<ConfiguredProvider> {
+    // A corrupt/unreadable credentials file must not break judge routing —
+    // degrade to env-only discovery via an empty in-memory file (an empty
+    // path reads as "no file"). If even that fails, discover nothing: the
+    // goal loop then simply keeps the worker as judge.
+    let Ok(credentials_file) = CredentialsFile::load_default()
+        .or_else(|_| CredentialsFile::load(std::path::PathBuf::new()))
+    else {
+        return Vec::new();
+    };
+    PROVIDERS
+        .iter()
+        .filter_map(|provider| {
+            resolve_provider_key(provider, None, &credentials_file, false)
+                .ok()
+                .map(|(api_key, _source)| ConfiguredProvider {
+                    config: provider.clone(),
+                    api_key,
+                })
+        })
+        .collect()
 }
 
 #[cfg(test)]
