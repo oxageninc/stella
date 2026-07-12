@@ -619,8 +619,12 @@ fn spawn_renderer(
 /// reusing `ZaiProvider` for OpenAI was wrong even though it happened to
 /// work.
 fn build_provider(cfg: &Config) -> Result<Box<dyn Provider>, String> {
+    // Provider-scoped catalog check: the same slug genuinely exists on more
+    // than one provider (gemini-3-pro on both `gemini` and `vertex`), so a
+    // slug that resolves globally must still be a hard error when requested
+    // from the wrong provider.
     stella_model::catalog::Catalog::seed()
-        .resolve(&cfg.model_id)
+        .resolve_for(cfg.provider.id, &cfg.model_id)
         .map_err(|e| e.to_string())?;
 
     let api_key = cfg.api_key.clone();
@@ -628,6 +632,56 @@ fn build_provider(cfg: &Config) -> Result<Box<dyn Provider>, String> {
     if cfg.provider.id == "openai" {
         let provider = stella_model::openai::OpenAiProvider::new(api_key, cfg.model_id.clone())
             .with_base_url(cfg.provider.base_url.to_string());
+        Ok(Box::new(provider))
+    } else if cfg.provider.id == "vertex" {
+        // The access token is cfg.api_key (VERTEX_ACCESS_TOKEN via the
+        // credential chain); project and location are Vertex-specific
+        // addressing, resolved here with named errors rather than burying a
+        // doomed request. The adapter builds its own URL from these, so the
+        // provider's static base_url is not passed through.
+        let project = std::env::var("VERTEX_PROJECT_ID")
+            .or_else(|_| std::env::var("GOOGLE_CLOUD_PROJECT"))
+            .ok()
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| {
+                "Vertex AI needs a project id — set VERTEX_PROJECT_ID (or \
+                 GOOGLE_CLOUD_PROJECT)"
+                    .to_string()
+            })?;
+        let location = std::env::var("VERTEX_LOCATION")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| "global".to_string());
+        let provider =
+            stella_model::vertex::VertexProvider::new(api_key, cfg.model_id.clone(), project, location);
+        Ok(Box::new(provider))
+    } else if cfg.provider.id == "bedrock" {
+        // cfg.api_key is AWS_ACCESS_KEY_ID via the credential chain; the rest
+        // of the standard AWS env set is read here. Secret resolution failure
+        // is a named error pointing at the exact var, not a doomed unsigned
+        // request. The adapter builds the region-scoped URL itself.
+        let secret = std::env::var("AWS_SECRET_ACCESS_KEY")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| {
+                "Bedrock needs AWS_SECRET_ACCESS_KEY alongside AWS_ACCESS_KEY_ID".to_string()
+            })?;
+        let session_token = std::env::var("AWS_SESSION_TOKEN")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .map(stella_model::credential::ApiKey::new);
+        let region = std::env::var("AWS_REGION")
+            .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
+            .ok()
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| "us-east-1".to_string());
+        let provider = stella_model::bedrock::BedrockProvider::new(
+            api_key,
+            stella_model::credential::ApiKey::new(secret),
+            session_token,
+            region,
+            cfg.model_id.clone(),
+        );
         Ok(Box::new(provider))
     } else if cfg.provider.openai_compatible {
         // Z.ai, xAI, DeepSeek, Gemini (OpenAI-compat shim), OpenRouter all
