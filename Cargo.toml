@@ -17,6 +17,13 @@ members = [
   "stella-fleet",
   "stella-tui",
   "stella-cli",
+  "stella-context",
+  "stella-graph",
+  "stella-pipeline",
+  "stella-mcp",
+  "stella-media",
+  "stella-fleet",
+  "stella-tui",
 ]
 
 [workspace.package]
@@ -43,23 +50,19 @@ rand = "0.9"
 proptest = "1"
 toml = "0.9"
 rpassword = "7"
-hmac = "0.12"
-# Phase 3-5 additions (03-plan.md). Declared once here so the nine new
-# crates' manifests are pure `workspace = true` references and parallel
-# workstreams never race on this file or churn Cargo.lock mid-build.
+base64 = "0.22"
+crossterm = "0.28"
+notify = "8"
+ratatui = "0.29"
+roxmltree = "0.20"
 rusqlite = { version = "0.32", features = ["bundled"] }
 sha2 = "0.10"
-notify = "8"
-tree-sitter = "0.25"
-tree-sitter-rust = "0.23"
-tree-sitter-python = "0.23"
-tree-sitter-typescript = "0.23"
-tree-sitter-javascript = "0.23"
-ratatui = "0.29"
-crossterm = "0.28"
-roxmltree = "0.20"
-base64 = "0.22"
 tempfile = "3"
+tree-sitter = "0.25"
+tree-sitter-javascript = "0.23"
+tree-sitter-python = "0.23"
+tree-sitter-rust = "0.23"
+tree-sitter-typescript = "0.23"
 
 [profile.release]
 lto = true

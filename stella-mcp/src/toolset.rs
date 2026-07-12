@@ -227,6 +227,8 @@ impl ToolExecutor for McpToolSet {
                         name: namespaced,
                         description: tool.description.clone(),
                         input_schema: tool.input_schema.clone(),
+                        // External MCP tools are unknown — treat as mutating,
+                        // the safe direction (never auto-parallelized).
                         read_only: false,
                     });
                 }

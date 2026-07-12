@@ -376,6 +376,13 @@ impl SessionModel {
                     status: *status,
                 });
             }
+            // `StepUsage` is a metering/billing record consumed by
+            // `stella-store`; the HUD's live spend is driven by `BudgetTick`,
+            // so folding it here would double-count. `GoalVerdict`'s own
+            // `cost_usd` is likewise already accounted against the budget when
+            // it fires. Neither mutates TUI state today (a goal-verdict
+            // transcript row is a display enhancement, tracked as follow-up).
+            AgentEvent::StepUsage { .. } | AgentEvent::GoalVerdict { .. } => {}
             AgentEvent::Error { message, retryable } => {
                 self.pending_scope_review = None;
                 self.pending_ask_user = None;
@@ -395,19 +402,6 @@ impl SessionModel {
                     model: model.clone(),
                     cost_usd: *cost_usd,
                 });
-            }
-            // Per-step metering: the HUD already shows running spend via
-            // BudgetTick, and the DuckDB store captures full StepUsage
-            // telemetry — no separate transcript entry needed here.
-            AgentEvent::StepUsage { cost_usd, .. } => {
-                self.hud.final_cost_usd = Some(self.hud.final_cost_usd.unwrap_or(0.0) + *cost_usd);
-            }
-            // Goal-loop verdicts render on the cli goal surface; the
-            // ratatui REPL just notes progress in the HUD stage.
-            AgentEvent::GoalVerdict { met, .. } => {
-                if *met {
-                    self.hud.stage = Some(StageKind::Complete);
-                }
             }
         }
     }

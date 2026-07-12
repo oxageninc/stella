@@ -152,19 +152,6 @@ pub enum AgentEvent {
         upserts: u32,
         superseded: u32,
     },
-    /// A media generation job changed state (`08-multimodal.md`). Video
-    /// jobs are async and long-lived; this event is how the TUI shows
-    /// progress without polling shared state (L-T1).
-    MediaProgress {
-        artifact_id: String,
-        kind: MediaKind,
-        state: MediaJobState,
-    },
-    /// A media artifact landed under `.stella/artifacts/` with a manifest
-    /// row.
-    MediaComplete {
-        artifact: MediaArtifactRef,
-    },
     /// A verification verdict — from the deterministic ladder (flip oracle,
     /// touched-tests-green) or the model judge (L-E11: deterministic-first;
     /// model judges handle only inconclusive evidence).
@@ -192,6 +179,19 @@ pub enum AgentEvent {
         id: String,
         question: String,
         options: Vec<String>,
+    },
+    /// A media generation job changed state (`08-multimodal.md`). Video
+    /// jobs are async and long-lived; this event is how the TUI shows
+    /// progress without polling shared state (L-T1).
+    MediaProgress {
+        artifact_id: String,
+        kind: MediaKind,
+        state: MediaJobState,
+    },
+    /// A media artifact landed under `.stella/artifacts/` with a manifest
+    /// row.
+    MediaComplete {
+        artifact: MediaArtifactRef,
     },
     /// A commit landed (fleet ledger / pipeline execute stage).
     Commit {
@@ -244,6 +244,31 @@ pub struct ProviderShare {
     pub frames: u32,
 }
 
+/// Evidence backing a `JudgeVerdict`. `deterministic` distinguishes the
+/// flip-oracle/tests ladder from a model judge's opinion — the two are
+/// never conflated (L-E11).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JudgeEvidence {
+    pub summary: String,
+    /// `true` when the verdict came from the deterministic ladder (a
+    /// fail→pass flip of the same normalized test command, touched-tests
+    /// green, diff budget) rather than a model judge.
+    pub deterministic: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_refs: Vec<String>,
+}
+
+/// What a `ScopeReview` gate presents for approval before a large plan
+/// executes (L-E5).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScopeProposal {
+    pub summary: String,
+    pub steps: Vec<String>,
+    pub estimated_files: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_cost_usd: Option<f64>,
+}
+
 /// Which kind of media artifact a job produces (`08-multimodal.md`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -275,31 +300,6 @@ pub struct MediaArtifactRef {
     pub path: String,
     /// Human label for citation/display.
     pub label: String,
-}
-
-/// Evidence backing a `JudgeVerdict`. `deterministic` distinguishes the
-/// flip-oracle/tests ladder from a model judge's opinion — the two are
-/// never conflated (L-E11).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct JudgeEvidence {
-    pub summary: String,
-    /// `true` when the verdict came from the deterministic ladder (a
-    /// fail→pass flip of the same normalized test command, touched-tests
-    /// green, diff budget) rather than a model judge.
-    pub deterministic: bool,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub evidence_refs: Vec<String>,
-}
-
-/// What a `ScopeReview` gate presents for approval before a large plan
-/// executes (L-E5).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ScopeProposal {
-    pub summary: String,
-    pub steps: Vec<String>,
-    pub estimated_files: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub estimated_cost_usd: Option<f64>,
 }
 
 /// A pull request's status as observed by the fleet monitor. Reconciled

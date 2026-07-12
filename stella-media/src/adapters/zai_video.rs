@@ -418,10 +418,10 @@ mod tests {
     }
 
     // Live smoke (L-V4): video actually spends, so it is gated on BOTH the key
-    // and an explicit STELLA_MEDIA_LIVE=1 opt-in; otherwise it no-ops.
+    // and an explicit OXAGEN_MEDIA_LIVE=1 opt-in; otherwise it no-ops.
     #[tokio::test]
     async fn live_smoke_submit_and_poll_once() {
-        if std::env::var("STELLA_MEDIA_LIVE").is_err() {
+        if std::env::var("OXAGEN_MEDIA_LIVE").is_err() {
             return;
         }
         let key = match ApiKey::from_env("ZAI_API_KEY") {

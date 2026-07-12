@@ -12,7 +12,7 @@
 //! Coverage is recorded-fixture-first (wiremock transcripts, including the
 //! failure shapes: auth 401, rate-limit 429, content-policy refusal, and a
 //! 404-gone video job), with one runtime-skipped **live smoke** per family
-//! that only fires when the provider key *and* `STELLA_MEDIA_LIVE=1` are
+//! that only fires when the provider key *and* `OXAGEN_MEDIA_LIVE=1` are
 //! present — so CI never calls a paid API, yet a keyed release run exercises
 //! the real wire (L-V4).
 

@@ -210,11 +210,6 @@ pub fn event_signature(event: &AgentEvent) -> String {
         // Budget ticks vary in magnitude every run; only their occurrence is
         // structural.
         AgentEvent::BudgetTick { mode, .. } => format!("budget_tick:{mode:?}"),
-        // Per-step metering: token counts and cost vary every run; the
-        // structural part is that a step committed with N tool calls.
-        AgentEvent::StepUsage { tool_calls, .. } => format!("step_usage:tool_calls={tool_calls}"),
-        // A goal verdict's structural identity is only whether it passed.
-        AgentEvent::GoalVerdict { met, .. } => format!("goal_verdict:met={met}"),
         AgentEvent::ProviderFallback { from, to, .. } => {
             format!("provider_fallback:{from}->{to}")
         }
@@ -235,6 +230,12 @@ pub fn event_signature(event: &AgentEvent) -> String {
         AgentEvent::AskUser { options, .. } => format!("ask_user:options={}", options.len()),
         AgentEvent::Commit { .. } => "commit".to_string(),
         AgentEvent::Pr { status, .. } => format!("pr:{status:?}"),
+        // Step usage is pure magnitude (tokens/cost/duration) — only its
+        // occurrence is structural, like a budget tick.
+        AgentEvent::StepUsage { .. } => "step_usage".to_string(),
+        // A goal verdict's structural identity is whether the goal was met
+        // (mirrors `judge_verdict`); the reasoning text and cost are volatile.
+        AgentEvent::GoalVerdict { met, .. } => format!("goal_verdict:met={met}"),
         AgentEvent::Error { retryable, .. } => format!("error:retryable={retryable}"),
         AgentEvent::Complete { .. } => "complete".to_string(),
     }

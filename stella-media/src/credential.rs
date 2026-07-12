@@ -82,11 +82,11 @@ mod tests {
 
     #[test]
     fn from_env_missing_var_is_not_found() {
-        let err = ApiKey::from_env("STELLA_MEDIA_TEST_DEFINITELY_UNSET_12345").unwrap_err();
+        let err = ApiKey::from_env("OXAGEN_MEDIA_TEST_DEFINITELY_UNSET_12345").unwrap_err();
         assert_eq!(
             err,
             CredentialError::NotFound {
-                env_var: "STELLA_MEDIA_TEST_DEFINITELY_UNSET_12345".into()
+                env_var: "OXAGEN_MEDIA_TEST_DEFINITELY_UNSET_12345".into()
             }
         );
     }
@@ -95,29 +95,29 @@ mod tests {
     fn from_env_present_var_resolves_and_reveals() {
         // SAFETY: test-only env mutation with a unique var name.
         unsafe {
-            std::env::set_var("STELLA_MEDIA_TEST_KEY", "sk-test-value");
+            std::env::set_var("OXAGEN_MEDIA_TEST_KEY", "sk-test-value");
         }
-        let key = ApiKey::from_env("STELLA_MEDIA_TEST_KEY").unwrap();
+        let key = ApiKey::from_env("OXAGEN_MEDIA_TEST_KEY").unwrap();
         assert_eq!(key.reveal(), "sk-test-value");
         unsafe {
-            std::env::remove_var("STELLA_MEDIA_TEST_KEY");
+            std::env::remove_var("OXAGEN_MEDIA_TEST_KEY");
         }
     }
 
     #[test]
     fn from_env_empty_var_is_reported_as_empty() {
         unsafe {
-            std::env::set_var("STELLA_MEDIA_TEST_EMPTY_KEY", "");
+            std::env::set_var("OXAGEN_MEDIA_TEST_EMPTY_KEY", "");
         }
-        let err = ApiKey::from_env("STELLA_MEDIA_TEST_EMPTY_KEY").unwrap_err();
+        let err = ApiKey::from_env("OXAGEN_MEDIA_TEST_EMPTY_KEY").unwrap_err();
         assert_eq!(
             err,
             CredentialError::Empty {
-                env_var: "STELLA_MEDIA_TEST_EMPTY_KEY".into()
+                env_var: "OXAGEN_MEDIA_TEST_EMPTY_KEY".into()
             }
         );
         unsafe {
-            std::env::remove_var("STELLA_MEDIA_TEST_EMPTY_KEY");
+            std::env::remove_var("OXAGEN_MEDIA_TEST_EMPTY_KEY");
         }
     }
 }
