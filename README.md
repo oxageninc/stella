@@ -16,14 +16,35 @@ A fast, BYOK, model-agnostic terminal coding agent built in Rust, from the maker
 
 ## Install
 
-Requires Rust 1.90+ (via [rustup](https://rustup.rs)) and git. Prebuilt binaries, Homebrew, and a curl|sh installer are on the roadmap (Phase 7); today Stella installs with cargo:
+### Homebrew (macOS / Linux)
+
+```bash
+brew install oxageninc/stella/stella
+# equivalently: brew tap oxageninc/stella && brew install stella
+stella --version
+```
+
+### Shell installer (macOS / Linux, no Homebrew)
+
+```bash
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/oxageninc/stella-cli/releases/latest/download/stella-cli-installer.sh | sh
+```
+
+Both install a prebuilt binary — no Rust toolchain needed. Prebuilt archives
+and checksums for each release are on the
+[Releases page](https://github.com/oxageninc/stella-cli/releases).
+
+### From source (cargo)
+
+Requires Rust 1.90+ (via [rustup](https://rustup.rs)) and git:
 
 ```bash
 cargo install --locked --git https://github.com/oxageninc/stella-cli stella-cli
 stella --version
 ```
 
-Or build from source:
+Or build the workspace directly:
 
 ```bash
 git clone https://github.com/oxageninc/stella-cli.git
@@ -31,6 +52,9 @@ cd stella-cli
 cargo build --release
 ./target/release/stella --version
 ```
+
+> Maintainers: the Homebrew formula and installer are produced automatically on
+> each version tag — see [RELEASING.md](RELEASING.md).
 
 ## Set your API key
 
@@ -233,4 +257,6 @@ MIT OR Apache-2.0
 - Phase 5: Fleet, TUI polish, media generation (vision-grade judge
   evidence: screenshots attached to judge calls)
 - Phase 6: Benchmark proof (SWE-bench Verified)
-- Phase 7: OSS release (cargo-dist, Homebrew, curl|sh)
+- Phase 7: OSS release — cargo-dist packaging with prebuilt binaries,
+  Homebrew, and a curl|sh installer (done — see
+  [RELEASING.md](RELEASING.md); flips on with the first `v*` tag)
