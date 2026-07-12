@@ -78,8 +78,9 @@ echo "Jobs dir: $JOBS_DIR"
 echo ""
 
 # Build Harbor args
+# Harbor expects custom agents as module.path:ClassName
 HARBOR_ARGS=(
-    --agent "$AGENT"
+    --agent stella_harbor:StellaAgent
     --dataset "$DATASET"
     -m "$MODEL_SLUG"
     --n-concurrent "$N_CONCURRENT"
