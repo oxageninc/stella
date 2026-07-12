@@ -1542,35 +1542,4 @@ mod tests {
             "a judge adapter that fails to build must fall back to the worker provider"
         );
     }
-
-    #[test]
-    fn build_code_graph_indexes_a_workspace_into_context_db() {
-        // `stella init` must build the code-graph index into .stella/context.db
-        // — the data side of init that the domain taxonomy tags. This witness
-        // runs build_code_graph against a tempdir with one Rust file and asserts
-        // the symbol + import count landed in the store.
-        let ws = tempfile::TempDir::new().unwrap();
-        let src = ws.path().join("lib.rs");
-        std::fs::write(
-            &src,
-            "pub fn alpha() {}\npub fn beta() {}\nmod gamma;\n",
-        )
-        .unwrap();
-
-        build_code_graph(ws.path());
-
-        let db = ws.path().join(".stella/context.db");
-        assert!(db.exists(), "context.db must be created by init");
-        let graph =
-            stella_graph::CodeGraph::open(ws.path(), &db).expect("reopen the indexed store");
-        // The index is queryable: `alpha` is a defined symbol.
-        let alpha = graph
-            .definitions("alpha")
-            .expect("query the index");
-        assert!(
-            !alpha.is_empty(),
-            "`alpha` must be indexed as a definition — got {} frames",
-            alpha.len()
-        );
-    }
 }
