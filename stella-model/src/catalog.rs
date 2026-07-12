@@ -1,5 +1,5 @@
 //! Model catalog. Binding rule from
-//! `docs/specs/oxagen-rust-cli/07-model-matrix.md` §3: **a slug not present
+//! `docs/specs/stella-rust-cli/07-model-matrix.md` §3: **a slug not present
 //! in the catalog is a hard, immediate, named error, never a silent
 //! fallback** (the TS-era phantom `glm-5.2-turbo` slug and gateway
 //! slug-drift lessons, L-M1/L-M2). The seed below covers every provider
