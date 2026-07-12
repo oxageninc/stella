@@ -13,6 +13,11 @@
 [advisories]
 # A yanked dependency is a warning, not a hard failure.
 yanked = "warn"
+# Benign advisories to tolerate (real vulnerabilities still fail the gate):
+# - RUSTSEC-2024-0436: `paste` is archived/unmaintained but has no known
+#   vulnerability — a compile-time macro helper pulled in transitively
+#   (ratatui et al.). Not a security issue, so it must not block CI.
+ignore = ["RUSTSEC-2024-0436"]
 
 [bans]
 # Multiple versions of the same crate is a warning, not a failure — the bundled
