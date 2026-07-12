@@ -124,35 +124,6 @@ pub static PROVIDERS: &[ProviderConfig] = &[
         // by the adapter.
         base_url: "https://bedrock-runtime.<AWS_REGION>.amazonaws.com",
     },
-    // Vertex and Bedrock are appended LAST so auto-detection (the no-`--model`
-    // path picks the first provider with a resolvable credential) never
-    // prefers them over an explicitly-configured provider — AWS_ACCESS_KEY_ID
-    // in particular is commonly present in a shell for unrelated reasons.
-    // Both speak a native, non-OpenAI wire shape, so `openai_compatible` is
-    // false and `build_provider` (agent.rs) routes them to their own adapters.
-    ProviderConfig {
-        id: "vertex",
-        env_var: "VERTEX_ACCESS_TOKEN",
-        display_name: "Google Vertex AI",
-        default_model: "gemini-3-pro",
-        // Native generateContent, project/location-scoped. The VertexProvider
-        // adapter builds its own addressing from VERTEX_PROJECT_ID /
-        // VERTEX_LOCATION, so this base_url is shown in `stella models` for
-        // reference only — build_provider does not pass it to the adapter.
-        base_url: "https://aiplatform.googleapis.com",
-        openai_compatible: false,
-    },
-    ProviderConfig {
-        id: "bedrock",
-        env_var: "AWS_ACCESS_KEY_ID",
-        display_name: "Amazon Bedrock",
-        default_model: "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
-        // Region-templated at request time by the BedrockProvider adapter
-        // (bedrock-runtime.<AWS_REGION>.amazonaws.com); shown here for
-        // reference only.
-        base_url: "https://bedrock-runtime.us-east-1.amazonaws.com",
-        openai_compatible: false,
-    },
 ];
 
 /// The `local` pseudo-provider: any OpenAI-compatible endpoint the user
@@ -235,7 +206,7 @@ impl Config {
                         })?;
                     return Self::resolve(
                         provider,
-                        model_id_override(model_spec),
+                        model_spec.to_string(),
                         api_key_override,
                         base_url_override,
                         &mut credentials_file,
@@ -295,10 +266,22 @@ impl Config {
             );
         }
 
+        // A bare `--api-key` with no `--model` is ambiguous: the key doesn't
+        // say which provider it belongs to, and threading it into detection
+        // would make the FIRST provider (zai) always "resolve" and get built
+        // with a key meant for someone else. Require an explicit provider.
+        if api_key_override.is_some() {
+            return Err("--api-key needs an explicit --model provider/model_id \
+                        (a bare key doesn't say which provider it is for), e.g. \
+                        stella --model anthropic/claude-fable-5 --api-key <key>"
+                .to_string());
+        }
+
         // No --model: pick the first provider with a resolvable credential
         // (env var/aliases or credentials file — never prompts here, since
         // prompting needs a specific provider in mind and the user hasn't
-        // named one).
+        // named one). `api_key_override` is `None` on this path (guarded
+        // above), so detection reflects only real ambient credentials.
         for provider in PROVIDERS {
             if resolve_provider_key(provider, api_key_override, &credentials_file, false).is_ok() {
                 return Self::resolve(
@@ -460,10 +443,6 @@ impl Config {
     }
 }
 
-fn model_id_override(slug: &str) -> String {
-    slug.to_string()
-}
-
 /// The provider-aware credential chain: CLI flag -> primary env var ->
 /// alias env vars -> credentials file -> interactive prompt. Wraps
 /// `ApiKey::resolve` (which owns everything except aliases) so alias env
@@ -532,7 +511,7 @@ mod tests {
     /// `stella_model::catalog::Catalog::seed()`, or `build_provider`'s
     /// catalog check (`agent.rs`) would hard-error on first use of a
     /// provider whose default was never added to the seed — exactly what
-    /// happened for 5 of these 7 rows before the catalog was completed.
+    /// happened for several of these rows before the catalog was completed.
     /// Uses the provider-scoped resolver, same as `build_provider`, so a
     /// default that only exists under a *different* provider's row still
     /// fails here.

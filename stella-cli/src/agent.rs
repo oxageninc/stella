@@ -1168,6 +1168,7 @@ mod tests {
             model_id,
             api_key: ApiKey::new("dummy-key-unused-offline"),
             workspace_root: std::path::PathBuf::from("/tmp"),
+            base_url_override: None,
         }
     }
 
@@ -1175,18 +1176,20 @@ mod tests {
     fn existing_providers_still_route_to_their_current_adapter() {
         // Regression: switching the catalog check to resolve_for, the
         // (provider, id) dedup, and the inserted vertex/bedrock arms must NOT
-        // change selection for any provider that worked before. OpenAI keeps
-        // its Responses-API adapter ahead of the openai_compatible flag;
-        // every OpenAI-compatible provider still routes to the shared
-        // ZaiProvider shim (id "zai"); Anthropic keeps the Messages adapter.
+        // change selection for any provider that worked before. `build_provider`
+        // dispatches on `cfg.provider.id`: OpenAI/Anthropic/Gemini each get
+        // their own native adapter, while the OpenAI-compatible gateways (xAI,
+        // DeepSeek, OpenRouter) share the ZaiProvider implementation but are
+        // re-identified via `with_identity`, so each adapter's `id()` is its own
+        // provider name — i.e. every provider reports itself.
         for (provider_id, expected_adapter) in [
             ("openai", "openai"),
             ("anthropic", "anthropic"),
             ("zai", "zai"),
-            ("xai", "zai"),
-            ("deepseek", "zai"),
-            ("gemini", "zai"),
-            ("openrouter", "zai"),
+            ("xai", "xai"),
+            ("deepseek", "deepseek"),
+            ("gemini", "gemini"),
+            ("openrouter", "openrouter"),
         ] {
             let provider = build_provider(&cfg_for(provider_id))
                 .unwrap_or_else(|e| panic!("build_provider({provider_id}) failed: {e}"));
@@ -1201,7 +1204,7 @@ mod tests {
     #[test]
     fn vertex_and_bedrock_route_to_their_native_adapters_not_a_fallthrough() {
         // The new providers must construct their own native adapter (not the
-        // openai_compatible shim, id "zai", nor the anthropic branch). Both
+        // shared ZaiProvider shim, id "zai", nor the anthropic branch). Both
         // arms read extra addressing/credentials from the environment; set
         // the minimum each requires. build_provider only constructs — no
         // network call. These env vars are read by no other test, so setting
