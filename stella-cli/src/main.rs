@@ -115,7 +115,16 @@ enum Command {
 
     /// List every tool available to the agent this session — built-ins,
     /// developer custom tools (.stella/tools/), and manifest diagnostics
-    Tools,
+    Tools {
+        /// Validate custom tool manifests instead of listing: parse every
+        /// <name>.toml, check names, required fields, timeouts, and
+        /// collisions with built-ins and other manifests, then exit
+        /// non-zero if any manifest has errors. Pass a directory to check
+        /// (defaults to the dirs discovery scans: .stella/tools/ and
+        /// ~/.config/stella/tools/).
+        #[arg(long, value_name = "DIR")]
+        validate: Option<Option<std::path::PathBuf>>,
+    },
 
     /// List configured providers and available models
     Models,
@@ -156,13 +165,18 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> Result<(), String> {
     // Models and Version don't need a configured provider/key.
-    match cli.command {
+    match &cli.command {
         Some(Command::Models) => {
             config::Config::print_available_models();
             return Ok(());
         }
-        Some(Command::Tools) => {
-            return agent::run_tools_listing();
+        Some(Command::Tools { validate }) => {
+            return match validate {
+                // `--validate` (dir optional) is the strict pre-flight path;
+                // a plain `stella tools` stays the lenient listing.
+                Some(dir) => agent::run_tools_validation(dir.as_deref()),
+                None => agent::run_tools_listing(),
+            };
         }
         Some(Command::Version) => {
             println!("stella v{}", env!("CARGO_PKG_VERSION"));
@@ -225,7 +239,7 @@ fn run(cli: Cli) -> Result<(), String> {
         // Models/Version (and Tools) short-circuit in the first match at the
         // top of `run` before a provider is resolved; Init is handled by the
         // caller. Reaching any of them here is impossible.
-        Command::Init | Command::Tools | Command::Models | Command::Version => {
+        Command::Init | Command::Tools { .. } | Command::Models | Command::Version => {
             unreachable!("handled before provider resolution")
         }
         Command::Config => {
