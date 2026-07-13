@@ -120,13 +120,19 @@ fn timeline_effect(progress: f32) -> (Effect, Duration) {
 
     if progress < REVEAL_FRACTION {
         let local = (progress / REVEAL_FRACTION).clamp(0.0, 1.0);
-        let effect = fx::coalesce(EffectTimer::new(FxDuration::from(reveal_dur), Interpolation::QuadOut))
-            .with_rng(SimpleRng::new(FX_SEED));
+        let effect = fx::coalesce(EffectTimer::new(
+            FxDuration::from(reveal_dur),
+            Interpolation::QuadOut,
+        ))
+        .with_rng(SimpleRng::new(FX_SEED));
         (effect, reveal_dur.mul_f32(local))
     } else {
         let local = ((progress - REVEAL_FRACTION) / (1.0 - REVEAL_FRACTION)).clamp(0.0, 1.0);
-        let effect = fx::dissolve(EffectTimer::new(FxDuration::from(dissolve_dur), Interpolation::QuadIn))
-            .with_rng(SimpleRng::new(FX_SEED));
+        let effect = fx::dissolve(EffectTimer::new(
+            FxDuration::from(dissolve_dur),
+            Interpolation::QuadIn,
+        ))
+        .with_rng(SimpleRng::new(FX_SEED));
         (effect, dissolve_dur.mul_f32(local))
     }
 }
@@ -271,14 +277,20 @@ mod tests {
     #[test]
     fn renders_the_big_wordmark_on_a_roomy_terminal_at_the_handoff_point() {
         let rows = draw(&state_at(HANDOFF_MS), 80, 24);
-        assert!(has_non_space(&rows), "wordmark should be (fully) visible right past coalesce-in");
+        assert!(
+            has_non_space(&rows),
+            "wordmark should be (fully) visible right past coalesce-in"
+        );
     }
 
     #[test]
     fn renders_the_compact_fallback_on_a_tiny_terminal_at_the_handoff_point() {
         let rows = draw(&state_at(HANDOFF_MS), 30, 5);
         let text = rows.join("");
-        assert!(text.contains("STELLA"), "tiny terminals get the literal fallback line");
+        assert!(
+            text.contains("STELLA"),
+            "tiny terminals get the literal fallback line"
+        );
     }
 
     #[test]
@@ -287,7 +299,10 @@ mod tests {
         // almost nothing has materialized yet — the opposite end of the
         // reveal from the handoff-point test above.
         let rows = draw(&state_at(0), 80, 24);
-        assert!(!has_non_space(&rows), "a just-started splash should still read as (near-)blank");
+        assert!(
+            !has_non_space(&rows),
+            "a just-started splash should still read as (near-)blank"
+        );
     }
 
     #[test]
@@ -319,6 +334,9 @@ mod tests {
         let mut state = SplashState::new();
         state.skip();
         let rows = draw(&state, 80, 24);
-        assert!(!has_non_space(&rows), "a skipped splash should render fully dissolved");
+        assert!(
+            !has_non_space(&rows),
+            "a skipped splash should render fully dissolved"
+        );
     }
 }

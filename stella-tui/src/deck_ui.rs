@@ -476,7 +476,10 @@ mod tests {
         let model = model_with(&["lead"]);
         let mut ui = DeckUi::default(); // splash NOT skipped
         assert!(!ui.splash.is_done());
-        assert_eq!(handle_deck_key(ch('a'), &model, &mut ui), DeckAction::Handled);
+        assert_eq!(
+            handle_deck_key(ch('a'), &model, &mut ui),
+            DeckAction::Handled
+        );
         assert!(ui.splash.is_done(), "first key skips the splash");
         assert!(ui.composer.buffer().is_empty(), "and does not type");
     }
@@ -511,7 +514,10 @@ mod tests {
                 text: "do the thing".into()
             })
         );
-        assert!(ui.composer.buffer().is_empty(), "composer clears after submit");
+        assert!(
+            ui.composer.buffer().is_empty(),
+            "composer clears after submit"
+        );
     }
 
     #[test]
@@ -519,7 +525,10 @@ mod tests {
         let model = model_with(&["lead"]);
         let mut ui = ready_ui();
         ui.tab = DeckTab::Graph;
-        assert_eq!(handle_deck_key(ctrl('c'), &model, &mut ui), DeckAction::Quit);
+        assert_eq!(
+            handle_deck_key(ctrl('c'), &model, &mut ui),
+            DeckAction::Quit
+        );
     }
 
     #[test]

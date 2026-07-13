@@ -75,9 +75,12 @@ fn render_empty(area: Rect, buf: &mut Buffer) {
         width: inner.width,
         height: 1,
     };
-    Paragraph::new(Line::from(Span::styled("no files touched yet", theme::muted())))
-        .alignment(Alignment::Center)
-        .render(row, buf);
+    Paragraph::new(Line::from(Span::styled(
+        "no files touched yet",
+        theme::muted(),
+    )))
+    .alignment(Alignment::Center)
+    .render(row, buf);
 }
 
 // ── The ledger table + summary footer ───────────────────────────────────
@@ -123,7 +126,9 @@ fn render_list(ledger: &FileLedger, selected: usize, area: Rect, buf: &mut Buffe
     let lines: Vec<Line<'static>> = records[start..end]
         .iter()
         .enumerate()
-        .map(|(offset, rec)| record_line(rec, table_area.width as usize, start + offset == selected))
+        .map(|(offset, rec)| {
+            record_line(rec, table_area.width as usize, start + offset == selected)
+        })
         .collect();
     Paragraph::new(Text::from(lines)).render(body_area, buf);
 
@@ -254,7 +259,9 @@ fn render_diff_pane(
     buf: &mut Buffer,
 ) {
     let record = records.get(ui.files_sel);
-    let title = record.map(|r| r.path.clone()).unwrap_or_else(|| "diff".to_string());
+    let title = record
+        .map(|r| r.path.clone())
+        .unwrap_or_else(|| "diff".to_string());
     let block = Block::default()
         .borders(Borders::ALL)
         .title(format!(" diff · {title} "));
@@ -276,14 +283,18 @@ fn render_diff_pane(
             ui.metrics.files_diff_total = total;
             ui.metrics.files_diff_height = inner_h;
             let window = ui.files_diff_scroll.window(total, inner_h);
-            let visible: Vec<Line<'static>> = lines.get(window).map(<[Line]>::to_vec).unwrap_or_default();
+            let visible: Vec<Line<'static>> =
+                lines.get(window).map(<[Line]>::to_vec).unwrap_or_default();
             Paragraph::new(Text::from(visible)).render(inner, buf);
         }
         _ => {
             ui.metrics.files_diff_total = 0;
             ui.metrics.files_diff_height = inner_h;
-            Paragraph::new(Line::from(Span::styled("(no diff captured)", theme::muted())))
-                .render(inner, buf);
+            Paragraph::new(Line::from(Span::styled(
+                "(no diff captured)",
+                theme::muted(),
+            )))
+            .render(inner, buf);
         }
     }
 }
@@ -377,7 +388,10 @@ mod tests {
             text.contains("existing.rs"),
             "expected modified file path in output:\n{text}"
         );
-        assert!(text.contains("2 files"), "expected file count summary:\n{text}");
+        assert!(
+            text.contains("2 files"),
+            "expected file count summary:\n{text}"
+        );
         assert!(
             text.contains(&format!("+{}", model.ledger.total_added())),
             "expected total added in footer:\n{text}"
@@ -422,7 +436,10 @@ mod tests {
         render(&model, &mut ui, area, &mut buf);
         assert_eq!(ui.metrics.files_diff_total, 0);
         let text = buffer_text(&buf);
-        assert!(text.contains("no diff captured"), "expected fallback text:\n{text}");
+        assert!(
+            text.contains("no diff captured"),
+            "expected fallback text:\n{text}"
+        );
     }
 
     #[test]
@@ -439,7 +456,11 @@ mod tests {
     #[test]
     fn path_width_never_exceeds_the_available_row_width() {
         let fixed = AGENT_W + OP_W + ADD_W + REM_W + CHANGES_W;
-        assert_eq!(path_width(120), 120 - fixed, "wide rows: path fills the leftovers");
+        assert_eq!(
+            path_width(120),
+            120 - fixed,
+            "wide rows: path fills the leftovers"
+        );
         assert_eq!(path_width(fixed + 2), MIN_PATH_W, "floored at MIN_PATH_W");
         assert_eq!(path_width(8), 8, "capped to the row on very narrow panes");
         assert_eq!(path_width(0), 0);

@@ -28,9 +28,7 @@ fn render_tab(model: &WorkspaceModel, tab: DeckTab, w: u16, h: u16) -> String {
     ui.tab = tab;
     ui.graph = Some(demo_graph());
     let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
-    terminal
-        .draw(|f| render_deck(model, &mut ui, f))
-        .unwrap();
+    terminal.draw(|f| render_deck(model, &mut ui, f)).unwrap();
     let buf = terminal.backend().buffer();
     let area = *buf.area();
     (0..area.height)
@@ -87,6 +85,9 @@ fn agents_dashboard_shows_status_and_spend_columns() {
     let text = render_tab(&model, DeckTab::Agents, 160, 20);
     // Column headers and at least one agent's live status render.
     for needle in ["CPU%", "MEM", "In/Out", "Activity", "needs input"] {
-        assert!(text.contains(needle), "dashboard missing {needle:?}:\n{text}");
+        assert!(
+            text.contains(needle),
+            "dashboard missing {needle:?}:\n{text}"
+        );
     }
 }

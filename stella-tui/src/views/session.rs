@@ -29,7 +29,11 @@ pub fn render(model: &WorkspaceModel, ui: &mut DeckUi, area: Rect, buf: &mut Buf
     // pending at once — nothing clears one when the other arrives — so they
     // render independently, exactly like the single-session `render`; an
     // ask-user question is never hidden behind a scope review.
-    let scope_h: u16 = if sm.pending_scope_review.is_some() { 8 } else { 0 };
+    let scope_h: u16 = if sm.pending_scope_review.is_some() {
+        8
+    } else {
+        0
+    };
     let ask_h: u16 = match &sm.pending_ask_user {
         Some(p) => (p.options.len() as u16 + 5).min(12),
         None => 0,
@@ -76,7 +80,10 @@ fn render_header(agent: &AgentEntry, area: Rect, buf: &mut Buffer) {
         ),
         Span::styled(agent.meta.id.clone(), theme::accent()),
         Span::styled("  ·  ", theme::rule()),
-        Span::styled(st.label().to_string(), Style::new().fg(theme::status_color(st))),
+        Span::styled(
+            st.label().to_string(),
+            Style::new().fg(theme::status_color(st)),
+        ),
         Span::raw("   "),
         Span::styled(agent.meta.title.clone(), theme::muted()),
     ]);

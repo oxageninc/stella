@@ -14,7 +14,7 @@
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use tachyonfx::{fx, Duration as FxDuration, Effect, EffectTimer, Interpolation, Motion};
+use tachyonfx::{Duration as FxDuration, Effect, EffectTimer, Interpolation, Motion, fx};
 
 use crate::theme;
 
@@ -24,7 +24,10 @@ use crate::theme;
 /// view rather than pop in — e.g. a view's first paint after a tab switch,
 /// or a card resolving once its data arrives.
 pub fn fade_in(ms: u32) -> Effect {
-    fx::fade_from_fg(theme::MUTED, EffectTimer::from_ms(ms, Interpolation::QuadOut))
+    fx::fade_from_fg(
+        theme::MUTED,
+        EffectTimer::from_ms(ms, Interpolation::QuadOut),
+    )
 }
 
 /// Scatters cells to blank over `ms`, accelerating toward empty.
@@ -90,9 +93,15 @@ mod tests {
 
         assert!(!effect.done(), "a fresh 100ms effect has not finished");
         apply(&mut effect, Duration::from_millis(50), area, &mut buf);
-        assert!(!effect.done(), "halfway through a 100ms fade should still be running");
+        assert!(
+            !effect.done(),
+            "halfway through a 100ms fade should still be running"
+        );
         apply(&mut effect, Duration::from_millis(200), area, &mut buf);
-        assert!(effect.done(), "overshooting the duration should finish the effect");
+        assert!(
+            effect.done(),
+            "overshooting the duration should finish the effect"
+        );
     }
 
     #[test]
@@ -107,7 +116,11 @@ mod tests {
         // dissolved regardless of its internal random cell ordering.
         apply(&mut effect, Duration::from_millis(500), area, &mut buf);
 
-        assert_eq!(non_space_cells(&buf), 0, "a fully-run dissolve blanks every cell");
+        assert_eq!(
+            non_space_cells(&buf),
+            0,
+            "a fully-run dissolve blanks every cell"
+        );
     }
 
     #[test]

@@ -414,7 +414,12 @@ pub(crate) fn render_scope_review(
         .render(area, buf);
 }
 
-pub(crate) fn render_ask_user(prompt: &AskUserPrompt, answered: bool, area: Rect, buf: &mut Buffer) {
+pub(crate) fn render_ask_user(
+    prompt: &AskUserPrompt,
+    answered: bool,
+    area: Rect,
+    buf: &mut Buffer,
+) {
     let mut lines: Vec<Line<'static>> = Vec::new();
     lines.push(Line::from(Span::styled(
         prompt.question.clone(),

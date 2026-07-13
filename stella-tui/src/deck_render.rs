@@ -101,7 +101,10 @@ fn render_status_bar(model: &WorkspaceModel, ui: &DeckUi, area: Rect, buf: &mut 
     ];
     // CPU gauge — a small colored bar + percent.
     spans.push(Span::styled("cpu ", theme::muted()));
-    spans.push(Span::styled(cpu_bar(cpu), theme::muted().fg(theme::gauge_color(cpu / 100.0))));
+    spans.push(Span::styled(
+        cpu_bar(cpu),
+        theme::muted().fg(theme::gauge_color(cpu / 100.0)),
+    ));
     spans.push(Span::styled(
         format!(" {cpu:>3.0}% "),
         theme::body().fg(theme::gauge_color(cpu / 100.0)),
@@ -156,11 +159,26 @@ fn render_help(area: Rect, buf: &mut Buffer) {
         Line::default(),
         Line::from(Span::styled("  Tab / ⇧Tab   switch tabs", theme::body())),
         Line::from(Span::styled("  1–5          jump to a tab", theme::body())),
-        Line::from(Span::styled("  Enter        dispatch prompt (never blocks)", theme::body())),
-        Line::from(Span::styled("  ↑ ↓          navigate the active tab", theme::body())),
-        Line::from(Span::styled("  Agents: p/s/r  pause / stop / restart", theme::body())),
-        Line::from(Span::styled("  Traces: f      cycle agent filter", theme::body())),
-        Line::from(Span::styled("  Files:  Enter  open the diff", theme::body())),
+        Line::from(Span::styled(
+            "  Enter        dispatch prompt (never blocks)",
+            theme::body(),
+        )),
+        Line::from(Span::styled(
+            "  ↑ ↓          navigate the active tab",
+            theme::body(),
+        )),
+        Line::from(Span::styled(
+            "  Agents: p/s/r  pause / stop / restart",
+            theme::body(),
+        )),
+        Line::from(Span::styled(
+            "  Traces: f      cycle agent filter",
+            theme::body(),
+        )),
+        Line::from(Span::styled(
+            "  Files:  Enter  open the diff",
+            theme::body(),
+        )),
         Line::from(Span::styled("  Ctrl-C       quit", theme::body())),
         Line::default(),
         Line::from(Span::styled("  any key closes this help", theme::muted())),

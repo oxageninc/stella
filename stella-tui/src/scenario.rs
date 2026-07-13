@@ -18,19 +18,63 @@ use crate::graph::{GraphEdge, GraphNode, GraphSnapshot};
 /// A sample code-graph neighborhood centered on the engine step driver.
 pub fn demo_graph() -> GraphSnapshot {
     let nodes = vec![
-        GraphNode { label: "run_turn".into(), kind: "function".into(), location: Some("stella-core/src/driver.rs:239".into()) },
-        GraphNode { label: "Engine".into(), kind: "struct".into(), location: Some("stella-core/src/engine.rs:48".into()) },
-        GraphNode { label: "Router".into(), kind: "struct".into(), location: Some("stella-core/src/router.rs:373".into()) },
-        GraphNode { label: "AgentEvent".into(), kind: "enum".into(), location: Some("stella-protocol/src/event.rs:55".into()) },
-        GraphNode { label: "Ledger".into(), kind: "struct".into(), location: Some("stella-fleet/src/ledger.rs:90".into()) },
-        GraphNode { label: "driver.rs".into(), kind: "file".into(), location: Some("stella-core/src/driver.rs".into()) },
+        GraphNode {
+            label: "run_turn".into(),
+            kind: "function".into(),
+            location: Some("stella-core/src/driver.rs:239".into()),
+        },
+        GraphNode {
+            label: "Engine".into(),
+            kind: "struct".into(),
+            location: Some("stella-core/src/engine.rs:48".into()),
+        },
+        GraphNode {
+            label: "Router".into(),
+            kind: "struct".into(),
+            location: Some("stella-core/src/router.rs:373".into()),
+        },
+        GraphNode {
+            label: "AgentEvent".into(),
+            kind: "enum".into(),
+            location: Some("stella-protocol/src/event.rs:55".into()),
+        },
+        GraphNode {
+            label: "Ledger".into(),
+            kind: "struct".into(),
+            location: Some("stella-fleet/src/ledger.rs:90".into()),
+        },
+        GraphNode {
+            label: "driver.rs".into(),
+            kind: "file".into(),
+            location: Some("stella-core/src/driver.rs".into()),
+        },
     ];
     let edges = vec![
-        GraphEdge { from: 0, to: 1, kind: "calls".into() },
-        GraphEdge { from: 1, to: 2, kind: "uses".into() },
-        GraphEdge { from: 0, to: 3, kind: "emits".into() },
-        GraphEdge { from: 5, to: 0, kind: "defines".into() },
-        GraphEdge { from: 1, to: 4, kind: "writes".into() },
+        GraphEdge {
+            from: 0,
+            to: 1,
+            kind: "calls".into(),
+        },
+        GraphEdge {
+            from: 1,
+            to: 2,
+            kind: "uses".into(),
+        },
+        GraphEdge {
+            from: 0,
+            to: 3,
+            kind: "emits".into(),
+        },
+        GraphEdge {
+            from: 5,
+            to: 0,
+            kind: "defines".into(),
+        },
+        GraphEdge {
+            from: 1,
+            to: 4,
+            kind: "writes".into(),
+        },
     ];
     GraphSnapshot {
         focus: "run_turn — engine step driver".into(),

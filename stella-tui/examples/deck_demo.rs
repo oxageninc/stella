@@ -88,9 +88,9 @@ async fn main() -> std::io::Result<()> {
                         // Any non-ScopeReview stage clears the pending gate;
                         // an abort ends the run instead.
                         let next = match decision {
-                            ScopeDecision::Approve | ScopeDecision::Trim => {
-                                AgentEvent::Stage { name: StageKind::Execute }
-                            }
+                            ScopeDecision::Approve | ScopeDecision::Trim => AgentEvent::Stage {
+                                name: StageKind::Execute,
+                            },
                             ScopeDecision::Abort => AgentEvent::Complete {
                                 model: "glm-5.2".into(),
                                 cost_usd: 0.0,
@@ -136,8 +136,12 @@ async fn mini_run(tx: &mpsc::UnboundedSender<Inbound>, id: &str) {
         event,
     };
     let steps = vec![
-        ev(AgentEvent::Stage { name: StageKind::Triage }),
-        ev(AgentEvent::Stage { name: StageKind::Execute }),
+        ev(AgentEvent::Stage {
+            name: StageKind::Triage,
+        }),
+        ev(AgentEvent::Stage {
+            name: StageKind::Execute,
+        }),
         ev(AgentEvent::ToolStart {
             call: ToolCall {
                 call_id: format!("{id}-c1"),
@@ -147,7 +151,9 @@ async fn mini_run(tx: &mpsc::UnboundedSender<Inbound>, id: &str) {
         }),
         ev(AgentEvent::ToolResult {
             call_id: format!("{id}-c1"),
-            output: ToolOutput::Ok { content: "ok".into() },
+            output: ToolOutput::Ok {
+                content: "ok".into(),
+            },
             duration_ms: 30,
         }),
         ev(AgentEvent::FileChange {

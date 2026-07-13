@@ -178,7 +178,10 @@ fn render_detail(snapshot: &GraphSnapshot, cursor: usize, area: Rect, buf: &mut 
         theme::heading(),
     )));
     if degree == 0 {
-        lines.push(Line::from(Span::styled("no known relations", theme::muted())));
+        lines.push(Line::from(Span::styled(
+            "no known relations",
+            theme::muted(),
+        )));
     } else {
         for edge in &snapshot.edges {
             let outgoing = edge.from == cursor;
@@ -245,7 +248,9 @@ const X_BOUNDS: [f64; 2] = [-1.7, 1.7];
 const Y_BOUNDS: [f64; 2] = [-1.1, 1.1];
 
 fn render_sketch(snapshot: &GraphSnapshot, cursor: usize, area: Rect, buf: &mut Buffer) {
-    let block = Block::default().borders(Borders::ALL).title(" neighborhood ");
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" neighborhood ");
     let inner = block.inner(area);
     block.render(area, buf);
     if inner.width < 6 || inner.height < 4 {
@@ -447,7 +452,10 @@ mod tests {
             text.contains("serde"),
             "clamps to the last node (index 2) and renders it:\n{text}"
         );
-        assert_eq!(ui.graph_cursor, 2, "render() writes the clamped cursor back");
+        assert_eq!(
+            ui.graph_cursor, 2,
+            "render() writes the clamped cursor back"
+        );
     }
 
     #[test]

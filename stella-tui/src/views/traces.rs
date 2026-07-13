@@ -39,9 +39,12 @@ pub fn render(model: &WorkspaceModel, ui: &mut DeckUi, area: Rect, buf: &mut Buf
     ui.metrics.trace_height = inner_height;
 
     let window = ui.trace_scroll.window(total, inner_height);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(title_for(ui.trace_filter.as_deref(), total, &window, ui.trace_scroll.follow));
+    let block = Block::default().borders(Borders::ALL).title(title_for(
+        ui.trace_filter.as_deref(),
+        total,
+        &window,
+        ui.trace_scroll.follow,
+    ));
 
     if total == 0 {
         let inner = block.inner(area);
@@ -55,7 +58,9 @@ pub fn render(model: &WorkspaceModel, ui: &mut DeckUi, area: Rect, buf: &mut Buf
         .map(|row| row_line(row, model.now_ms, inner_width))
         .collect();
 
-    Paragraph::new(Text::from(lines)).block(block).render(area, buf);
+    Paragraph::new(Text::from(lines))
+        .block(block)
+        .render(area, buf);
 }
 
 /// The block title: active filter + position/following state + the `f: filter`
@@ -68,7 +73,11 @@ fn title_for(filter: Option<&str>, total: usize, window: &Range<usize>, followin
     } else if following {
         format!(" · {total} events · following")
     } else {
-        format!(" · {}-{} / {total}", window.start.min(total), window.end.min(total))
+        format!(
+            " · {}-{} / {total}",
+            window.start.min(total),
+            window.end.min(total)
+        )
     };
     format!(" traces · {scope}{position} · f: filter ")
 }
@@ -80,12 +89,8 @@ fn row_line(row: &TraceRow, now_ms: u64, width: usize) -> Line<'static> {
     let elapsed_ms = now_ms.saturating_sub(row.ts);
     let mmss = format_mmss(elapsed_ms);
     let kind_chip = format!("[{}]", row.kind.label());
-    let prefix_width = mmss.chars().count()
-        + 2
-        + row.agent.chars().count()
-        + 2
-        + kind_chip.chars().count()
-        + 1;
+    let prefix_width =
+        mmss.chars().count() + 2 + row.agent.chars().count() + 2 + kind_chip.chars().count() + 1;
     let summary = truncate_to_width(&row.summary, width.saturating_sub(prefix_width));
 
     Line::from(vec![
@@ -93,12 +98,16 @@ fn row_line(row: &TraceRow, now_ms: u64, width: usize) -> Line<'static> {
         Span::raw("  "),
         Span::styled(
             row.agent.clone(),
-            Style::new().fg(theme::agent_color(&row.agent)).add_modifier(Modifier::BOLD),
+            Style::new()
+                .fg(theme::agent_color(&row.agent))
+                .add_modifier(Modifier::BOLD),
         ),
         Span::raw("  "),
         Span::styled(
             kind_chip,
-            Style::new().fg(theme::trace_kind_color(row.kind)).add_modifier(Modifier::BOLD),
+            Style::new()
+                .fg(theme::trace_kind_color(row.kind))
+                .add_modifier(Modifier::BOLD),
         ),
         Span::raw(" "),
         Span::styled(summary, theme::body()),
@@ -237,9 +246,18 @@ mod tests {
             text.contains("building the auth refactor"),
             "agent a's text row is visible:\n{text}"
         );
-        assert!(text.contains("src/lib.rs"), "agent b's file row is visible:\n{text}");
-        assert!(text.contains("traces · all"), "header shows unfiltered scope:\n{text}");
-        assert!(text.contains("f: filter"), "header shows the filter hint:\n{text}");
+        assert!(
+            text.contains("src/lib.rs"),
+            "agent b's file row is visible:\n{text}"
+        );
+        assert!(
+            text.contains("traces · all"),
+            "header shows unfiltered scope:\n{text}"
+        );
+        assert!(
+            text.contains("f: filter"),
+            "header shows the filter hint:\n{text}"
+        );
         assert_eq!(ui.metrics.trace_total, model.trace.rows.len());
     }
 
@@ -257,7 +275,10 @@ mod tests {
             !text.contains("src/lib.rs"),
             "agent b's row is filtered out:\n{text}"
         );
-        assert!(text.contains("traces · a"), "header shows the active filter:\n{text}");
+        assert!(
+            text.contains("traces · a"),
+            "header shows the active filter:\n{text}"
+        );
         assert_eq!(ui.metrics.trace_total, model.trace.for_agent("a").count());
     }
 

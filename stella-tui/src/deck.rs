@@ -228,8 +228,11 @@ impl WorkspaceModel {
         let idx = match self.index_of(agent) {
             Some(i) => i,
             None => {
-                self.agents
-                    .push(AgentEntry::new(AgentMeta::new(agent.clone(), agent.clone(), self.now_ms)));
+                self.agents.push(AgentEntry::new(AgentMeta::new(
+                    agent.clone(),
+                    agent.clone(),
+                    self.now_ms,
+                )));
                 self.agents.len() - 1
             }
         };
@@ -322,10 +325,7 @@ pub struct FileLedger {
 
 impl FileLedger {
     fn record(&mut self, agent: &str, path: &str, kind: FileChangeKind, diff: &Option<String>) {
-        let (added, removed) = diff
-            .as_deref()
-            .map(count_diff_lines)
-            .unwrap_or((0, 0));
+        let (added, removed) = diff.as_deref().map(count_diff_lines).unwrap_or((0, 0));
         if let Some(rec) = self
             .records
             .iter_mut()
@@ -570,13 +570,11 @@ fn event_intensity(ev: &AgentEvent) -> u8 {
 fn status_from_event(ev: &AgentEvent) -> Option<AgentStatus> {
     match ev {
         AgentEvent::Complete { .. } => Some(AgentStatus::Done),
-        AgentEvent::Error { retryable, .. } => {
-            Some(if *retryable {
-                AgentStatus::Running
-            } else {
-                AgentStatus::Failed
-            })
-        }
+        AgentEvent::Error { retryable, .. } => Some(if *retryable {
+            AgentStatus::Running
+        } else {
+            AgentStatus::Failed
+        }),
         // Both user-response gates block the agent until answered — a scope
         // review is just as much "needs input" as an ask-user question.
         AgentEvent::AskUser { .. } | AgentEvent::ScopeReview { .. } => {
@@ -599,7 +597,11 @@ fn trace_of(ev: &AgentEvent) -> (TraceKind, String) {
         AgentEvent::Text { delta } => (TraceKind::Text, snip(delta)),
         AgentEvent::Reasoning { delta } => (TraceKind::Reasoning, snip(delta)),
         AgentEvent::ToolStart { call } => (TraceKind::Tool, format!("{}()", call.name)),
-        AgentEvent::ToolResult { output, duration_ms, .. } => {
+        AgentEvent::ToolResult {
+            output,
+            duration_ms,
+            ..
+        } => {
             let ok = matches!(output, ToolOutput::Ok { .. });
             (
                 TraceKind::Tool,
@@ -608,25 +610,39 @@ fn trace_of(ev: &AgentEvent) -> (TraceKind, String) {
         }
         AgentEvent::FileChange { path, kind, diff } => {
             let (a, r) = diff.as_deref().map(count_diff_lines).unwrap_or((0, 0));
-            (TraceKind::File, format!("{kind:?} {path} +{a}/-{r}").to_lowercase())
+            (
+                TraceKind::File,
+                format!("{kind:?} {path} +{a}/-{r}").to_lowercase(),
+            )
         }
         AgentEvent::BudgetTick { spent_usd, .. } => (TraceKind::Budget, format!("${spent_usd:.4}")),
-        AgentEvent::StepUsage { model, cost_usd, .. } => {
-            (TraceKind::Budget, format!("{model} ${cost_usd:.4}"))
+        AgentEvent::StepUsage {
+            model, cost_usd, ..
+        } => (TraceKind::Budget, format!("{model} ${cost_usd:.4}")),
+        AgentEvent::ContextRecall { frames, tokens, .. } => (
+            TraceKind::Context,
+            format!("{} frames, {tokens} tok", frames.len()),
+        ),
+        AgentEvent::ContextWrite {
+            upserts,
+            superseded,
+            ..
+        } => (TraceKind::Context, format!("+{upserts} ~{superseded}")),
+        AgentEvent::JudgeVerdict { passed, .. } => (
+            TraceKind::Verdict,
+            if *passed {
+                "passed".into()
+            } else {
+                "failed".into()
+            },
+        ),
+        AgentEvent::GoalVerdict { met, round, .. } => (
+            TraceKind::Verdict,
+            format!("round {round} {}", if *met { "met" } else { "unmet" }),
+        ),
+        AgentEvent::MediaProgress { kind, .. } => {
+            (TraceKind::Media, format!("{kind:?}").to_lowercase())
         }
-        AgentEvent::ContextRecall { frames, tokens, .. } => {
-            (TraceKind::Context, format!("{} frames, {tokens} tok", frames.len()))
-        }
-        AgentEvent::ContextWrite { upserts, superseded, .. } => {
-            (TraceKind::Context, format!("+{upserts} ~{superseded}"))
-        }
-        AgentEvent::JudgeVerdict { passed, .. } => {
-            (TraceKind::Verdict, if *passed { "passed".into() } else { "failed".into() })
-        }
-        AgentEvent::GoalVerdict { met, round, .. } => {
-            (TraceKind::Verdict, format!("round {round} {}", if *met { "met" } else { "unmet" }))
-        }
-        AgentEvent::MediaProgress { kind, .. } => (TraceKind::Media, format!("{kind:?}").to_lowercase()),
         AgentEvent::MediaComplete { artifact } => (TraceKind::Media, artifact.label.clone()),
         AgentEvent::Commit { message, .. } => (TraceKind::Vcs, snip(message)),
         AgentEvent::Pr { status, .. } => (TraceKind::Vcs, format!("pr {status:?}").to_lowercase()),
@@ -634,9 +650,14 @@ fn trace_of(ev: &AgentEvent) -> (TraceKind, String) {
             (TraceKind::Other, format!("fallback {from}→{to}"))
         }
         AgentEvent::Retry { attempt, .. } => (TraceKind::Other, format!("retry #{attempt}")),
-        AgentEvent::Compaction { before_tokens, after_tokens, .. } => {
-            (TraceKind::Other, format!("compact {before_tokens}→{after_tokens}"))
-        }
+        AgentEvent::Compaction {
+            before_tokens,
+            after_tokens,
+            ..
+        } => (
+            TraceKind::Other,
+            format!("compact {before_tokens}→{after_tokens}"),
+        ),
         AgentEvent::ScopeReview { proposal } => (TraceKind::Stage, snip(&proposal.summary)),
         AgentEvent::AskUser { question, .. } => (TraceKind::Other, snip(question)),
         AgentEvent::Error { message, .. } => (TraceKind::Error, snip(message)),
@@ -702,12 +723,7 @@ mod tests {
         w.apply_inbound(&reg("lead"));
         w.apply_inbound(&reg("sub"));
         assert_eq!(w.agents.len(), 2);
-        w.apply_inbound(&ev(
-            "sub",
-            AgentEvent::Text {
-                delta: "hi".into(),
-            },
-        ));
+        w.apply_inbound(&ev("sub", AgentEvent::Text { delta: "hi".into() }));
         // The event landed on "sub"'s pure fold, not "lead"'s.
         let sub = &w.agents[w.index_of("sub").unwrap()];
         assert_eq!(sub.model.transcript.len(), 1);
@@ -719,7 +735,12 @@ mod tests {
     #[test]
     fn stray_event_auto_registers_its_agent() {
         let mut w = WorkspaceModel::new();
-        w.apply_inbound(&ev("ghost", AgentEvent::Stage { name: StageKind::Plan }));
+        w.apply_inbound(&ev(
+            "ghost",
+            AgentEvent::Stage {
+                name: StageKind::Plan,
+            },
+        ));
         assert!(w.index_of("ghost").is_some());
     }
 
@@ -800,7 +821,9 @@ mod tests {
             agent: "ghost".into(),
             status: AgentStatus::Paused,
         });
-        let i = w.index_of("ghost").expect("status auto-registers, like Event");
+        let i = w
+            .index_of("ghost")
+            .expect("status auto-registers, like Event");
         assert_eq!(w.agents[i].status, AgentStatus::Paused);
     }
 
@@ -855,7 +878,12 @@ mod tests {
         let mut w = WorkspaceModel::new();
         w.apply_inbound(&reg("a"));
         w.apply_inbound(&reg("b"));
-        w.apply_inbound(&ev("a", AgentEvent::Stage { name: StageKind::Execute }));
+        w.apply_inbound(&ev(
+            "a",
+            AgentEvent::Stage {
+                name: StageKind::Execute,
+            },
+        ));
         w.apply_inbound(&ev(
             "b",
             AgentEvent::ToolStart {
@@ -888,7 +916,9 @@ mod tests {
             "lead",
             AgentEvent::ToolResult {
                 call_id: "q".into(),
-                output: ToolOutput::Ok { content: "sqlite".into() },
+                output: ToolOutput::Ok {
+                    content: "sqlite".into(),
+                },
                 duration_ms: 1,
             },
         ));

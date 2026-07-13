@@ -128,7 +128,10 @@ pub enum WorkspaceInput {
     /// router picks the model/agent. The deck never gates input on agent state.
     Enqueue { text: String },
     /// Pause / resume / stop / restart a specific agent.
-    Control { agent: AgentId, control: AgentControl },
+    Control {
+        agent: AgentId,
+        control: AgentControl,
+    },
     /// Tear down the deck.
     Quit,
 }
