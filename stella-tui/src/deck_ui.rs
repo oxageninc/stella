@@ -170,10 +170,10 @@ pub fn handle_deck_key(key: KeyEvent, model: &WorkspaceModel, ui: &mut DeckUi) -
 
     // Focused-agent gates take precedence over normal composer editing, exactly
     // like the single-session shell — but they route to the focused agent.
-    if let Some(agent) = focused_id(model, ui) {
-        if let Some(action) = handle_focused_gates(key, model, ui, &agent) {
-            return action;
-        }
+    if let Some(agent) = focused_id(model, ui)
+        && let Some(action) = handle_focused_gates(key, model, ui, &agent)
+    {
+        return action;
     }
 
     // Per-tab navigation for non-typing keys, then composer editing.

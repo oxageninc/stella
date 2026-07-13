@@ -325,6 +325,7 @@ fn circle_positions(n: usize) -> Vec<(f64, f64)> {
 }
 
 #[cfg(test)]
+#[allow(clippy::field_reassign_with_default)]
 mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
