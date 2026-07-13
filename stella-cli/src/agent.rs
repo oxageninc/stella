@@ -28,6 +28,7 @@ use stella_protocol::{AgentEvent, CompletionMessage, ModelRef, Role, ToolOutput}
 use stella_store::{Store, TelemetryRow};
 use stella_tools::ToolRegistry;
 use stella_tools::custom::{self, CustomTool, CustomToolSet};
+use stella_tools::validate;
 use tokio::sync::mpsc;
 
 use crate::OutputFormat;
@@ -643,6 +644,12 @@ fn discover_custom_tools(cfg: &Config, print_diagnostics: bool) -> Vec<CustomToo
                 diagnostic.reason
             );
         }
+        if !report.diagnostics.is_empty() {
+            eprintln!(
+                "  {}",
+                "run `stella tools --validate` to check every custom tool manifest".dimmed()
+            );
+        }
     }
     report.tools
 }
@@ -724,6 +731,92 @@ pub fn run_tools_listing() -> Result<(), String> {
             .dimmed()
     );
     Ok(())
+}
+
+/// `stella tools --validate [DIR]` — the strict pre-flight for custom tool
+/// manifests. Where discovery (and the plain listing above) stays lenient,
+/// this checks every `*.toml` in `dir` (or, by default, the same directories
+/// discovery scans) and reports errors, warnings, and infos per file — see
+/// `stella_tools::validate`. Returns `Err` when any manifest has errors, so
+/// the process exits non-zero and a broken manifest is caught *before* a run
+/// consumes model budget.
+pub fn run_tools_validation(dir: Option<&std::path::Path>) -> Result<(), String> {
+    let workspace_root =
+        std::env::current_dir().map_err(|e| format!("cannot determine workspace root: {e}"))?;
+    tui::section_header("Custom tool manifests — validation");
+
+    let report = match dir {
+        Some(dir) => {
+            if !dir.is_dir() {
+                return Err(format!(
+                    "`{}` is not a directory — pass a directory of *.toml manifests, or omit \
+                     the value to check .stella/tools/ and ~/.config/stella/tools/",
+                    dir.display()
+                ));
+            }
+            println!("  {} {}", "checking:".dimmed(), dir.display());
+            validate::validate_dir(dir, &workspace_root)
+        }
+        None => {
+            println!(
+                "  {} {}",
+                "checking:".dimmed(),
+                ".stella/tools/, ~/.config/stella/tools/".dimmed()
+            );
+            validate::validate_default(&workspace_root)
+        }
+    };
+
+    if report.manifests.is_empty() {
+        println!(
+            "  {}",
+            "no manifests found — drop a <name>.toml in .stella/tools/ to add a custom tool"
+                .dimmed()
+        );
+        return Ok(());
+    }
+
+    println!();
+    for manifest in &report.manifests {
+        let mark = if manifest.has_errors() {
+            "✗".red()
+        } else {
+            "✓".green()
+        };
+        let name = manifest
+            .name
+            .as_deref()
+            .map(|n| format!(" ({n})"))
+            .unwrap_or_default();
+        println!("  {mark} {}{}", manifest.path.display(), name.bright_blue());
+        for issue in &manifest.issues {
+            let (label, message) = match issue.severity {
+                validate::Severity::Error => ("error:".red().bold(), issue.message.red()),
+                validate::Severity::Warning => ("warning:".yellow().bold(), issue.message.normal()),
+                validate::Severity::Info => ("info:".dimmed(), issue.message.dimmed()),
+            };
+            println!("      {label} {message}");
+        }
+    }
+
+    let failed = report.manifests.iter().filter(|m| m.has_errors()).count();
+    let ok = report.manifests.len() - failed;
+    println!(
+        "\n  {} manifest(s) checked: {} ok, {} with errors, {} warning(s)",
+        report.manifests.len(),
+        ok,
+        failed,
+        report.warning_count()
+    );
+
+    if failed > 0 {
+        Err(format!(
+            "{failed} of {} custom tool manifest(s) failed validation",
+            report.manifests.len()
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 /// Construct the turn/session budget guard from `--budget`. No limit at
