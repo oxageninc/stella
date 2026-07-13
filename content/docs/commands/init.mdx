@@ -1,0 +1,55 @@
+---
+title: stella init
+description: Analyze the workspace, infer its domain taxonomy, and build the code-graph index.
+---
+
+Analyze the current workspace, infer its domain taxonomy, and build the code-graph index that powers memories, reflections, and structured exploration.
+
+## Synopsis
+
+```bash
+stella init [global flags]
+```
+
+## What it does
+
+`stella init` does two things:
+
+1. **Infers the domain taxonomy** and writes it to `<workspace>/.stella/domains.toml`. This taxonomy is the tagging vocabulary for memories, reflections, and every code-graph node and edge.
+2. **Builds the code-graph index** at `<workspace>/.stella/context.db`.
+
+It works **offline** using a heuristic fallback, so it never hard-fails on configuration — you can initialize a workspace even without a resolvable provider credential.
+
+<Callout type="info">
+Run `stella init` once per workspace to prime Stella's understanding of your codebase. The generated files live under `<workspace>/.stella/`.
+</Callout>
+
+## Flags
+
+`stella init` takes the [global flags](/docs/commands). Because it can run offline, model selection is optional:
+
+| Flag | Why it matters here |
+| --- | --- |
+| `--model <provider/model_id>` | Pin the model used for taxonomy inference. Omit it to rely on auto-detection or the offline heuristic fallback. |
+| `--budget <usd>` | Cap spend for the analysis pass. |
+
+## Generated files
+
+| Path | Contents |
+| --- | --- |
+| `<workspace>/.stella/domains.toml` | The inferred domain taxonomy (tagging vocabulary). |
+| `<workspace>/.stella/context.db` | The code-graph index. |
+
+## Examples
+
+Initialize the current workspace:
+
+```bash
+stella init
+```
+
+Initialize using a specific model for taxonomy inference:
+
+```bash
+stella init --model openai/gpt-5.5
+```

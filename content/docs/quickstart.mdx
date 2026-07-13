@@ -1,0 +1,84 @@
+---
+title: Quickstart
+description: Set a key, run your first prompt, and try goal mode — in under a minute.
+---
+
+This walks you from zero to a verified change. It assumes you've
+[installed](/docs/installation) the `stella` binary.
+
+## 1. Set an API key
+
+Stella is bring-your-own-key. Export a key for any one provider — Stella auto-detects it:
+
+```bash
+export ANTHROPIC_API_KEY=your_key_here   # or OPENAI_API_KEY, GEMINI_API_KEY, ZAI_API_KEY, …
+```
+
+No key handy? Point Stella at a local OpenAI-compatible server instead — see
+[Providers &amp; models](/docs/providers#local--any-openai-compatible-server).
+
+Confirm what Stella resolved:
+
+```bash
+stella config    # provider, model, redacted key, base URL, workspace
+```
+
+## 2. Run a one-shot prompt
+
+From inside a project directory:
+
+```bash
+stella run "explain what this repository does, then list the riskiest files"
+```
+
+`stella run` executes a single non-interactive turn and prints the result. It can read
+files, run commands, and edit code as needed.
+
+## 3. Chat interactively
+
+Running `stella` with no subcommand starts an interactive REPL:
+
+```bash
+stella
+```
+
+Inside the session, type a message to send it, or use a slash command:
+
+| Command   | Does                              |
+| --------- | --------------------------------- |
+| `/help`   | Show help                         |
+| `/models` | List providers and models         |
+| `/config` | Show the current configuration    |
+| `/files`  | List files changed this session   |
+| `/clear`  | Clear conversation history        |
+| `/goal`   | Switch into goal mode             |
+| `/exit`   | Leave Stella                      |
+
+## 4. Give it a goal
+
+Goal mode works in judged rounds until a **separate judge model** confirms the objective
+is met from evidence — not just because the worker says so:
+
+```bash
+stella goal "the test suite passes and there are no clippy warnings"
+```
+
+See [Goal mode](/docs/goal-mode) for how the judge is chosen and how the loop ends.
+
+## 5. Pin a specific model (optional)
+
+By default Stella auto-detects the provider. Pin one explicitly with `--model`:
+
+```bash
+stella --model anthropic/claude-fable-5 run "refactor the database layer"
+stella --model zai/glm-5.2 goal "CI is green on the current branch"
+```
+
+## Where to go next
+
+- **[Providers &amp; models](/docs/providers)** — the full provider matrix and the
+  credential chain.
+- **[Configuration](/docs/configuration/settings)** — override provider defaults in
+  `settings.json`.
+- **[Commands](/docs/commands)** — every command and global flag.
+- **[Scripting](/docs/scripting)** — run Stella headlessly in CI with JSON output.

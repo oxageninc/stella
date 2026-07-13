@@ -1,0 +1,66 @@
+/**
+ * Stella CLI docs — styles.
+ *
+ * Generic shadcn-neutral branding: Tailwind v4 base + Fumadocs' neutral design
+ * tokens and docs preset. No brand palette yet; the accent tracks Fumadocs'
+ * own tokens. The landing-page layer is namespaced `lp-*` so it never leaks
+ * into the /docs theme.
+ */
+@import "tailwindcss";
+@import "fumadocs-ui/css/neutral.css";
+@import "fumadocs-ui/css/preset.css";
+
+/* Let Tailwind see Fumadocs' compiled utility classes. */
+@source "../../node_modules/fumadocs-ui/dist/**/*.js";
+
+/* ───────────────────────────────────────────────────────────────────────────
+ * Landing page (the (home) route only). Pure-CSS, namespaced `lp-*`.
+ * ─────────────────────────────────────────────────────────────────────────── */
+
+.lp-hero-grid {
+  background-image:
+    linear-gradient(
+      to right,
+      color-mix(in oklch, var(--color-fd-foreground) 6%, transparent) 1px,
+      transparent 1px
+    ),
+    linear-gradient(
+      to bottom,
+      color-mix(in oklch, var(--color-fd-foreground) 6%, transparent) 1px,
+      transparent 1px
+    );
+  background-size: 44px 44px;
+  mask-image: radial-gradient(ellipse 80% 60% at 50% 0%, #000 40%, transparent 100%);
+}
+
+.lp-terminal {
+  font-family:
+    ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono",
+    monospace;
+}
+
+.lp-caret {
+  display: inline-block;
+  width: 0.55ch;
+  height: 1.05em;
+  translate: 0 0.16em;
+  background: currentColor;
+  animation: lp-blink 1.05s steps(1) infinite;
+}
+
+@keyframes lp-blink {
+  0%,
+  50% {
+    opacity: 1;
+  }
+  50.01%,
+  100% {
+    opacity: 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .lp-caret {
+    animation: none;
+  }
+}

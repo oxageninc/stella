@@ -1,0 +1,90 @@
+---
+title: Agent Engine
+description: How Stella's agent step loop works — the model proposes tool calls, tools execute, results feed back, and the run repeats until a deterministic definition-of-done check passes.
+---
+
+# Agent Engine
+
+At the heart of Stella is a simple, iterative **step loop**. The agent does not
+plan the whole task up front and then execute it blindly. Instead, it works one
+step at a time: the model looks at the current state, proposes an action, the
+action runs, and the result is fed back into the model for the next step. This
+repeats until the work is done.
+
+## The step loop
+
+Every Stella command that drives the agent — `stella run`, `stella chat`,
+`stella goal`, and `stella monitor` — is built on the same loop:
+
+1. **The model proposes tool calls.** Given the conversation so far (the
+   prompt, prior tool results, recalled memories, and other context), the model
+   decides what to do next and emits one or more tool calls.
+2. **Tools execute.** Stella runs each proposed tool — reading a file, running a
+   shell command, editing code, checking CI status, and so on. Each tool has its
+   own permission model, and read-only tools are marked as such.
+3. **Results feed back.** The output of each tool is appended to the
+   conversation and returned to the model.
+4. **Repeat until done.** The model sees the new results and proposes the next
+   step. The loop continues until the task is complete.
+
+Because every step is grounded in real tool output rather than the model's
+assumptions, the agent can correct course as it learns more about the workspace.
+
+## Tools
+
+The model acts on the world exclusively through tools. Stella ships with a set
+of built-in tools that are always available, including:
+
+- `read`, `write`, `edit`, `delete` — file operations.
+- `glob`, `grep` — find files and search their contents.
+- `bash`, `exec` — run shell commands.
+- `ci` — inspect CI status and logs.
+- `issues` — read and manage issues (Linear when `LINEAR_API_KEY` is set,
+  otherwise GitHub).
+- `memory` — save and recall workspace memories.
+- `project` — project setup and introspection.
+- `screenshot` — capture screenshots.
+- `exploration` — structured codebase exploration.
+- `verify` — run the definition-of-done check (see below).
+- `registry` — list the tools registered for the session.
+
+Developers can extend this set with custom tools (a `<name>.toml` manifest in
+`.stella/tools/` or `~/.config/stella/tools/`) and with MCP servers configured
+in `.stella/mcp.toml`. Run `stella tools` to list every tool available to the
+agent in the current session.
+
+<Callout type="info">
+Each tool carries a per-tool permission model. Read-only tools are marked
+`read_only: true`, which lets Stella reason about which actions are safe to run
+without side effects.
+</Callout>
+
+## `verify_done` — the definition-of-done check
+
+Knowing *when to stop* is as important as knowing what to do next. Stella uses
+`verify_done`, a **deterministic definition-of-done check**, to decide whether
+the work actually satisfies the requirement rather than relying on the model to
+declare itself finished.
+
+Being deterministic, `verify_done` produces a consistent, evidence-based
+verdict for the same state — it is not a matter of the model's opinion. The
+agent can trigger this check through the built-in `verify` tool, which runs the
+definition-of-done check as part of the step loop.
+
+This gives the loop a concrete stopping condition: the agent keeps proposing and
+executing steps, and the run is considered complete only once the
+definition-of-done check confirms it.
+
+## Where the loop is used
+
+The step loop is the common foundation across Stella's commands. Some commands
+add structure on top of it:
+
+- [Goal mode](/docs/goal-mode) wraps the loop in **judged rounds**, where a
+  separate judge model assesses from evidence whether the objective has been met
+  before the run ends.
+- `stella monitor` is goal mode specialized for CI — it watches CI and keeps the
+  loop running until the latest run is all-green.
+
+In every case, the underlying mechanic is the same: propose, execute, feed back,
+repeat — until done.

@@ -1,0 +1,56 @@
+---
+title: Configuration
+description: How Stella is configured — settings.json, credentials, workspace files, and the scope hierarchy.
+---
+
+Stella reads configuration from a few well-defined places. Most users need only an API
+key; teams and power users reach for `settings.json`.
+
+## What lives where
+
+| Path | Purpose |
+| --- | --- |
+| `~/.config/stella/settings.json` | User-scope [settings](/docs/configuration/settings): provider overrides, hooks |
+| `<workspace>/.stella/settings.json` | Project-scope settings (highest precedence) |
+| org-managed `settings.json` | Organization defaults ([see below](#the-settings-hierarchy)) |
+| `~/.config/stella/credentials.toml` | Stored [API keys](/docs/configuration/credentials) |
+| `<workspace>/.stella/mcp.toml` | [MCP servers](/docs/tools/mcp) to connect at session start |
+| `<workspace>/.stella/tools/*.toml` | [Custom script tools](/docs/tools/custom-tools) |
+| `<workspace>/.stella/domains.toml` | Domain taxonomy (from `stella init`) |
+| `<workspace>/.stella/memories/*.md` | Saved [workspace memories](/docs/memory) |
+| `<workspace>/.stella/stella.duckdb` | Local [telemetry &amp; store](/docs/telemetry) |
+
+## The settings hierarchy
+
+`settings.json` is read across three scopes and merged **field by field**, with the more
+specific scope winning:
+
+1. **project** — `<workspace>/.stella/settings.json` (highest preference)
+2. **org-managed** — a system-level managed file (middle)
+3. **user** — `~/.config/stella/settings.json` (lowest preference)
+
+A project entry overrides an org-managed one, which overrides a user one — per field, so a
+project can change just a base URL while inheriting an API key from a higher scope. This is
+the same layering the rest of Stella's settings use.
+
+See **[settings.json](/docs/configuration/settings)** for the full schema, the org-managed
+path, and worked examples.
+
+## Configuration vs. credentials
+
+Two separate concerns:
+
+- **[settings.json](/docs/configuration/settings)** configures *behavior* — which base URL
+  a provider uses, its display name, default model, and lifecycle hooks. It may also carry
+  an API key.
+- **[credentials.toml](/docs/configuration/credentials)** stores *only* API keys, written
+  with owner-only permissions.
+
+Both feed the [credential chain](/docs/providers#the-credential-chain).
+
+## Inspecting the resolved configuration
+
+```bash
+stella config    # the fully resolved provider, model, key preview, and base URL
+stella models    # every provider with its effective base URL and key status
+```

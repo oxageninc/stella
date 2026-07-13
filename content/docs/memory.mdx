@@ -1,0 +1,82 @@
+---
+title: Memory & Knowledge
+description: How Stella persists knowledge across sessions — workspace memories, a reflections log, skills, the code-graph index, the DuckDB store, and the domain taxonomy that tags it all.
+---
+
+# Memory & Knowledge
+
+Stella accumulates knowledge about your workspace so that each session starts
+smarter than a blank slate. This knowledge lives on disk — mostly under the
+`.stella/` directory in your workspace — and spans several layers, from
+free-form notes to a structured code-graph index.
+
+## Where knowledge lives
+
+| Path | What it holds |
+| --- | --- |
+| `.stella/memories/*.md` | Workspace memories — Markdown notes saved and recalled via the `memory` tool. |
+| `.stella/reflections.jsonl` | The reflections mining log — one JSON object per line. |
+| `.stella/skills/<slug>/SKILL.md` | Workspace skills (per-project). |
+| `~/.config/stella/skills/` | User-global skills, available across all workspaces. |
+| `.stella/context.db` | The code-graph index, built by `stella init`. |
+| `.stella/stella.duckdb` | The local DuckDB store for persistence and telemetry. |
+| `.stella/domains.toml` | The domain taxonomy — the tagging vocabulary, produced by `stella init`. |
+
+## Workspace memories
+
+Workspace memories are Markdown files under `.stella/memories/`. The agent
+writes them through the built-in `memory` tool to record durable facts about the
+project, and recalls them back into context in later sessions. Because they are
+plain `.md` files, you can read, edit, and version-control them like any other
+project asset.
+
+## Reflections log
+
+The reflections mining log lives at `.stella/reflections.jsonl`. It is a
+line-delimited JSON file — **one JSON object per line** — used to accumulate
+reflections mined over time. The append-only, one-object-per-line format makes
+it easy to process incrementally.
+
+## Skills
+
+Skills are reusable capabilities described in a `SKILL.md` file. Stella looks in
+two locations:
+
+- **Workspace skills** at `.stella/skills/<slug>/SKILL.md` — scoped to the
+  current project.
+- **User-global skills** at `~/.config/stella/skills/` — available across every
+  workspace.
+
+## The code-graph index
+
+`stella init` analyzes the workspace and builds a **code-graph index** at
+`.stella/context.db`. This index gives the agent structured, navigable knowledge
+of the codebase rather than forcing it to re-read everything from scratch each
+run.
+
+<Callout type="info">
+`stella init` works offline, falling back to heuristics, so it never hard-fails
+on configuration. Alongside the code-graph index it also infers the domain
+taxonomy described below.
+</Callout>
+
+## The DuckDB store
+
+`.stella/stella.duckdb` is a local [DuckDB](https://duckdb.org) database used for
+persistence and telemetry. Token usage, cost, and per-step metering land here on
+your own disk. See [Telemetry](/docs/telemetry) for how this data is metered and
+how it works with `--budget`.
+
+## The domain taxonomy
+
+`stella init` also infers a **domain taxonomy**, written to
+`.stella/domains.toml`. This taxonomy is the shared **tagging vocabulary** for
+memories, reflections, and every node and edge in the code-graph. A consistent
+set of domain tags lets Stella relate a memory, a reflection, and a piece of
+code to the same area of your project.
+
+<Callout type="info">
+Because the taxonomy is the vocabulary that ties the other knowledge layers
+together, running `stella init` to seed `.stella/domains.toml` and
+`.stella/context.db` is a good first step in any new workspace.
+</Callout>

@@ -1,0 +1,57 @@
+---
+title: stella tools
+description: List every tool available to the agent this session.
+---
+
+List every tool available to the agent for the current session — built-in tools, developer custom tools, and manifest diagnostics.
+
+## Synopsis
+
+```bash
+stella tools [global flags]
+```
+
+## What it does
+
+`stella tools` prints the complete set of tools the agent can call this session:
+
+- **Built-in tools** — always available (see the table below).
+- **Developer custom tools** — loaded from `<name>.toml` manifests.
+- **Manifest diagnostics** — surfaced so you can spot a malformed or shadowed custom-tool manifest.
+
+Custom tools come from a `<name>.toml` manifest dropped in `<workspace>/.stella/tools/` (workspace-scoped) or `~/.config/stella/tools/` (user-global). On a name collision, the workspace copy wins. MCP servers configured in `<workspace>/.stella/mcp.toml` merge additional tools in at session start.
+
+## Built-in tools
+
+Each tool has a per-tool permission model; read-only tools are marked `read_only: true`.
+
+| Tool | Purpose |
+| --- | --- |
+| `read` | Read a file. |
+| `write` | Write a file. |
+| `edit` | Edit a file. |
+| `glob` | Find files by glob pattern. |
+| `grep` | Search file contents. |
+| `bash` | Run a shell command. |
+| `exec` | Execute a program. |
+| `delete` | Delete a file. |
+| `ci` | CI status and logs. |
+| `issues` | Issue tracking (Linear when `LINEAR_API_KEY` is set, otherwise GitHub). |
+| `memory` | Save and recall workspace memories. |
+| `project` | Project setup and introspection. |
+| `screenshot` | Capture a screenshot. |
+| `verify` | Run the definition-of-done check. |
+| `exploration` | Structured codebase exploration. |
+| `registry` | Tool registry and listing. |
+
+## Flags
+
+`stella tools` takes the [global flags](/docs/commands). It is primarily a diagnostic command, so model selection rarely matters here.
+
+## Example
+
+```bash
+stella tools
+```
+
+Run it after adding a custom-tool manifest to confirm the tool loaded and to review any manifest diagnostics.

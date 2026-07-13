@@ -1,0 +1,32 @@
+---
+title: MCP Servers
+description: Connect Model Context Protocol servers to Stella so their tools merge into the agent at session start.
+---
+
+Stella can connect to [Model Context Protocol](https://modelcontextprotocol.io) (MCP) servers and merge their tools into the agent. This lets you extend the agent with capabilities that live outside your workspace — without writing a [custom script tool](/docs/tools/custom-tools) for each one.
+
+## Configuration
+
+MCP servers are configured in `.stella/mcp.toml` in your workspace. Stella connects to each configured server at **session start** and merges the tools it exposes into the agent, alongside the [built-in tools](/docs/tools) and any custom tools.
+
+Because the tools are added at session start, connecting a new server takes effect on your next session. Run `stella tools` to confirm the merged tools are available.
+
+## Example configuration
+
+<Callout type="info">
+The configuration below is an **illustrative example** showing a single stdio MCP server launched by a command with arguments. Treat the exact field names and layout as a plausible illustration rather than an exhaustive schema reference.
+</Callout>
+
+```toml
+# .stella/mcp.toml — illustrative example
+
+[servers.filesystem]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "."]
+```
+
+In this example, Stella starts a stdio MCP server by running the given `command` with its `args`. When the server reports the tools it provides, those tools are merged into the agent for the session.
+
+<Callout type="info">
+MCP tools are treated like any other tool once merged in: they follow the [per-tool permission model](/docs/tools/permissions) and their calls can be gated or blocked with a [`PreToolUse` hook](/docs/tools/hooks).
+</Callout>

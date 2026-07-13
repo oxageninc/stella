@@ -1,0 +1,64 @@
+---
+title: stella run
+description: Send a single one-shot prompt to Stella non-interactively.
+---
+
+Send a one-shot prompt and let the agent work to completion without any interactive back-and-forth. This is the command to reach for in scripts, CI jobs, and Git hooks.
+
+## Synopsis
+
+```bash
+stella run <prompt> [global flags]
+```
+
+## What it does
+
+`stella run` runs the full agent step loop — the model proposes tool calls, the tools execute, results feed back, and the loop repeats until the task is done — then exits. There is no REPL and no prompt for further input. It is the non-interactive counterpart to [`stella chat`](/docs/commands/chat).
+
+Because it is non-interactive, `stella run` is the natural place to combine `--output-format json` or `--output-format stream-json` for headless automation, and `--budget` for a hard spend cap.
+
+<Callout type="info">
+`stella run` uses the same tools, providers, and credential chain as every other command. All [global flags](/docs/commands) apply.
+</Callout>
+
+## Flags
+
+`stella run` takes only the [global flags](/docs/commands). The most relevant ones:
+
+| Flag | Why it matters here |
+| --- | --- |
+| `--model <provider/model_id>` | Pin the worker model instead of relying on auto-detection. |
+| `--output-format <text\|json\|stream-json>` | Use `json` or `stream-json` for machine-readable, headless output. |
+| `--budget <usd>` | Cap total spend for the run; work aborts cleanly once the cap is exceeded. |
+
+## Examples
+
+Run a simple one-shot task with the default (auto-detected) model:
+
+```bash
+stella run "Add a docstring to every public function in src/utils.py"
+```
+
+Pin a specific model and emit a single JSON object for a script to parse:
+
+```bash
+stella run "Summarize the changes on this branch" \
+  --model anthropic/claude-fable-5 \
+  --output-format json
+```
+
+Cap spend at two US dollars and stream events as they happen (useful in CI logs):
+
+```bash
+stella run "Fix the failing unit tests in the payments module" \
+  --output-format stream-json \
+  --budget 2.00
+```
+
+Point at a local OpenAI-compatible server:
+
+```bash
+stella run "Explain what main.rs does" \
+  --model local/llama3.3 \
+  --base-url http://localhost:11434/v1
+```

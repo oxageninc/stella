@@ -1,0 +1,52 @@
+---
+title: stella models
+description: List configured providers and available models with key status and defaults.
+---
+
+List the configured providers and their available models. For each provider, Stella shows its key status, default model, and base URL.
+
+## Synopsis
+
+```bash
+stella models [global flags]
+```
+
+## What it does
+
+`stella models` enumerates the built-in providers and reports, for each one, whether a credential resolved (its key status), what its default model is, and which base URL it will use. It is the quickest way to confirm which providers are ready to use before you pin one with `--model`.
+
+The same listing is available from inside an interactive session via the [`/models`](/docs/commands/chat) slash command.
+
+<Callout type="info">
+Provider credentials are resolved through the credential chain: `--api-key` flag, then the provider env var (and aliases), then `settings.json`, then `~/.config/stella/credentials.toml`, and finally an interactive prompt on a TTY.
+</Callout>
+
+## Flags
+
+`stella models` takes the [global flags](/docs/commands). Note that `--base-url` overrides the displayed base URL for a provider, and `--api-key` (with an explicit `--model`) participates in the key-status resolution.
+
+## Example
+
+```bash
+stella models
+```
+
+Representative output (illustrative):
+
+```text
+PROVIDER     KEY        DEFAULT MODEL                       BASE URL
+zai          ok         glm-5.2                             https://api.z.ai/api/paas/v4
+anthropic    ok         claude-fable-5                      https://api.anthropic.com
+openai       missing    gpt-5.5                             https://api.openai.com/v1
+gemini       missing    gemini-3-pro                        https://generativelanguage.googleapis.com/v1beta
+xai          missing    grok-4                              https://api.x.ai/v1
+deepseek     missing    deepseek-chat                       https://api.deepseek.com/v1
+openrouter   missing    auto                                https://openrouter.ai/api/v1
+vertex       missing    gemini-3-pro                        (project/region-scoped)
+bedrock      missing    us.anthropic.claude-sonnet-4-5-...  (region-scoped)
+local        n/a        (you pass the model)                (set via --base-url)
+```
+
+<Callout type="warn">
+The values above are for illustration. Your actual key status depends on which credentials resolve in your environment, and default models and base URLs can be overridden per provider via `settings.json`.
+</Callout>

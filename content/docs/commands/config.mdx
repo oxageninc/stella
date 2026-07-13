@@ -1,0 +1,53 @@
+---
+title: stella config
+description: Show the fully resolved configuration for the current session.
+---
+
+Show the fully resolved configuration for the current session — the provider, model, a redacted key preview, base URL, workspace, and wire dialect.
+
+## Synopsis
+
+```bash
+stella config [global flags]
+```
+
+## What it does
+
+`stella config` resolves every configuration source — global flags, environment variables, `settings.json` across all three scopes, and `credentials.toml` — and prints the **effective** result. It is the fastest way to confirm exactly which provider, model, and base URL a run will use, and that your key resolved without exposing it (the key is shown only as a redacted preview).
+
+The same output is available from inside an interactive session via the [`/config`](/docs/commands/chat) slash command.
+
+<Callout type="info">
+`settings.json` is merged field-by-field across three scopes — project (`<workspace>/.stella/settings.json`), org-managed, and user (`~/.config/stella/settings.json`) — highest precedence first. `stella config` shows the merged, effective values.
+</Callout>
+
+## Flags
+
+`stella config` takes the [global flags](/docs/commands). Passing `--model`, `--base-url`, or `--api-key` lets you preview how a specific override resolves before committing to a run.
+
+## Example
+
+```bash
+stella config
+```
+
+Representative output (illustrative):
+
+```text
+Provider:   zai
+Model:      glm-5.2
+API key:    sk-...a1b2  (redacted)
+Base URL:   https://api.z.ai/api/paas/v4
+Workspace:  /Users/you/projects/acme
+Dialect:    OpenAI-compatible
+```
+
+Preview how an explicit override resolves without starting a run:
+
+```bash
+stella config --model anthropic/claude-fable-5
+```
+
+<Callout type="warn">
+The values above are for illustration. Your actual output reflects the credentials and settings that resolve in your environment.
+</Callout>

@@ -1,0 +1,19 @@
+{
+  "title": "Documentation",
+  "pages": [
+    "index",
+    "installation",
+    "quickstart",
+    "providers",
+    "---Reference---",
+    "commands",
+    "configuration",
+    "tools",
+    "---Concepts---",
+    "agent-engine",
+    "goal-mode",
+    "memory",
+    "telemetry",
+    "scripting"
+  ]
+}

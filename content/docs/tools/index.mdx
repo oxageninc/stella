@@ -1,0 +1,50 @@
+---
+title: Built-in Tools
+description: The complete catalog of tools the Stella agent can call in every session, including which are read-only and which mutate your workspace.
+---
+
+Stella ships with a set of built-in tools that are always available to the agent. On top of these, you can add your own [custom script tools](/docs/tools/custom-tools) and merge in tools from [MCP servers](/docs/tools/mcp). Every tool is subject to a [per-tool permission model](/docs/tools/permissions).
+
+## Listing tools
+
+To see everything available to the agent in the current session — built-ins, developer custom tools, and manifest diagnostics — run:
+
+```bash
+stella tools
+```
+
+This reflects the live session: it accounts for custom tools discovered in `.stella/tools/` and `~/.config/stella/tools/`, and for any tools merged in from configured MCP servers.
+
+## The built-in catalog
+
+Each built-in tool is either **read-only** (it only observes your workspace and environment) or **mutating** (it changes files, runs commands, or performs side effects). Read-only tools are marked `read_only: true` in the tool's permission model.
+
+| Tool | Description | Access |
+| --- | --- | --- |
+| `read` | Read the contents of a file. | Read-only |
+| `write` | Create a file or overwrite an existing one. | Mutating |
+| `edit` | Apply an in-place edit to an existing file. | Mutating |
+| `glob` | Find files by glob pattern. | Read-only |
+| `grep` | Search file contents for a pattern. | Read-only |
+| `bash` | Run a shell command. | Mutating |
+| `exec` | Execute a program or command. | Mutating |
+| `delete` | Delete a file. | Mutating |
+| `ci` | Inspect CI status and logs for a branch or pull request. | Read-only |
+| `issues` | Read and manage issues (Linear if `LINEAR_API_KEY` is set, otherwise GitHub). | Mutating |
+| `project` | Project setup and introspection. | Mutating |
+| `screenshot` | Capture a screenshot. | Read-only |
+| `verify` | Run the definition-of-done check for the current work. | Read-only |
+| `memory` | Save and recall workspace memories. | Mutating |
+| `exploration` | Structured exploration of the codebase. | Read-only |
+| `registry` | List and inspect the tool registry. | Read-only |
+
+<Callout type="info">
+The `issues` tool automatically targets **Linear** when the `LINEAR_API_KEY` environment variable is set, and falls back to **GitHub** otherwise. No configuration change is needed to switch — it is driven entirely by the presence of `LINEAR_API_KEY`.
+</Callout>
+
+## Where to go next
+
+- [Permissions](/docs/tools/permissions) — how read-only and mutating tools are gated, and how hooks can block tool calls.
+- [Custom tools](/docs/tools/custom-tools) — add your own script tools with a TOML manifest.
+- [MCP servers](/docs/tools/mcp) — merge tools from Model Context Protocol servers.
+- [Hooks](/docs/tools/hooks) — run shell commands on agent lifecycle events.
