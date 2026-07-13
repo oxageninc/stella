@@ -3,6 +3,8 @@
 //! overlay until it finishes. This is the tab dispatcher and the one place the
 //! deck's chrome is drawn.
 
+use std::time::Duration;
+
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
@@ -12,7 +14,12 @@ use ratatui_comfy_tabs::{TabNav, TabNavState};
 
 use crate::deck::{DeckTab, WorkspaceModel};
 use crate::deck_ui::DeckUi;
-use crate::{splash, theme, views};
+use crate::{fx, splash, theme, views};
+
+/// How long the deck fades in from muted after the splash hands off.
+const REVEAL_MS: u32 = 350;
+/// How long the amber sweep plays over the content pane on a tab change.
+const TAB_SWITCH_MS: u32 = 180;
 
 pub fn render_deck(model: &WorkspaceModel, ui: &mut DeckUi, frame: &mut Frame) {
     let area = frame.area();
@@ -47,6 +54,27 @@ pub fn render_deck(model: &WorkspaceModel, ui: &mut DeckUi, frame: &mut Frame) {
 
     render_composer(ui, bands[2], buf);
     render_status_bar(model, ui, bands[3], buf);
+
+    // Deck motion (crate::fx), scrubbed like the splash: each frame builds a
+    // fresh effect and processes it once at its wall-clock elapsed, so no
+    // Effect is persisted in the (Clone + Debug) ui state. Colors only —
+    // content/glyphs are never moved, so render tests stay byte-stable.
+    if let Some(at) = ui.tab_switched_at {
+        let elapsed = at.elapsed();
+        if elapsed < Duration::from_millis(u64::from(TAB_SWITCH_MS)) {
+            let mut sweep = fx::tab_switch(TAB_SWITCH_MS);
+            fx::apply(&mut sweep, elapsed, content, buf);
+        } else {
+            ui.tab_switched_at = None; // motion finished — stop rebuilding it
+        }
+    }
+    if let Some(done_at) = ui.splash.finished_at() {
+        let elapsed = done_at.elapsed();
+        if elapsed < Duration::from_millis(u64::from(REVEAL_MS)) {
+            let mut reveal = fx::fade_in(REVEAL_MS);
+            fx::apply(&mut reveal, elapsed, area, buf);
+        }
+    }
 
     if ui.help_open {
         render_help(area, buf);

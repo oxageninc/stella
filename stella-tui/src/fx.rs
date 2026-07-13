@@ -6,17 +6,34 @@
 //! deck's motion language (timing, curves, which colors carry brand meaning)
 //! stays consistent in one place. Colors always come from [`crate::theme`].
 //!
-//! [`crate::splash`] doesn't build its effects here — it needs to scrub to
-//! an arbitrary point on an external `f32` timeline (so a skip lands exactly
-//! where it should), which these forward-only, real-time constructors don't
-//! support — but it shares the same [`apply`] plumbing to drive whatever
-//! effect it builds.
+//! Production consumers today: [`crate::deck_render`] drives [`fade_in`]
+//! (the deck revealing after the splash) and [`tab_switch`] (the sweep on a
+//! tab change); [`crate::splash`] drives [`dissolve_out`] for its dissolve
+//! phase. The splash's coalesce-in stays a hand-built effect there — it is
+//! splash-specific, not part of the deck's shared motion language — but it
+//! shares [`FX_SEED`] and the [`apply`] plumbing.
+//!
+//! Effects here may be rebuilt fresh every frame and *scrubbed* to a point
+//! on an external timeline (see `deck_render`/`splash`): a
+//! `tachyonfx::EffectTimer` only cares about total elapsed time, so one
+//! `process(elapsed)` call on a fresh effect lands exactly where continuous
+//! playback would have. That only holds if randomized effects pick the same
+//! cells every rebuild, which is why the randomized constructors pin their
+//! RNG to [`FX_SEED`].
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use tachyonfx::{Duration as FxDuration, Effect, EffectTimer, Interpolation, Motion, fx};
+use tachyonfx::{
+    Duration as FxDuration, Effect, EffectTimer, Interpolation, Motion, SimpleRng, fx,
+};
 
 use crate::theme;
+
+/// Fixed RNG seed for every randomized deck effect. tachyonfx's default RNG
+/// seeds from the wall clock, so a fresh effect built each frame would pick a
+/// different cell pattern every frame — scrubbed playback would read as
+/// flicker, not motion. One shared seed makes every rebuild agree.
+pub(crate) const FX_SEED: u32 = 0x57E11A;
 
 /// A foreground fade-in from muted to each cell's real color, over `ms`.
 ///
@@ -36,7 +53,7 @@ pub fn fade_in(ms: u32) -> Effect {
 /// "this is going away," distinct from a fade which reads as "this is
 /// settling in."
 pub fn dissolve_out(ms: u32) -> Effect {
-    fx::dissolve(EffectTimer::from_ms(ms, Interpolation::QuadIn))
+    fx::dissolve(EffectTimer::from_ms(ms, Interpolation::QuadIn)).with_rng(SimpleRng::new(FX_SEED))
 }
 
 /// A brisk amber sweep for tab / view switches in the deck shell: the new
@@ -50,6 +67,7 @@ pub fn tab_switch(ms: u32) -> Effect {
         theme::AMBER_DEEP,
         EffectTimer::from_ms(ms, Interpolation::CircOut),
     )
+    .with_rng(SimpleRng::new(FX_SEED))
 }
 
 /// Advances `effect` by `dt` and renders the result into `buf` within

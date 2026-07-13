@@ -45,7 +45,9 @@ const MIN_WORDMARK_HEIGHT: u16 = 8;
 #[derive(Debug, Clone)]
 pub struct SplashState {
     start: Instant,
-    skipped: bool,
+    /// When `skip()` dismissed the splash early, if it did — the moment the
+    /// deck took over, used by [`Self::finished_at`].
+    skipped_at: Option<Instant>,
 }
 
 impl Default for SplashState {
@@ -58,13 +60,16 @@ impl SplashState {
     pub fn new() -> Self {
         Self {
             start: Instant::now(),
-            skipped: false,
+            skipped_at: None,
         }
     }
 
-    /// Dismiss immediately (any key).
+    /// Dismiss immediately (any key). Idempotent — the first skip wins, so
+    /// `finished_at` stays stable under repeated keypresses.
     pub fn skip(&mut self) {
-        self.skipped = true;
+        if self.skipped_at.is_none() {
+            self.skipped_at = Some(Instant::now());
+        }
     }
 
     pub fn elapsed(&self) -> Duration {
@@ -73,7 +78,7 @@ impl SplashState {
 
     /// Progress `0.0..=1.0` through the splash timeline.
     pub fn progress(&self) -> f32 {
-        if self.skipped {
+        if self.skipped_at.is_some() {
             return 1.0;
         }
         (self.elapsed().as_secs_f32() / SPLASH_DURATION.as_secs_f32()).clamp(0.0, 1.0)
@@ -81,7 +86,20 @@ impl SplashState {
 
     /// True once the splash should hand off to the deck.
     pub fn is_done(&self) -> bool {
-        self.skipped || self.elapsed() >= SPLASH_DURATION
+        self.skipped_at.is_some() || self.elapsed() >= SPLASH_DURATION
+    }
+
+    /// The moment the splash finished (skipped or timed out), or `None` while
+    /// it is still playing. The deck uses this to time its reveal fade
+    /// (`deck_render` drives [`crate::fx::fade_in`] from it).
+    pub fn finished_at(&self) -> Option<Instant> {
+        if let Some(at) = self.skipped_at {
+            return Some(at);
+        }
+        if self.elapsed() >= SPLASH_DURATION {
+            return Some(self.start + SPLASH_DURATION);
+        }
+        None
     }
 }
 
@@ -101,38 +119,31 @@ pub fn render(state: &SplashState, area: Rect, buf: &mut Buffer) {
     crate::fx::apply(&mut effect, elapsed, area, buf);
 }
 
-/// Fixed RNG seed for the coalesce/dissolve cell pattern. `render` builds a
-/// FRESH effect every frame and scrubs it to `progress()`; tachyonfx's
-/// dissolve/coalesce pick which cells flip from their RNG, and the default
-/// RNG seeds from the wall clock — so an unseeded fresh effect would choose a
-/// different cell pattern every frame and the scrub would read as flicker,
-/// not an animation. One fixed seed makes every frame agree on the pattern,
-/// keeping the scrubbed playback identical to a continuously-driven effect.
-const FX_SEED: u32 = 0x57E11A;
-
 /// Picks the coalesce-in or dissolve-out effect for the current splash
 /// `progress`, paired with the synthetic elapsed duration that, applied to a
 /// *fresh* copy of that effect, lands it exactly where continuous real-time
-/// playback would have at this point in the timeline.
+/// playback would have at this point in the timeline. Both effects run on
+/// the pinned [`crate::fx::FX_SEED`] RNG so the random cell pattern is
+/// identical across per-frame rebuilds (an unseeded effect would re-roll the
+/// pattern every frame and the scrub would read as flicker).
 fn timeline_effect(progress: f32) -> (Effect, Duration) {
     let reveal_dur = SPLASH_DURATION.mul_f32(REVEAL_FRACTION);
     let dissolve_dur = SPLASH_DURATION.saturating_sub(reveal_dur);
 
     if progress < REVEAL_FRACTION {
+        // Splash-specific: the coalesce-in is not part of the deck's shared
+        // motion language (crate::fx), so it is built here.
         let local = (progress / REVEAL_FRACTION).clamp(0.0, 1.0);
         let effect = fx::coalesce(EffectTimer::new(
             FxDuration::from(reveal_dur),
             Interpolation::QuadOut,
         ))
-        .with_rng(SimpleRng::new(FX_SEED));
+        .with_rng(SimpleRng::new(crate::fx::FX_SEED));
         (effect, reveal_dur.mul_f32(local))
     } else {
+        // The dissolve IS the deck's shared teardown motion — reuse it.
         let local = ((progress - REVEAL_FRACTION) / (1.0 - REVEAL_FRACTION)).clamp(0.0, 1.0);
-        let effect = fx::dissolve(EffectTimer::new(
-            FxDuration::from(dissolve_dur),
-            Interpolation::QuadIn,
-        ))
-        .with_rng(SimpleRng::new(FX_SEED));
+        let effect = crate::fx::dissolve_out(dissolve_dur.as_millis() as u32);
         (effect, dissolve_dur.mul_f32(local))
     }
 }
@@ -232,7 +243,7 @@ mod tests {
     fn state_at(elapsed_ms: u64) -> SplashState {
         SplashState {
             start: Instant::now() - Duration::from_millis(elapsed_ms),
-            skipped: false,
+            skipped_at: None,
         }
     }
 
@@ -255,7 +266,7 @@ mod tests {
     fn default_matches_new() {
         let state = SplashState::default();
         assert!(!state.is_done());
-        assert!(!state.skipped);
+        assert!(state.skipped_at.is_none());
     }
 
     #[test]
@@ -265,6 +276,24 @@ mod tests {
         state.skip();
         assert!(state.is_done());
         assert_eq!(state.progress(), 1.0);
+    }
+
+    #[test]
+    fn finished_at_is_none_while_playing_then_stable_once_done() {
+        // Still playing: no finish moment yet.
+        assert!(state_at(100).finished_at().is_none());
+
+        // Timed out: finishes exactly at start + SPLASH_DURATION.
+        let timed_out = state_at(2_000);
+        let fin = timed_out.finished_at().expect("past the timeline");
+        assert_eq!(fin, timed_out.start + SPLASH_DURATION);
+
+        // Skipped: the first skip pins the moment; a second skip won't move it.
+        let mut skipped = SplashState::new();
+        skipped.skip();
+        let first = skipped.finished_at().expect("skip finishes the splash");
+        skipped.skip();
+        assert_eq!(skipped.finished_at(), Some(first));
     }
 
     #[test]

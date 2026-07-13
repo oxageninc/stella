@@ -60,6 +60,10 @@ pub struct DeckUi {
     pub files_diff_open: bool,
     pub files_diff_scroll: ScrollState,
     pub metrics: DeckMetrics,
+    /// When the active tab last changed — `deck_render` drives the
+    /// [`crate::fx::tab_switch`] sweep from it, then clears it once the
+    /// motion has played out. `None` = no sweep in flight.
+    pub tab_switched_at: Option<std::time::Instant>,
 }
 
 impl Default for DeckUi {
@@ -79,6 +83,7 @@ impl Default for DeckUi {
             files_diff_open: false,
             files_diff_scroll: ScrollState::default(),
             metrics: DeckMetrics::default(),
+            tab_switched_at: None,
         }
     }
 }
@@ -88,6 +93,16 @@ impl DeckUi {
         Self {
             composer,
             ..Self::default()
+        }
+    }
+
+    /// Switch the active tab, stamping the moment so the render layer can
+    /// play the [`crate::fx::tab_switch`] sweep. Same-tab is a no-op — a
+    /// re-press must not restart the motion.
+    pub fn set_tab(&mut self, tab: DeckTab) {
+        if tab != self.tab {
+            self.tab = tab;
+            self.tab_switched_at = Some(std::time::Instant::now());
         }
     }
 }
@@ -150,15 +165,15 @@ pub fn handle_deck_key(key: KeyEvent, model: &WorkspaceModel, ui: &mut DeckUi) -
     // Deck-global tab navigation (Tab / Shift-Tab always; digits when empty).
     match key.code {
         KeyCode::Tab => {
-            ui.tab = ui.tab.next();
+            ui.set_tab(ui.tab.next());
             return DeckAction::Handled;
         }
         KeyCode::BackTab => {
-            ui.tab = ui.tab.prev();
+            ui.set_tab(ui.tab.prev());
             return DeckAction::Handled;
         }
         KeyCode::Char(d @ '1'..='5') if composer_empty => {
-            ui.tab = DeckTab::from_index((d as usize) - ('1' as usize));
+            ui.set_tab(DeckTab::from_index((d as usize) - ('1' as usize)));
             return DeckAction::Handled;
         }
         KeyCode::Char('?') if composer_empty => {
@@ -271,7 +286,7 @@ fn handle_agents_key(
             Some(DeckAction::Handled)
         }
         KeyCode::Enter if composer_empty => {
-            ui.tab = DeckTab::Session;
+            ui.set_tab(DeckTab::Session);
             Some(DeckAction::Handled)
         }
         // Agent controls — only when the composer is empty (else they type).
@@ -588,6 +603,22 @@ mod tests {
                 input: UserInput::ScopeDecision(ScopeDecision::Approve),
             })
         );
+    }
+
+    #[test]
+    fn set_tab_stamps_the_switch_moment_only_on_change() {
+        let model = model_with(&["lead"]);
+        let mut ui = ready_ui();
+        assert!(ui.tab_switched_at.is_none(), "no motion before any switch");
+
+        // The key path routes through set_tab and stamps the moment.
+        handle_deck_key(key(KeyCode::Tab), &model, &mut ui);
+        assert_eq!(ui.tab, DeckTab::Agents);
+        let first = ui.tab_switched_at.expect("tab switch stamped");
+
+        // Switching to the SAME tab must not restart the sweep.
+        ui.set_tab(DeckTab::Agents);
+        assert_eq!(ui.tab_switched_at, Some(first));
     }
 
     #[test]
