@@ -241,7 +241,7 @@ jobs:
           --model "$BENCH_MODEL"
           --budget 1
           --timeout 900
-          --stella-bin target/release/stella
+          --stella-bin ${{ github.workspace }}/target/release/stella
 
       - name: Upload receipts
         if: always() && steps.preflight.outputs.run == 'true'
