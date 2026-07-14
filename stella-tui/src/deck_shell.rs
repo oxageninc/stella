@@ -27,11 +27,11 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
-use crate::composer::Composer;
+use crate::composer::{Composer, SlashCommand};
 use crate::deck::WorkspaceModel;
 use crate::deck_render::render_deck;
 use crate::deck_ui::{DeckAction, DeckUi, handle_deck_key, ingest_inbound};
-use crate::envelope::{Inbound, WorkspaceInput};
+use crate::envelope::{AgentMeta, AgentStatus, Inbound, WorkspaceInput};
 use crate::graph::GraphSnapshot;
 use crate::resource::ResourceMonitor;
 use crate::shell::DebugLog;
@@ -39,6 +39,14 @@ use crate::shell::DebugLog;
 /// The repaint / sample cadence. ~30 fps keeps animations smooth and the CPU
 /// gauge / elapsed timers live without busy-spinning.
 const TICK: Duration = Duration::from_millis(33);
+
+/// The synthetic agent id `!` shell commands run under — they get their own
+/// dashboard lane and transcript instead of polluting a real agent's fold.
+const SHELL_AGENT: &str = "shell";
+
+/// Cap on captured shell output fed back as an event. Head and tail are both
+/// kept (errors live at the tail); the middle is elided.
+const SHELL_OUTPUT_CAP: usize = 4000;
 
 /// Configuration for one deck session.
 #[derive(Debug, Clone, Default)]
@@ -51,6 +59,9 @@ pub struct DeckOptions {
     /// An initial code-graph snapshot to seed the Graph tab (the caller, which
     /// owns a `CodeGraph`, queries it and hands it in — the TUI stays decoupled).
     pub initial_graph: Option<GraphSnapshot>,
+    /// The slash-command vocabulary for the `/` popup (the caller owns the
+    /// real list, exactly like the single-session `RunOptions`).
+    pub slash_commands: Vec<SlashCommand>,
 }
 
 /// Restores the terminal on drop, including during a panic unwind.
@@ -108,6 +119,95 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Run one `!` shell command **immediately** on the local event lane.
+///
+/// The command gets the synthetic [`SHELL_AGENT`] lane: a `Register` (idempotent
+/// — re-registering only refreshes the title to the latest command), a
+/// `ToolStart` so the invocation is visible the instant it launches, and a
+/// `ToolResult` + terminal `Status` when it finishes. stdout and stderr are
+/// both captured; a non-zero exit reports as a tool error. The TUI never
+/// blocks on the child — it runs on a spawned task and reports back over `tx`.
+fn spawn_shell_command(cmd: String, tx: UnboundedSender<Inbound>, started_ms: u64) {
+    use stella_protocol::{AgentEvent, ToolCall, ToolOutput};
+
+    let call_id = format!("shell-{started_ms}");
+    let _ = tx.send(Inbound::Register(
+        AgentMeta::new(SHELL_AGENT, format!("! {cmd}"), started_ms).with_role("shell"),
+    ));
+    let _ = tx.send(Inbound::Event {
+        agent: SHELL_AGENT.to_string(),
+        event: AgentEvent::ToolStart {
+            call: ToolCall {
+                call_id: call_id.clone(),
+                name: "shell".to_string(),
+                input: serde_json::json!({ "cmd": cmd }),
+            },
+        },
+    });
+
+    tokio::spawn(async move {
+        let started = std::time::Instant::now();
+        let result = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(&cmd)
+            .output()
+            .await;
+        let (ok, content) = match result {
+            Ok(out) => {
+                let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+                if !out.stderr.is_empty() {
+                    if !text.is_empty() {
+                        text.push('\n');
+                    }
+                    text.push_str(&String::from_utf8_lossy(&out.stderr));
+                }
+                if text.trim().is_empty() {
+                    text = format!("(no output — exit {})", out.status);
+                }
+                (out.status.success(), cap_output(&text))
+            }
+            Err(e) => (false, format!("failed to spawn `sh -c`: {e}")),
+        };
+        let output = if ok {
+            ToolOutput::Ok { content }
+        } else {
+            ToolOutput::Error { message: content }
+        };
+        let _ = tx.send(Inbound::Event {
+            agent: SHELL_AGENT.to_string(),
+            event: AgentEvent::ToolResult {
+                call_id,
+                output,
+                duration_ms: started.elapsed().as_millis() as u64,
+            },
+        });
+        // Park the lane so it never reads as still-working (a lingering
+        // Running shell agent would keep the spinner alive forever).
+        let _ = tx.send(Inbound::Status {
+            agent: SHELL_AGENT.to_string(),
+            status: if ok {
+                AgentStatus::Done
+            } else {
+                AgentStatus::Failed
+            },
+        });
+    });
+}
+
+/// Middle-out cap on shell output: keep the head and the tail (errors live at
+/// the tail), elide the middle past [`SHELL_OUTPUT_CAP`] chars.
+fn cap_output(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= SHELL_OUTPUT_CAP {
+        return text.to_string();
+    }
+    let half = SHELL_OUTPUT_CAP / 2;
+    let head: String = chars[..half].iter().collect();
+    let tail: String = chars[chars.len() - half..].iter().collect();
+    format!("{head}\n…[output truncated]…\n{tail}")
+}
+
+
 /// Run the command deck to completion. [`Inbound`] envelopes stream in over
 /// `inbound`; the user's [`WorkspaceInput`]s stream out over `submissions`.
 /// Returns when the inbound stream closes or the user quits, having always
@@ -127,7 +227,13 @@ pub async fn run_deck(
     model.now_ms = now_ms();
     let mut ui = DeckUi::new(Composer::new());
     ui.graph = opts.initial_graph.clone();
+    ui.slash_commands = opts.slash_commands.clone();
     let mut resources = ResourceMonitor::new();
+
+    // Synthetic-event lane for `!` shell commands: spawned commands report
+    // back here and are folded exactly like engine events. The sender lives
+    // for the whole loop, so this arm never closes it.
+    let (local_tx, mut local_rx) = tokio::sync::mpsc::unbounded_channel::<Inbound>();
 
     // Blocking crossterm reader → async loop, with a shutdown flag.
     let (key_tx, mut key_rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
@@ -174,13 +280,29 @@ pub async fn run_deck(
                                 break 'run;
                             }
                             DeckAction::Send(input) => {
-                                // A queued prompt is reflected locally so it shows
+                                // Queue edits are reflected locally so they show
                                 // immediately, then forwarded for dispatch — the
-                                // input path never blocks on a busy agent.
-                                if let WorkspaceInput::Enqueue { text } = &input {
-                                    model.queue.enqueue(text.clone(), model.now_ms);
+                                // input path never blocks on a busy agent. (The
+                                // queue is the labeled out-of-band fold of the
+                                // OUTBOUND stream; this is its one mutation site.)
+                                match &input {
+                                    WorkspaceInput::Enqueue { text } => {
+                                        model.queue.enqueue(text.clone(), model.now_ms);
+                                    }
+                                    WorkspaceInput::QueueRemove { index } => {
+                                        model.queue.remove(*index);
+                                    }
+                                    WorkspaceInput::QueueClear => model.queue.clear(),
+                                    _ => {}
                                 }
                                 let _ = submissions.send(input);
+                            }
+                            DeckAction::Shell(cmd) => {
+                                // `!` commands run NOW — never queued, never
+                                // waiting on the engine. Output returns on the
+                                // local lane as ordinary events.
+                                debug.note(&format!("shell: {cmd}"));
+                                spawn_shell_command(cmd, local_tx.clone(), model.now_ms);
                             }
                             DeckAction::Handled | DeckAction::Ignored => {}
                         }
@@ -189,6 +311,13 @@ pub async fn run_deck(
                     Some(_) => {}
                     // Reader thread ended (stdin closed).
                     None => break 'run,
+                }
+            }
+            maybe_local = local_rx.recv() => {
+                // Shell-command lane (see `spawn_shell_command`). `local_tx`
+                // outlives the loop, so `None` cannot actually occur.
+                if let Some(ev) = maybe_local {
+                    ingest_inbound(&ev, &mut model, &mut ui);
                 }
             }
             _ = tick.tick() => {
@@ -204,4 +333,48 @@ pub async fn run_deck(
     let _ = reader.join();
     debug.note("deck session end");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cap_output_keeps_head_and_tail() {
+        let short = "fits";
+        assert_eq!(cap_output(short), short);
+        let long = format!("HEAD{}TAIL", "x".repeat(SHELL_OUTPUT_CAP * 2));
+        let capped = cap_output(&long);
+        assert!(capped.starts_with("HEAD"));
+        assert!(capped.ends_with("TAIL"));
+        assert!(capped.contains("[output truncated]"));
+        assert!(capped.chars().count() < long.chars().count());
+    }
+
+    #[test]
+    fn shell_commands_report_on_the_local_lane() {
+        // The spawner's synchronous part: Register + ToolStart land on the
+        // channel immediately, before the child even runs.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        spawn_shell_command("echo hi".into(), tx, 42);
+        match rx.try_recv() {
+            Ok(Inbound::Register(meta)) => {
+                assert_eq!(meta.id, SHELL_AGENT);
+                assert!(meta.title.contains("echo hi"));
+            }
+            other => panic!("expected Register first, got {other:?}"),
+        }
+        match rx.try_recv() {
+            Ok(Inbound::Event { agent, .. }) => assert_eq!(agent, SHELL_AGENT),
+            other => panic!("expected ToolStart second, got {other:?}"),
+        }
+        // The async completion (ToolResult + terminal Status) needs the
+        // runtime to run the child; the sync part above is the determinism
+        // this test pins, so completion just needs to arrive eventually.
+        rt.block_on(async {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await;
+        });
+    }
 }

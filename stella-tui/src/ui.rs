@@ -70,6 +70,12 @@ pub struct UiState {
     /// The slash-command vocabulary offered by the menu (an input — the CLI
     /// owns the real list).
     pub slash_commands: Vec<SlashCommand>,
+    /// Selected row in the slash popup while it is open (clamped to the
+    /// filtered matches at use time).
+    pub slash_selected: usize,
+    /// Whether reasoning entries render in full. Off by default — collapsed
+    /// thinking shows a one-line live tail; `ctrl+r` toggles.
+    pub thinking_expanded: bool,
     /// Viewport sizes from the last render (for scroll clamping).
     pub metrics: ViewportMetrics,
 }
@@ -86,6 +92,8 @@ impl Default for UiState {
             scope_answered: false,
             ask_answered: false,
             slash_commands: Vec::new(),
+            slash_selected: 0,
+            thinking_expanded: false,
             metrics: ViewportMetrics::default(),
         }
     }
@@ -147,6 +155,12 @@ pub fn handle_key(key: KeyEvent, model: &SessionModel, ui: &mut UiState) -> Shel
     // Ctrl-C always requests a clean cancel + quit, from any focus.
     if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
         return ShellAction::Quit;
+    }
+
+    // Ctrl-R toggles the collapsed-thinking view from any focus.
+    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('r')) {
+        ui.thinking_expanded = !ui.thinking_expanded;
+        return ShellAction::Handled;
     }
 
     // A pending, unanswered scope card is modal-ish: a/t/x/Esc decide it.
@@ -227,7 +241,51 @@ fn scope_decision_for(code: KeyCode) -> Option<ScopeDecision> {
     }
 }
 
+/// The names of the slash commands currently matching the composer, or empty
+/// when the popup is not active. Owned strings so the caller can keep
+/// mutating `ui` while acting on them.
+fn slash_matches(ui: &UiState) -> Vec<String> {
+    ui.composer
+        .slash_menu(&ui.slash_commands)
+        .map(|m| m.matches.iter().map(|c| c.name.clone()).collect())
+        .unwrap_or_default()
+}
+
 fn handle_composer_key(key: KeyEvent, ui: &mut UiState) -> ShellAction {
+    // While the slash popup is open, navigation keys drive it: ↑/↓ choose,
+    // Tab completes into the buffer, Enter runs the selection, Esc dismisses.
+    let slash = slash_matches(ui);
+    if !slash.is_empty() {
+        let selected = ui.slash_selected.min(slash.len() - 1);
+        match key.code {
+            KeyCode::Up => {
+                ui.slash_selected = selected.saturating_sub(1);
+                return ShellAction::Handled;
+            }
+            KeyCode::Down => {
+                ui.slash_selected = (selected + 1).min(slash.len() - 1);
+                return ShellAction::Handled;
+            }
+            KeyCode::Tab => {
+                ui.composer.load(slash[selected].clone());
+                ui.slash_selected = 0;
+                return ShellAction::Handled;
+            }
+            KeyCode::Enter => {
+                ui.composer.clear();
+                ui.slash_selected = 0;
+                return ShellAction::Submit(UserInput::Prompt {
+                    text: slash[selected].clone(),
+                });
+            }
+            KeyCode::Esc => {
+                ui.composer.clear();
+                ui.slash_selected = 0;
+                return ShellAction::Handled;
+            }
+            _ => {}
+        }
+    }
     match key.code {
         KeyCode::Enter => match ui.composer.take_submission() {
             Some(text) => ShellAction::Submit(UserInput::Prompt { text }),
@@ -235,6 +293,7 @@ fn handle_composer_key(key: KeyEvent, ui: &mut UiState) -> ShellAction {
         },
         KeyCode::Backspace => {
             ui.composer.backspace();
+            ui.slash_selected = 0;
             ShellAction::Handled
         }
         KeyCode::Tab => {
@@ -243,6 +302,7 @@ fn handle_composer_key(key: KeyEvent, ui: &mut UiState) -> ShellAction {
         }
         KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
             ui.composer.insert_char(c);
+            ui.slash_selected = 0;
             ShellAction::Handled
         }
         // Non-printable navigation scrolls the transcript (or the diff when
@@ -547,6 +607,83 @@ mod tests {
             &mut ui,
         );
         assert!(!ui.ask_answered);
+    }
+
+    #[test]
+    fn ctrl_r_toggles_the_thinking_view() {
+        let model = SessionModel::new();
+        let mut ui = UiState::default();
+        assert!(!ui.thinking_expanded, "collapsed by default");
+        assert_eq!(handle_key(ctrl('r'), &model, &mut ui), ShellAction::Handled);
+        assert!(ui.thinking_expanded);
+        handle_key(ctrl('r'), &model, &mut ui);
+        assert!(!ui.thinking_expanded);
+    }
+
+    fn slash_ui() -> UiState {
+        UiState::new(
+            Composer::new(),
+            vec![
+                SlashCommand::new("/help", "show help"),
+                SlashCommand::new("/diff", "open the diff viewer"),
+                SlashCommand::new("/files", "focus files"),
+            ],
+        )
+    }
+
+    #[test]
+    fn slash_popup_arrows_choose_and_enter_runs_the_selection() {
+        let model = SessionModel::new();
+        let mut ui = slash_ui();
+        handle_key(ch('/'), &model, &mut ui);
+        handle_key(key(KeyCode::Down), &model, &mut ui);
+        assert_eq!(ui.slash_selected, 1);
+        let action = handle_key(key(KeyCode::Enter), &model, &mut ui);
+        assert_eq!(
+            action,
+            ShellAction::Submit(UserInput::Prompt {
+                text: "/diff".into()
+            })
+        );
+        assert!(ui.composer.is_empty(), "running a command clears the line");
+    }
+
+    #[test]
+    fn slash_popup_tab_completes_without_submitting() {
+        let model = SessionModel::new();
+        let mut ui = slash_ui();
+        for c in "/f".chars() {
+            handle_key(ch(c), &model, &mut ui);
+        }
+        let action = handle_key(key(KeyCode::Tab), &model, &mut ui);
+        assert_eq!(action, ShellAction::Handled);
+        assert_eq!(ui.composer.buffer(), "/files", "completed in place");
+    }
+
+    #[test]
+    fn slash_popup_esc_dismisses_and_typing_resets_the_selection() {
+        let model = SessionModel::new();
+        let mut ui = slash_ui();
+        handle_key(ch('/'), &model, &mut ui);
+        handle_key(key(KeyCode::Down), &model, &mut ui);
+        assert_eq!(ui.slash_selected, 1);
+        handle_key(ch('h'), &model, &mut ui);
+        assert_eq!(ui.slash_selected, 0, "typing narrows → selection resets");
+        handle_key(key(KeyCode::Esc), &model, &mut ui);
+        assert!(ui.composer.is_empty(), "esc clears the slash query");
+    }
+
+    #[test]
+    fn arrows_still_scroll_when_no_slash_popup_is_active() {
+        let model = SessionModel::new();
+        let mut ui = slash_ui();
+        ui.metrics = ViewportMetrics {
+            transcript_height: 10,
+            transcript_total: 100,
+            ..Default::default()
+        };
+        handle_key(key(KeyCode::Up), &model, &mut ui);
+        assert!(!ui.scroll.follow, "no popup → arrows scroll the transcript");
     }
 
     #[test]

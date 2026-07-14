@@ -175,6 +175,14 @@ impl Composer {
         self.buffer.clear();
     }
 
+    /// Replace the composer's content with `text` — the queue editor uses
+    /// this to pull a queued prompt back in for editing. Any in-progress
+    /// chips/typing are discarded (the caller decides when that is right).
+    pub fn load(&mut self, text: impl Into<String>) {
+        self.chips.clear();
+        self.buffer = text.into();
+    }
+
     /// The slash-menu view over `commands`, or `None` when the buffer is not
     /// a slash query. Active only when the whole buffer is a single `/`-word
     /// (no spaces yet) with no committed chips.
