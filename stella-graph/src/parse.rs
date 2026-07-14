@@ -359,7 +359,7 @@ fn extract_rust_orm_tables(root: Node, src: &[u8]) -> Vec<Symbol> {
             && let Ok(name) = macro_id.utf8_text(src)
         {
             let name_lower = name.to_ascii_lowercase();
-            if name_lower.ends_with("table") {
+            if name_lower == "table" || name_lower.ends_with("::table") {
                 let mut tc = node.walk();
                 for child in node.children(&mut tc) {
                     if child.kind() == "token_tree" {
@@ -400,13 +400,13 @@ fn extract_python_orm_tables(root: Node, src: &[u8]) -> Vec<Symbol> {
 
     fn walk(node: Node, src: &[u8], out: &mut Vec<Symbol>) {
         if node.kind() == "class_definition" {
-            let is_model = check_python_orm_superclass(node, src)
-                || check_python_tablename(node, src);
+            let tablename = python_tablename_value(node, src);
+            let is_model = tablename.is_some() || check_python_orm_superclass(node, src);
             if is_model
                 && let Some(name_node) = node.child_by_field_name("name")
                 && let Ok(name) = name_node.utf8_text(src)
             {
-                let table_name = python_class_to_table_name(name);
+                let table_name = tablename.unwrap_or_else(|| python_class_to_table_name(name));
                 out.push(Symbol {
                     name: table_name,
                     kind: SymbolKind::Table,
@@ -427,6 +427,10 @@ fn extract_python_orm_tables(root: Node, src: &[u8]) -> Vec<Symbol> {
 }
 
 /// Check if a Python class inherits from a known ORM base class.
+/// Matches the base expression's innermost identifier exactly (`Model`,
+/// `models.Model`, `Base`, `sqlalchemy.orm.Base`, `declarative_base()`) so
+/// unrelated types that merely end in the same substring — `ViewModel`,
+/// `DatabaseModel` — are not mistaken for ORM bases.
 fn check_python_orm_superclass(class_node: Node, src: &[u8]) -> bool {
     let Some(superclasses) = class_node.child_by_field_name("superclasses") else {
         return false;
@@ -434,14 +438,8 @@ fn check_python_orm_superclass(class_node: Node, src: &[u8]) -> bool {
     let mut cursor = superclasses.walk();
     for arg in superclasses.children(&mut cursor) {
         if let Ok(text) = arg.utf8_text(src) {
-            let text = text.trim();
-            // Django: models.Model, db.Model
-            // SQLAlchemy: Base, declarative_base, Model
-            if text.ends_with("Model")
-                || text.ends_with(".Base")
-                || text == "Base"
-                || text.ends_with("declarative_base()")
-            {
+            let ident = python_base_identifier(text.trim());
+            if ident == "Model" || ident == "Base" || ident == "declarative_base" {
                 return true;
             }
         }
@@ -449,23 +447,56 @@ fn check_python_orm_superclass(class_node: Node, src: &[u8]) -> bool {
     false
 }
 
-/// Check if a Python class body contains `__tablename__ = "..."`.
-fn check_python_tablename(class_node: Node, src: &[u8]) -> bool {
-    let body = match class_node.child_by_field_name("body") {
-        Some(b) => b,
-        None => return false,
-    };
+/// The innermost identifier of a (possibly qualified, possibly called) base
+/// class expression: `models.Model` -> `Model`, `declarative_base()` ->
+/// `declarative_base`.
+fn python_base_identifier(text: &str) -> &str {
+    let text = text.strip_suffix("()").unwrap_or(text);
+    text.rsplit('.').next().unwrap_or(text)
+}
+
+/// Extract the string value of `__tablename__ = "..."` from a Python class
+/// body, if present.
+fn python_tablename_value(class_node: Node, src: &[u8]) -> Option<String> {
+    let body = class_node.child_by_field_name("body")?;
     let mut cursor = body.walk();
-    for child in body.children(&mut cursor) {
-        if child.kind() == "assignment"
-            && let Some(left) = child.child_by_field_name("left")
+    for stmt in body.children(&mut cursor) {
+        // Class-body statements are wrapped in `expression_statement`; the
+        // `assignment` itself is an unnamed child of that wrapper.
+        let assignment = if stmt.kind() == "assignment" {
+            Some(stmt)
+        } else if stmt.kind() == "expression_statement" {
+            let mut inner = stmt.walk();
+            stmt.children(&mut inner).find(|c| c.kind() == "assignment")
+        } else {
+            None
+        };
+        let Some(assignment) = assignment else {
+            continue;
+        };
+        if let Some(left) = assignment.child_by_field_name("left")
             && let Ok(text) = left.utf8_text(src)
             && text == "__tablename__"
+            && let Some(right) = assignment.child_by_field_name("right")
         {
-            return true;
+            return python_string_literal_value(right, src);
         }
     }
-    false
+    None
+}
+
+/// The inner text of a Python string literal node, quotes stripped.
+fn python_string_literal_value(node: Node, src: &[u8]) -> Option<String> {
+    if node.kind() != "string" {
+        return None;
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "string_content" {
+            return child.utf8_text(src).ok().map(|s| s.to_string());
+        }
+    }
+    None
 }
 
 /// Naive Django-style class→table conversion: CamelCase → snake_case + plural.
@@ -812,6 +843,66 @@ class Order(Base):
                 .iter()
                 .any(|s| s.kind == SymbolKind::Table),
             "SQLAlchemy model not detected: {:?}",
+            parsed.symbols
+        );
+    }
+
+    #[test]
+    fn sqlalchemy_explicit_tablename_overrides_class_name_convention() {
+        // `__tablename__` deliberately does not match the naive
+        // CamelCase->snake_case->pluralize conversion of the class name, so
+        // this only passes if the literal value is read rather than derived.
+        let src = "\
+from sqlalchemy.orm import declarative_base
+Base = declarative_base()
+
+class Order(Base):
+    __tablename__ = \"customer_orders\"
+    id = Column(Integer, primary_key=True)
+";
+        let parsed = parse(Language::Python, src);
+        assert!(
+            parsed
+                .symbols
+                .iter()
+                .any(|s| s.name == "customer_orders" && s.kind == SymbolKind::Table),
+            "explicit __tablename__ value not used: {:?}",
+            parsed.symbols
+        );
+        assert!(
+            !parsed.symbols.iter().any(|s| s.name == "orders"),
+            "table name should not fall back to class-name convention: {:?}",
+            parsed.symbols
+        );
+    }
+
+    #[test]
+    fn python_unrelated_view_model_not_detected_as_table() {
+        let src = "\
+class OrderViewModel(ViewModel):
+    total = 0
+";
+        let parsed = parse(Language::Python, src);
+        assert!(
+            !parsed.symbols.iter().any(|s| s.kind == SymbolKind::Table),
+            "unrelated ViewModel base should not be indexed as a table: {:?}",
+            parsed.symbols
+        );
+    }
+
+    #[test]
+    fn rust_unrelated_table_suffixed_macro_not_detected() {
+        let src = "\
+render_table! {
+    users (id) {
+        id -> Int4,
+    }
+}
+";
+        let parsed = parse(Language::Rust, src);
+        assert!(
+            !parsed.symbols.iter().any(|s| s.kind == SymbolKind::Table),
+            "unrelated render_table! macro should not be indexed as a table: {:?}",
             parsed.symbols
         );
     }
