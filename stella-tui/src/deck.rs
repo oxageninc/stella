@@ -212,6 +212,27 @@ impl WorkspaceModel {
                     self.agents[i].status = *status;
                 }
             }
+            Inbound::PromptStarted { agent, text } => {
+                // The dispatcher drained the oldest queued prompt. Both sides
+                // are FIFO over one ordered channel, so the front entry is the
+                // one that started; `text` is carried for the trace row (and
+                // as a guard against a front entry the shell never saw).
+                if self
+                    .queue
+                    .items
+                    .front()
+                    .is_none_or(|queued| queued.text == *text)
+                {
+                    let _ = self.queue.take_next();
+                }
+                let ts = self.now_ms;
+                self.trace.push(TraceRow {
+                    ts,
+                    agent: agent.clone(),
+                    kind: TraceKind::Stage,
+                    summary: format!("▶ {}", snip(text)),
+                });
+            }
         }
     }
 
@@ -938,6 +959,38 @@ mod tests {
         assert_eq!(q.take_next().as_deref(), Some("second"));
         assert_eq!(q.pending(), 0);
         assert_eq!(q.take_next(), None);
+    }
+
+    #[test]
+    fn prompt_started_pops_the_front_of_the_queue_and_leaves_a_trace() {
+        let mut w = WorkspaceModel::new();
+        w.apply_inbound(&reg("lead"));
+        // The shell enqueues on submit (its labeled out-of-band mutation)…
+        w.queue.enqueue("first".into(), 1);
+        w.queue.enqueue("second".into(), 2);
+        // …and the dispatcher's PromptStarted drains it front-first.
+        w.apply_inbound(&Inbound::PromptStarted {
+            agent: "lead".into(),
+            text: "first".into(),
+        });
+        assert_eq!(w.queue.pending(), 1);
+        assert_eq!(w.queue.items.front().map(|q| q.text.as_str()), Some("second"));
+        let row = w.trace.rows.back().expect("a trace row was recorded");
+        assert_eq!(row.agent, "lead");
+        assert!(row.summary.contains("first"), "{}", row.summary);
+    }
+
+    #[test]
+    fn prompt_started_with_an_unseen_text_never_drops_someone_elses_entry() {
+        let mut w = WorkspaceModel::new();
+        w.queue.enqueue("queued by the shell".into(), 1);
+        // A dispatch the shell never enqueued (e.g. a driver-side prompt)
+        // must not eat the front entry the user is still watching.
+        w.apply_inbound(&Inbound::PromptStarted {
+            agent: "lead".into(),
+            text: "driver-side prompt".into(),
+        });
+        assert_eq!(w.queue.pending(), 1);
     }
 
     #[test]
