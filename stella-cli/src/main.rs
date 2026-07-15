@@ -21,6 +21,7 @@ mod agent;
 mod command_deck;
 mod config;
 mod domains;
+mod fleet_cmd;
 mod interactive;
 mod memory;
 mod settings;
@@ -142,6 +143,42 @@ enum Command {
         validate: Option<Option<std::path::PathBuf>>,
     },
 
+    /// Fan tasks out to a fleet of worker agents — one git worktree per
+    /// isolated task, wave-scheduled by dependency, every attempt, commit,
+    /// and dollar recorded in .stella/fleet.db. Worktrees and their
+    /// fleet/<task> branches are left in place for review.
+    Fleet {
+        /// Task prompts — each becomes an independent isolated task
+        #[arg(required_unless_present = "plan")]
+        tasks: Vec<String>,
+
+        /// A plan file instead: .json or .toml with [[tasks]] entries
+        /// (id, title, prompt, optional depends_on + isolation)
+        #[arg(long, value_name = "FILE", conflicts_with = "tasks")]
+        plan: Option<std::path::PathBuf>,
+
+        /// Max tasks dispatched concurrently within one wave
+        #[arg(long, default_value_t = 4)]
+        max_concurrency: usize,
+
+        /// Git ref isolated worktrees branch from (default: current HEAD)
+        #[arg(long)]
+        base_ref: Option<String>,
+    },
+
+    /// Query the code graph built by `stella init` — symbol definitions and
+    /// references, a file's imports/importers, or its graph neighborhood.
+    /// Offline: reads .stella/codegraph.db, needs no API key.
+    Graph {
+        /// What to ask the graph
+        #[arg(value_enum)]
+        op: GraphOp,
+
+        /// Symbol name (definitions/references) or workspace-relative file
+        /// path (imports/importers/neighbors)
+        target: String,
+    },
+
     /// List configured providers and available models
     Models,
 
@@ -192,6 +229,50 @@ fn use_deck(plain_flag: bool) -> bool {
     !plain_flag && !plain_env && std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
 }
 
+/// The five code-graph queries, mirroring the `code_graph` agent tool's ops
+/// one-for-one so a human at the CLI and the model inside a turn see the
+/// same frames for the same question.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum GraphOp {
+    /// Where a symbol is defined
+    Definitions,
+    /// Best-effort textual references to a symbol
+    References,
+    /// What a file imports
+    Imports,
+    /// Which files import a file
+    Importers,
+    /// A file's immediate graph neighborhood (symbols + edges)
+    Neighbors,
+}
+
+impl GraphOp {
+    fn as_str(self) -> &'static str {
+        match self {
+            GraphOp::Definitions => "definitions",
+            GraphOp::References => "references",
+            GraphOp::Imports => "imports",
+            GraphOp::Importers => "importers",
+            GraphOp::Neighbors => "neighbors",
+        }
+    }
+}
+
+/// `stella graph <op> <target>` — the human door to the same query surface
+/// the `code_graph` tool gives the agent. Frames print exactly as the model
+/// would receive them.
+fn run_graph(op: GraphOp, target: &str) -> Result<(), String> {
+    let root =
+        std::env::current_dir().map_err(|e| format!("cannot determine workspace root: {e}"))?;
+    match stella_tools::graph::run_query(&root, op.as_str(), target) {
+        stella_protocol::tool::ToolOutput::Ok { content } => {
+            println!("{content}");
+            Ok(())
+        }
+        stella_protocol::tool::ToolOutput::Error { message } => Err(message),
+    }
+}
+
 /// `--budget` must be a positive, finite dollar amount — a NaN or negative
 /// limit would make every comparison silently false and turn the "hard
 /// cap" into a no-op, the worst failure mode for a money control.
@@ -233,6 +314,10 @@ fn run(cli: Cli) -> Result<(), String> {
                 Some(dir) => agent::run_tools_validation(dir.as_deref()),
                 None => agent::run_tools_listing(),
             };
+        }
+        Some(Command::Graph { op, target }) => {
+            // Reads the local index only — works with zero API keys.
+            return run_graph(*op, target);
         }
         Some(Command::Stats { format, provider }) => {
             // Reads local telemetry only — works with zero API keys.
@@ -288,6 +373,21 @@ fn run(cli: Cli) -> Result<(), String> {
         Command::Goal { goal } => {
             rt()?.block_on(agent::run_goal_cmd(&cfg, &goal, cli.budget))?;
         }
+        Command::Fleet {
+            tasks,
+            plan,
+            max_concurrency,
+            base_ref,
+        } => {
+            rt()?.block_on(fleet_cmd::run_fleet(
+                &cfg,
+                &tasks,
+                plan.as_deref(),
+                base_ref.as_deref(),
+                max_concurrency,
+                cli.budget,
+            ))?;
+        }
         Command::Monitor { target } => {
             let target = target.unwrap_or_else(|| "main".to_string());
             // Monitoring IS a goal: the judge (who can call ci_status
@@ -315,6 +415,7 @@ fn run(cli: Cli) -> Result<(), String> {
         // caller. Reaching any of them here is impossible.
         Command::Init
         | Command::Tools { .. }
+        | Command::Graph { .. }
         | Command::Stats { .. }
         | Command::Models
         | Command::Version => {
