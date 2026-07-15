@@ -30,6 +30,7 @@ stella-store = { path = "../stella-store" }
 stella-mcp = { path = "../stella-mcp" }
 stella-context = { path = "../stella-context" }
 stella-graph = { path = "../stella-graph" }
+stella-fleet = { path = "../stella-fleet" }
 stella-pipeline = { path = "../stella-pipeline" }
 stella-tui = { path = "../stella-tui" }
 serde.workspace = true

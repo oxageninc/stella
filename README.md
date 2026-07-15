@@ -274,8 +274,8 @@ flowchart TD
     CORE -->|ToolExecutor port| TOOLS["stella-tools<br/>CRUD · bash · grep · glob · build · test · verify_done · issues · CI"]
     MCP["stella-mcp<br/>external MCP servers"] -.->|merges tools into registry| TOOLS
     CORE -->|emits AgentEvent stream| STORE["stella-store<br/>DuckDB: executions · events · telemetry"]
-    U -->|reflection-memory recall| CTX["stella-context — context plane<br/>recall · embeddings · memory"]
-    GRAPH["stella-graph — tree-sitter code index"] -->|indexed on `stella init`| DB[("DuckDB code graph")]
+    U -->|"recall · episodes · bi-temporal facts"| CTX["stella-context — context plane<br/>recall · embeddings · memory"]
+    GRAPH["stella-graph — tree-sitter code index"] -->|"indexed on `stella init` · queried via `code_graph` + `stella graph`"| DB[("SQLite code graph<br/>.stella/codegraph.db")]
     MODEL -.->|versioned serde| PROTO["stella-protocol — shared types + Provider/tool ports"]
     TOOLS -.-> PROTO
     STORE -.-> PROTO
@@ -283,11 +283,23 @@ flowchart TD
     class ENG eng;
 ```
 
-> **Status — what ships vs. what's next.** The diagram above is the live runtime
-> path. The workspace *also* carries several complete, property-tested library
-> crates that aren't wired into the CLI yet — they're the next layers, and some
-> of the best places to contribute:
+> **Status — every layer is wired.** The diagram above is the live runtime
+> path, and the once-"next" library crates now ship in the CLI: `stella-fleet`
+> drives `stella fleet` (a DAG of tasks, a git worktree per isolated task, a
+> spend ledger), `stella-graph` answers at runtime through the agent's
+> `code_graph` tool and the `stella graph` command (on top of the
+> `stella init` index and the session-start schema gate), the context plane
+> records an **episode** for every working turn and bi-temporal `covers_path`
+> **facts** at `init` alongside reflection recall, and `stella-media` exposes
+> BYOK image generation as the `generate_image` tool. The remaining partials —
+> and the best places to contribute — are:
 >
+> - **`stella-media`'s SVG + video surfaces** — library-complete (the SVG
+>   sanitize/repair pipeline, cost-gated async video jobs) but not yet exposed
+>   as tools or commands.
+> - **OCP host routing** — the in-tree context sources still share `ocp-types`
+>   values in-process rather than routing through `ocp-host` (see the OCP note
+>   below).
 > - **`stella-fleet`** — multi-agent fan-out: DAG planner, worktree isolation,
 >   lineage + spend ledger.
 > - **`stella-media`** — multimodal generation behind a `MediaProvider` port.
@@ -297,7 +309,7 @@ flowchart TD
 >   episodic memory are implemented and tested but the CLI currently uses only the
 >   reflection-memory recall path.
 >
-> Wiring any of these into the CLI is tracked in the issues — grab one.
+> Both are tracked in the issues — grab one.
 
 > **The Open Context Protocol (OCP).** Retrieval in Stella is designed as an open,
 > versioned wire protocol (`ocp/1.0-draft`): the **`ocp-types` crate** (zero
@@ -469,9 +481,12 @@ per field across scopes, so an org-managed `base_url` and a user-scope
 stella            # or: stella chat
 ```
 
-Opens a REPL. Type a prompt, press Enter — Stella thinks (live status line), calls
-tools (read files, run commands, search code), responds, and prints a cost/token
-summary.
+On a real terminal this opens the **Command Deck** — the tabbed TUI (Session ·
+Agents · Traces · Graph · Files) with PR-style diffs and an editable prompt
+queue; `--plain` (or `STELLA_PLAIN=1`, or piped stdio) falls back to the line
+REPL. Type a prompt, press Enter — Stella thinks (live status line), calls
+tools (read files, run commands, search code), responds, and prints a
+cost/token summary.
 
 **In-chat commands:**
 
@@ -497,6 +512,29 @@ stella run "add a health check endpoint to the API"
 stella goal "the login flow has a passing e2e test and CI is green"
 stella monitor main          # drive a branch/PR's CI to green as a judged goal
 ```
+
+### Fleet mode — fan a plan out to parallel workers
+
+```bash
+stella fleet "fix the flaky auth test" "tighten the CI cache key"   # two isolated tasks
+stella fleet --plan .stella/fleet.toml --max-concurrency 2 --budget 5.0
+```
+
+One git worktree + `fleet/<task>` branch per isolated task, wave-scheduled by
+dependency, every attempt/commit/dollar recorded in `.stella/fleet.db` —
+worktrees are left in place for review (`git worktree list`). A plan file is
+the serde form of the fleet DAG: `[[tasks]]` entries with `id`, `title`,
+`prompt`, plus optional `depends_on = [...]` and `isolation = "shared_tree"`.
+
+### Ask the code graph
+
+```bash
+stella graph definitions run_turn     # where is this symbol defined?
+stella graph importers src/auth.rs    # which files import it?
+```
+
+The same frames the agent gets from its `code_graph` tool — built by
+`stella init`, answered offline, no API key needed.
 
 ### Project setup & introspection
 
@@ -531,12 +569,14 @@ output. `stella run` executes through the staged pipeline by default; pass
 | `read_file` · `write_file` · `edit_file` · `delete_file` | The full CRUD ledger — surgical exact-substring edits, parent-dir creation |
 | `bash` | Run a shell command (timeout kill; `trace: true` echoes each line) |
 | `grep` · `glob` | Regex content search (ripgrep) · glob file discovery (fd) |
+| `code_graph` | Query the indexed code graph instead of grepping: symbol definitions/references, a file's imports/importers/neighborhood — registered once `stella init` has built the index |
 | `build_project` · `run_tests` | Build/test with the workspace's own toolchain (cargo/npm/go/make) |
 | `verify_done` | The **deterministic definition of done** — the witness gate above |
 | `explorations` · `save_exploration` | Shared codebase maps — explore once, reuse everywhere |
 | `save_memory` | Persist a lesson into every future session's system prompt |
 | `ci_status` | CI runs + failure logs via `gh` (judge-usable, read-only) |
 | `screenshot` | Capture the screen as verification evidence |
+| `generate_image` | Text-to-image via your own provider key (Z.ai CogView or OpenAI gpt-image), saved under `.stella/artifacts/` — registered **only when a media-capable key is set** |
 | `create_issue` · `update_issue` · `close_issue` · `search_issues` · `start_work_on_issue` | Issue tracking — registered **only when configured** |
 
 All file tools are **workspace-root-pinned**. Every read/write/edit/delete lands in
@@ -544,7 +584,8 @@ the **Files-Touched** ledger, rendered per turn as `[C·R·U·D] path` (also `/f
 
 **Issue tools are conditional:** set `LINEAR_API_KEY` for the Linear backend (it wins),
 or have `gh auth login` done for GitHub Issues. With neither, they aren't registered —
-no dead schema, no wasted tokens.
+no dead schema, no wasted tokens. The same discipline gates `code_graph` (needs the
+`stella init` index) and `generate_image` (needs `ZAI_API_KEY` or `OPENAI_API_KEY`).
 
 ## Self-improving & prompt-cache-native
 
@@ -552,6 +593,12 @@ Lessons saved with `save_memory` (or written by you as markdown in `.stella/memo
 load once at session start into a **byte-stable** system prompt — so every model call
 considers them at prompt-cache-hit prices (~0.1× input). New memories take effect the
 *next* session by design: hot-injection would invalidate the cache on every save.
+
+Alongside those baked lessons, every turn that does real work is recorded as an
+**episode** (summary, files touched, outcome, time window) in `.stella/context.db`,
+and `stella init` writes the domain taxonomy as bi-temporal **facts** — corrections
+supersede, never delete, so "what did we believe then" still answers. Both feed the
+per-turn recall block by similarity + domain overlap + recency.
 
 ## Local telemetry — DuckDB, on your disk
 
@@ -596,6 +643,11 @@ targets — see the architecture status note above).
 | `stella-store` | ✅ | DuckDB persistence — executions, events (full CoT), telemetry, files-touched |
 | `stella-mcp` | ✅ | MCP client (stdio + HTTP, protocol `2025-06-18`) merging external tools into the registry; per-call timeouts isolate dead servers |
 | `stella-protocol` | ✅ | Zero-logic, zero-I/O stability contract: shared serde types + the `Provider`/tool ports |
+| `stella-context` | ✅ | The context plane: reflection-memory recall + embedding index, an episode recorded for every working turn, and bi-temporal `covers_path` facts written at `stella init` — all recalled through one fused, budgeted pipeline |
+| `stella-graph` | ✅ | Tree-sitter symbol + import-edge indexer (Rust/TS/JS/Python/SQL). Indexed on `stella init`, read by the schema gate at session start, and queried at runtime via the `code_graph` tool and `stella graph` |
+| `stella-pipeline` | ✅ | The orchestration plane above the engine — the default `stella run` path: triage → plan (split context) → scope review → execute → verify → judge, with bounded revision (`--no-pipeline` opts out) |
+| `stella-fleet` | ✅ | The multi-agent fleet behind `stella fleet`: DAG planner + wave scheduling, git-worktree isolation per task, SQLite lineage + per-task spend ledger |
+| `stella-media` | ◑ | Multimodal generation behind one `MediaProvider` port — image generation wired as the BYOK-conditional `generate_image` tool; SVG/video pipelines library-complete, not yet exposed |
 | `stella-context` | ◑ | The context plane. Reflection-memory recall + embedding index are wired; the bi-temporal property graph and episodic memory are built and tested but not yet consulted at runtime |
 | `stella-graph` | ◑ | Tree-sitter symbol + import-edge indexer (Rust/TS/JS/Python/SQL). Indexed on `stella init`; the schema gate reads it at session start, broader runtime retrieval not yet wired |
 | `stella-pipeline` | ✅ | The orchestration plane above the engine — the default `stella run` path: triage → plan (split context) → scope review → execute → verify → judge, with bounded revision (`--no-pipeline` opts out) |
