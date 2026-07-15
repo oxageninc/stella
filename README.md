@@ -300,6 +300,14 @@ flowchart TD
 > - **OCP host routing** — the in-tree context sources still share `ocp-types`
 >   values in-process rather than routing through `ocp-host` (see the OCP note
 >   below).
+> - **`stella-fleet`** — multi-agent fan-out: DAG planner, worktree isolation,
+>   lineage + spend ledger.
+> - **`stella-media`** — multimodal generation behind a `MediaProvider` port.
+> - **`stella-graph` retrieval & the fuller context plane** — the code graph is
+>   indexed on `stella init` and feeds the schema conflict gate at session start,
+>   but broader runtime retrieval is not yet queried; bi-temporal facts and
+>   episodic memory are implemented and tested but the CLI currently uses only the
+>   reflection-memory recall path.
 >
 > Both are tracked in the issues — grab one.
 
@@ -640,6 +648,11 @@ targets — see the architecture status note above).
 | `stella-pipeline` | ✅ | The orchestration plane above the engine — the default `stella run` path: triage → plan (split context) → scope review → execute → verify → judge, with bounded revision (`--no-pipeline` opts out) |
 | `stella-fleet` | ✅ | The multi-agent fleet behind `stella fleet`: DAG planner + wave scheduling, git-worktree isolation per task, SQLite lineage + per-task spend ledger |
 | `stella-media` | ◑ | Multimodal generation behind one `MediaProvider` port — image generation wired as the BYOK-conditional `generate_image` tool; SVG/video pipelines library-complete, not yet exposed |
+| `stella-context` | ◑ | The context plane. Reflection-memory recall + embedding index are wired; the bi-temporal property graph and episodic memory are built and tested but not yet consulted at runtime |
+| `stella-graph` | ◑ | Tree-sitter symbol + import-edge indexer (Rust/TS/JS/Python/SQL). Indexed on `stella init`; the schema gate reads it at session start, broader runtime retrieval not yet wired |
+| `stella-pipeline` | ✅ | The orchestration plane above the engine — the default `stella run` path: triage → plan (split context) → scope review → execute → verify → judge, with bounded revision (`--no-pipeline` opts out) |
+| `stella-fleet` | 🧪 | The multi-agent fleet: DAG planner + wave scheduling, git-worktree isolation per task, SQLite lineage + per-task spend ledger |
+| `stella-media` | 🧪 | Multimodal generation (image/SVG/video) behind one `MediaProvider` port — BYOK, artifact discipline, cost-gated |
 | `stella-tui` | ✅ | The Command Deck — a pure event-fold core (`SessionModel`/`WorkspaceModel`) + thin crossterm shell; the default `stella chat` surface on a TTY (`--plain` opts out) |
 | `ocp-types` · `ocp-host` · `ocp-conformance` | ◑ | Open Context Protocol — wire types (zero deps beyond `serde`, in the binary), host runtime (discover/negotiate/route/gate), and the public conformance suite; only `ocp-types` is wired into the shipping CLI today |
 
