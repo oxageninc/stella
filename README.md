@@ -127,7 +127,7 @@ and the harness to prove it ships in this repo.
 |---|---|---|
 | 🥇 **Heavyweight** | Frontier model, $2/task cap | Highest resolve rate |
 | 🪶 **Featherweight** | Any model, any cap | Lowest **$ per resolved task** |
-| 🔌 **Off-grid** | Local models only (`--base-url`, zero API keys) | Resolve rate at $0 marginal cost |
+| 🔌 **Off-grid** | Local models only (`--base-url`, zero API keys) — [the guide](docs/off-grid.md) | Resolve rate at $0 marginal cost |
 | ⚔️ **Cross-harness** | Same model, Stella vs. any other agent CLI | Biggest head-to-head gap |
 
 ### Enter
@@ -154,6 +154,13 @@ The full harness docs live in [`bench/`](bench/README.md), and a
 [Harbor](https://www.harborframework.com/) adapter for containerized, at-scale,
 head-to-head runs against other agents lives in
 [`bench/harbor_adapter/`](bench/harbor_adapter/README.md).
+
+For the **Cross-harness** division, [`arena`](https://github.com/oxageninc/arena)
+is a standalone, open-source runner that pits Stella against Claude Code, Gemini
+CLI, Oxagen, and any agent you bolt on — same model, same budget, held-out tests
+the agent can't see or author, and paired statistics (Wilson intervals, exact
+McNemar, bootstrap CIs), with every run's manifest, transcripts, and diffs kept
+as receipts.
 
 ### The leaderboard
 
@@ -290,6 +297,8 @@ flowchart TD
 > - **`stella-media`** — multimodal generation behind a `MediaProvider` port.
 > - **`stella-graph` retrieval & the fuller context plane** — the code graph is
 >   indexed on `stella init` but not yet queried at runtime; bi-temporal facts and
+>   indexed on `stella init` and feeds the schema conflict gate at session start,
+>   but broader runtime retrieval is not yet queried; bi-temporal facts and
 >   episodic memory are implemented and tested but the CLI currently uses only the
 >   reflection-memory recall path.
 >
@@ -406,12 +415,50 @@ stella --model local/llama3.3 --base-url http://localhost:11434/v1 chat
 > route through the dedicated coding endpoint (`https://api.z.ai/api/coding/paas/v4`).
 
 **The credential chain** (first hit wins): `--api-key` flag → provider env var →
-`~/.config/stella/credentials.toml` → interactive prompt.
+`settings.json` `api_key` → `~/.config/stella/credentials.toml` → interactive prompt.
 
 ```bash
 stella models    # every provider, its models, and key status
 stella config    # the fully resolved configuration
 ```
+
+### Custom providers via `settings.json`
+
+Point Stella at **any** OpenAI-compatible (or Anthropic/Gemini-dialect) endpoint —
+Together, Fireworks, Groq, a private gateway — without a code change, and override
+built-in provider defaults, from a `settings.json`:
+
+| Scope | Path | Wins over |
+|---|---|---|
+| Project | `<workspace>/.stella/settings.json` | org-managed, user |
+| Org-managed | `/Library/Application Support/stella/settings.json` (macOS) · `/etc/stella/settings.json` (Linux) · `$STELLA_MANAGED_SETTINGS` | user |
+| User | `~/.config/stella/settings.json` | — |
+
+```jsonc
+{
+  "providers": {
+    // A brand-new provider: base_url is required, dialect defaults to
+    // "openai-compatible" ("anthropic" and "gemini" also available).
+    "together": {
+      "name": "Together AI",
+      "base_url": "https://api.together.xyz/v1",
+      "api_key_env": "TOGETHER_API_KEY",
+      "default_model": "meta-llama/Llama-3.3-70B-Instruct-Turbo"
+    },
+    // Overriding a built-in's defaults (e.g. the Z.ai coding plan):
+    "zai": {
+      "base_url": "https://api.z.ai/api/coding/paas/v4"
+    }
+  }
+}
+```
+
+Then: `stella --model together/meta-llama/Llama-3.3-70B-Instruct-Turbo run "…"`.
+Config-defined providers join auto-detection (after the built-ins) and judge
+routing, and show up in `stella models`. Prefer `api_key_env` over a literal
+`api_key` — settings files get committed, credentials should not. Entries merge
+per field across scopes, so an org-managed `base_url` and a user-scope
+`api_key_env` compose.
 
 <div align="center">
 
@@ -461,6 +508,8 @@ stella monitor main          # drive a branch/PR's CI to green as a judged goal
 ```bash
 stella init      # infer this workspace's domain taxonomy (.stella/domains.toml)
 stella tools     # list every tool available to the agent this session
+stella stats     # cost, tokens, and $/resolved task per provider/model from
+                 # local telemetry (--format table|json|csv, --provider <id>)
 ```
 
 ### Global flags
@@ -469,6 +518,13 @@ stella tools     # list every tool available to the agent this session
 `--output-format text|json|stream-json` (all also as `STELLA_*` env vars). The
 `json` / `stream-json` formats are for headless one-shot `stella run`; the
 interactive `chat` / `goal` / `monitor` modes always render human-readable output.
+`--output-format text|json|stream-json` (also as `STELLA_MODEL`,
+`STELLA_BASE_URL`, `STELLA_BUDGET`, and `STELLA_OUTPUT_FORMAT`; API keys come
+from provider-specific env vars or `~/.config/stella/credentials.toml`). The
+`json` / `stream-json` formats are for headless one-shot `stella run`; the
+interactive `chat` / `goal` / `monitor` modes always render human-readable
+output. `stella run` executes through the staged pipeline by default; pass
+`--no-pipeline` to fall back to the raw step-loop.
 
 <div align="center">
 
@@ -509,8 +565,9 @@ considers them at prompt-cache-hit prices (~0.1× input). New memories take effe
 
 Every execution is recorded in `.stella/stella.duckdb`: the full event stream
 (chain-of-thought deltas included), per-model-call telemetry (tokens in/out, cache
-read hit/miss, cost from the model card's pricing), the Files-Touched ledger, plus
-`file_locks` and `graph_nodes` / `graph_edges` tables for the context plane. Query it
+read hit/miss, cost from the model card's pricing), and the Files-Touched ledger
+(`file_locks` and `graph_nodes` / `graph_edges` tables exist in the schema as
+reserved seams for the context plane; no shipping command writes them yet). Query it
 with any DuckDB client. **Nothing leaves your machine** — the only network traffic
 Stella produces is to the model provider you chose.
 
@@ -554,6 +611,12 @@ targets — see the architecture status note above).
 | `stella-media` | 🧪 | Multimodal generation (image/SVG/video) behind one `MediaProvider` port — BYOK, artifact discipline, cost-gated |
 | `stella-tui` | 🧪 | Event-log REPL — a pure `SessionModel` fold + a thin crossterm shell (renders deterministically from events) |
 | `ocp-types` · `ocp-host` · `ocp-conformance` | ✅ | Open Context Protocol — wire types (zero deps beyond `serde`), host runtime (discover/negotiate/route/gate), and the public conformance suite |
+| `stella-graph` | ◑ | Tree-sitter symbol + import-edge indexer (Rust/TS/JS/Python/SQL). Indexed on `stella init`; the schema gate reads it at session start, broader runtime retrieval not yet wired |
+| `stella-pipeline` | ✅ | The orchestration plane above the engine — the default `stella run` path: triage → plan (split context) → scope review → execute → verify → judge, with bounded revision (`--no-pipeline` opts out) |
+| `stella-fleet` | 🧪 | The multi-agent fleet: DAG planner + wave scheduling, git-worktree isolation per task, SQLite lineage + per-task spend ledger |
+| `stella-media` | 🧪 | Multimodal generation (image/SVG/video) behind one `MediaProvider` port — BYOK, artifact discipline, cost-gated |
+| `stella-tui` | 🧪 | Event-log REPL — a pure `SessionModel` fold + a thin crossterm shell (renders deterministically from events) |
+| `ocp-types` · `ocp-host` · `ocp-conformance` | ◑ | Open Context Protocol — wire types (zero deps beyond `serde`, in the binary), host runtime (discover/negotiate/route/gate), and the public conformance suite; only `ocp-types` is wired into the shipping CLI today |
 
 ## Development
 
@@ -563,6 +626,26 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo run -p stella-cli -- models
 ```
+
+### Dev mode — test a checkout from any workspace
+
+To try your working copy against real projects *before* baking a release,
+install it as `stella-dev` — it lives side by side with the released
+`stella` and never shadows it:
+
+```bash
+scripts/dev.sh install        # build (release) + link ~/.local/bin/stella-dev
+cd ~/any/other/repo
+stella-dev                    # the tabbed Command Deck, running your checkout
+stella-dev version            # e.g. 0.1.16-dev.3f2c9aa+dirty — sha of the build
+```
+
+The link points into this checkout's `target/`, so iterating is just a
+rebuild — `scripts/dev.sh build` (or plain `cargo build --release -p
+stella-cli`) and every open workspace immediately runs the fresh binary.
+`--debug` builds the debug profile for faster compiles;
+`scripts/dev.sh status` shows what both binaries resolve to, and
+`scripts/dev.sh uninstall` removes the link.
 
 <div align="center">
 
@@ -621,6 +704,14 @@ platform attached. Want a terminal agent grounded in your org's graph? Use `oxag
 Want a fast, self-contained agent in any repo? Use Stella.
 
 ## Contributing & community
+
+```text
+   ·  .  ✦   ·   stella is built in the open — come build her with us   ·   ✦  .  ·
+```
+
+Stella is young, ambitious, and genuinely open — MIT OR Apache-2.0, DCO not CLA,
+no corporate gatekeeping. Every kind of contribution moves her forward:
+
 
 ```text
    ·  .  ✦   ·   stella is built in the open — come build her with us   ·   ✦  .  ·

@@ -24,6 +24,7 @@
 //! transaction, an abrupt process kill mid-index commits nothing and reopening
 //! finds a consistent store.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard};
@@ -159,6 +160,20 @@ impl CodeGraph {
         &self.inner.root
     }
 
+    /// Test seam: start the live-index pipeline (debounce → transactional
+    /// apply) **without** an OS filesystem watcher, returning a
+    /// [`crate::WatchInjector`] that feeds synthetic events straight into the
+    /// pipeline channel. Deterministic live-index tests write real files into
+    /// the workspace, inject the paths, and await the injector's applied-batch
+    /// signal — no dependence on OS event delivery timing.
+    ///
+    /// Hidden from docs: test-facing only, `pub` so integration tests in
+    /// `tests/` can reach it. Must be called from within a tokio runtime.
+    #[doc(hidden)]
+    pub fn watch_pipeline_for_tests(&self, debounce: std::time::Duration) -> watch::WatchInjector {
+        watch::spawn_injectable(self.inner.clone(), debounce)
+    }
+
     /// Run a full incremental index pass now (walk, re-parse only changed
     /// files, prune deleted). One transaction (L-L1). Synchronous — callers
     /// in an async context should wrap it in `spawn_blocking`.
@@ -207,6 +222,17 @@ impl CodeGraph {
     /// query it.
     pub fn query(&self, q: &ContextQuery) -> Result<Vec<ContextFrame>, GraphError> {
         frames::query(&self.inner.read_guard(), &self.inner.root, q)
+    }
+
+    /// All known table, type, and view names (lowercased) from the index.
+    /// Used by the schema gate to populate the known-schema set at session
+    /// start. Returns empty sets if the index is empty or unreadable.
+    pub fn schema_names(&self) -> (HashSet<String>, HashSet<String>, HashSet<String>) {
+        let conn = self.inner.read_guard();
+        let tables = store::names_of_kind(&conn, "table").unwrap_or_default();
+        let types = store::names_of_kind(&conn, "schema_enum").unwrap_or_default();
+        let views = store::names_of_kind(&conn, "view").unwrap_or_default();
+        (tables, types, views)
     }
 
     /// Stop the watcher and background tasks. Idempotent. Dropping the watcher
