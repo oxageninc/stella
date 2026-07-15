@@ -502,6 +502,34 @@ mod tests {
     }
 
     #[test]
+    fn busiest_file_picks_the_most_connected_file() {
+        let ws = tempdir().unwrap();
+        let dbdir = tempdir().unwrap();
+        let root = canon(&ws);
+        let db = dbdir.path().join("context.db");
+        // `hub.rs` carries three symbols; `leaf.rs` carries one. The busiest
+        // file is the one with the highest symbol+import degree.
+        fs::write(
+            root.join("hub.rs"),
+            "pub fn a() {}\npub fn b() {}\npub struct C;\n",
+        )
+        .unwrap();
+        fs::write(root.join("leaf.rs"), "pub fn d() {}\n").unwrap();
+        let grammars = Grammars::load().unwrap();
+        let mut conn = open(&db).unwrap();
+        index_tree(&mut conn, &root, &grammars).unwrap();
+
+        assert_eq!(busiest_file(&conn).unwrap().as_deref(), Some("hub.rs"));
+    }
+
+    #[test]
+    fn busiest_file_is_none_on_an_empty_index() {
+        let dbdir = tempdir().unwrap();
+        let conn = open(&dbdir.path().join("context.db")).unwrap();
+        assert_eq!(busiest_file(&conn).unwrap(), None);
+    }
+
+    #[test]
     fn kill_during_indexing_leaves_a_consistent_store() {
         let ws = tempdir().unwrap();
         let dbdir = tempdir().unwrap();

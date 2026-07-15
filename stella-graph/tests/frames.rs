@@ -110,3 +110,28 @@ fn kind_filter_limits_returned_frames() {
         "kind filter must exclude non-matching frames"
     );
 }
+
+#[test]
+fn file_neighborhood_returns_the_files_symbols() {
+    // The structured neighborhood the deck's Graph tab renders (as opposed to
+    // the prose frames above): the file's own symbols, with kinds and lines.
+    let (_ws, _db, graph) = fixture();
+    let hood = graph
+        .file_neighborhood(std::path::Path::new("driver.rs"))
+        .unwrap();
+    assert_eq!(hood.file, "driver.rs");
+    let names: Vec<&str> = hood.symbols.iter().map(|s| s.name.as_str()).collect();
+    assert!(names.contains(&"run_turn"), "symbols: {names:?}");
+    assert!(names.contains(&"Engine"), "symbols: {names:?}");
+    assert!(
+        hood.symbols.iter().any(|s| s.kind == "function"),
+        "a function symbol should carry the persisted `function` kind tag"
+    );
+}
+
+#[test]
+fn busiest_file_names_the_most_connected_file() {
+    let (_ws, _db, graph) = fixture();
+    // The one-file fixture makes driver.rs the only (thus busiest) candidate.
+    assert_eq!(graph.busiest_file().unwrap().as_deref(), Some("driver.rs"));
+}
