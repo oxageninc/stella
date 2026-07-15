@@ -379,27 +379,9 @@ impl FileLedger {
     }
 }
 
-/// Count added/removed source lines in a unified diff. File headers (`+++ `,
-/// `--- `) and hunk markers (`@@`) are ignored; only real `+`/`-` body lines
-/// count. The header check requires the trailing space of real header syntax:
-/// an added body line whose content starts with `++` (e.g. `++i`) arrives as
-/// `+++i` and must count, not be skipped as a header. Robust to
-/// `None`/partial diffs — a malformed diff yields `(0, 0)`, never a panic.
-pub fn count_diff_lines(diff: &str) -> (u32, u32) {
-    let mut added = 0u32;
-    let mut removed = 0u32;
-    for line in diff.lines() {
-        if line.starts_with("+++ ") || line.starts_with("--- ") {
-            continue;
-        }
-        match line.as_bytes().first() {
-            Some(b'+') => added += 1,
-            Some(b'-') => removed += 1,
-            _ => {}
-        }
-    }
-    (added, removed)
-}
+// The diff-counting fold moved to `crate::diff` (one module owns the whole
+// "how a diff reads" story); re-exported here so existing call sites hold.
+pub use crate::diff::count_diff_lines;
 
 // ── Route log: which model handled what ─────────────────────────────────────
 
@@ -455,6 +437,16 @@ impl PromptQueue {
     /// Remove the oldest pending prompt for dispatch, returning its text.
     pub fn take_next(&mut self) -> Option<String> {
         self.items.pop_front().map(|p| p.text)
+    }
+    /// Remove one queued prompt by position (0 = oldest), returning its text.
+    /// The queue is a *list* the user edits — deleting or pulling a prompt
+    /// back out for editing must never require dispatching it first.
+    pub fn remove(&mut self, index: usize) -> Option<String> {
+        self.items.remove(index).map(|p| p.text)
+    }
+    /// Drop every pending prompt (the deck gates this behind a confirm).
+    pub fn clear(&mut self) {
+        self.items.clear();
     }
 }
 
@@ -962,6 +954,7 @@ mod tests {
     }
 
     #[test]
+<<<<<<< HEAD
     fn prompt_started_pops_the_front_of_the_queue_and_leaves_a_trace() {
         let mut w = WorkspaceModel::new();
         w.apply_inbound(&reg("lead"));
@@ -991,6 +984,19 @@ mod tests {
             text: "driver-side prompt".into(),
         });
         assert_eq!(w.queue.pending(), 1);
+=======
+    fn prompt_queue_edits_like_a_list() {
+        let mut q = PromptQueue::default();
+        q.enqueue("a".into(), 1);
+        q.enqueue("b".into(), 2);
+        q.enqueue("c".into(), 3);
+        // Remove by position, not just from the front.
+        assert_eq!(q.remove(1).as_deref(), Some("b"));
+        assert_eq!(q.pending(), 2);
+        assert_eq!(q.remove(9), None, "out of range is a no-op");
+        q.clear();
+        assert_eq!(q.pending(), 0);
+>>>>>>> 41325e9a4a9d778b2906cd2be26473dc260bd7b7
     }
 
     #[test]
