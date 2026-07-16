@@ -151,6 +151,21 @@ impl DeckUi {
             self.tab_switched_at = Some(std::time::Instant::now());
         }
     }
+
+    /// Point the deck at agent `idx`. A session-message selection indexes the
+    /// *previously* focused agent's transcript, so it must not carry across;
+    /// dropping it also re-arms tail-follow (the selection is what pinned the
+    /// scroll window). Same-agent is a no-op.
+    pub fn focus_agent(&mut self, idx: usize) {
+        if idx == self.focused {
+            return;
+        }
+        self.focused = idx;
+        if self.session_selected.take().is_some() {
+            self.session_pending_scroll = None;
+            self.session_scroll.follow = true;
+        }
+    }
 }
 
 /// The outcome of handling one deck key.
@@ -182,9 +197,9 @@ pub fn ingest_inbound(inbound: &Inbound, model: &mut WorkspaceModel, ui: &mut De
 /// Clamp selections to the current agent/file/queue counts.
 fn clamp(model: &WorkspaceModel, ui: &mut DeckUi) {
     if model.agents.is_empty() {
-        ui.focused = 0;
+        ui.focus_agent(0);
     } else {
-        ui.focused = ui.focused.min(model.agents.len() - 1);
+        ui.focus_agent(ui.focused.min(model.agents.len() - 1));
     }
     let files = model.ledger.records.len();
     ui.files_sel = if files == 0 {
@@ -241,7 +256,11 @@ pub fn handle_deck_key(key: KeyEvent, model: &WorkspaceModel, ui: &mut DeckUi) -
     // all-thinking toggle (chain-of-thought everywhere).
     if is_ctrl_o {
         if let Some(sel) = ui.session_selected {
-            if let Some(agent) = model.agents.get(ui.focused) {
+            // Only a genuinely expandable entry toggles — a no-op press must
+            // not bump `expanded_rev` and invalidate the settled fold cache.
+            if let Some(agent) = model.agents.get(ui.focused)
+                && agent.model.transcript.get(sel).is_some_and(is_expandable)
+            {
                 let id = agent.meta.id.clone();
                 toggle_expanded(ui, &id, sel);
             }
@@ -511,12 +530,12 @@ fn handle_agents_key(
     let count = model.agents.len();
     match key.code {
         KeyCode::Up => {
-            ui.focused = ui.focused.saturating_sub(1);
+            ui.focus_agent(ui.focused.saturating_sub(1));
             Some(DeckAction::Handled)
         }
         KeyCode::Down => {
             if count > 0 {
-                ui.focused = (ui.focused + 1).min(count - 1);
+                ui.focus_agent((ui.focused + 1).min(count - 1));
             }
             Some(DeckAction::Handled)
         }
@@ -643,16 +662,20 @@ fn toggle_expanded(ui: &mut DeckUi, agent: &str, idx: usize) {
     ui.expanded_rev += 1;
 }
 
-/// The most recent transcript entry `ctrl+o` can meaningfully expand: a tool
-/// call (full args), a tool result (full output), or a collapsed thought.
-fn last_expandable(transcript: &[crate::model::TranscriptEntry]) -> Option<usize> {
+/// Whether `ctrl+o` can meaningfully expand this entry — exactly the variants
+/// whose [`crate::render::entry_lines`] rendering honors the expanded flag: a
+/// tool call (full args), a tool result (full output), or a collapsed thought.
+fn is_expandable(entry: &crate::model::TranscriptEntry) -> bool {
     use crate::model::TranscriptEntry as E;
-    transcript.iter().rposition(|e| {
-        matches!(
-            e,
-            E::ToolStart { .. } | E::ToolResult { .. } | E::Reasoning(_)
-        )
-    })
+    matches!(
+        entry,
+        E::ToolStart { .. } | E::ToolResult { .. } | E::Reasoning(_)
+    )
+}
+
+/// The most recent transcript entry `ctrl+o` can meaningfully expand.
+fn last_expandable(transcript: &[crate::model::TranscriptEntry]) -> Option<usize> {
+    transcript.iter().rposition(is_expandable)
 }
 
 fn handle_session_key(
@@ -890,6 +913,53 @@ mod tests {
         handle_deck_key(key(KeyCode::Down), &model, &mut ui);
         assert_eq!(ui.session_selected, None, "down past the tail deselects");
         assert!(ui.session_scroll.follow, "…and re-arms tail-follow");
+    }
+
+    #[test]
+    fn ctrl_o_on_a_non_expandable_selection_is_a_no_op() {
+        let mut model = model_with(&["lead"]);
+        // A plain text message — `entry_lines` ignores the expanded flag for
+        // it, so ctrl+o has nothing to toggle.
+        model.apply_inbound(&Inbound::Event {
+            agent: "lead".into(),
+            event: AgentEvent::Text {
+                delta: "hello".into(),
+            },
+        });
+        let mut ui = ready_ui();
+        handle_deck_key(key(KeyCode::Up), &model, &mut ui);
+        assert_eq!(ui.session_selected, Some(0));
+
+        let rev = ui.expanded_rev;
+        handle_deck_key(ctrl('o'), &model, &mut ui);
+        assert!(
+            ui.expanded.get("lead").is_none_or(|set| set.is_empty()),
+            "nothing marked expanded"
+        );
+        assert_eq!(
+            ui.expanded_rev, rev,
+            "a no-op press must not invalidate the settled fold cache"
+        );
+    }
+
+    #[test]
+    fn switching_focus_drops_the_session_selection() {
+        let mut model = model_with(&["lead", "sub"]);
+        with_tool_exchange(&mut model, "lead");
+        let mut ui = ready_ui();
+        handle_deck_key(key(KeyCode::Up), &model, &mut ui);
+        assert!(ui.session_selected.is_some());
+
+        // Focus another agent from the Agents tab: the selection indexes the
+        // *previous* agent's transcript and must not carry across.
+        ui.tab = DeckTab::Agents;
+        handle_deck_key(key(KeyCode::Down), &model, &mut ui);
+        assert_eq!(ui.focused, 1);
+        assert_eq!(
+            ui.session_selected, None,
+            "selection cleared on focus change"
+        );
+        assert!(ui.session_scroll.follow, "…and tail-follow re-arms");
     }
 
     fn ready_ui() -> DeckUi {

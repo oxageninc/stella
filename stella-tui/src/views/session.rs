@@ -172,17 +172,21 @@ pub fn render(model: &WorkspaceModel, ui: &mut DeckUi, area: Rect, buf: &mut Buf
     let total = ui.session_fold.total();
 
     // A selection move from the key handler lands here, where visual-row
-    // ranges are known: nudge the scroll window until the entry is visible.
+    // ranges are known: nudge the scroll window until the entry is visible,
+    // then pin it. Follow drops even when no nudge was needed — a streaming
+    // tail must not slide the highlight out of view (↓ past the tail, or
+    // scrolling back to the bottom, re-arms follow).
     if let Some(sel) = ui.session_pending_scroll.take() {
         let rows = ui.session_fold.rows_of(sel);
         let current = ui.session_scroll.window(total, height);
-        if rows.start < current.start {
-            ui.session_scroll.top = rows.start;
-            ui.session_scroll.follow = false;
+        ui.session_scroll.top = if rows.start < current.start {
+            rows.start
         } else if rows.end > current.end {
-            ui.session_scroll.top = rows.end.saturating_sub(height);
-            ui.session_scroll.follow = false;
-        }
+            rows.end.saturating_sub(height)
+        } else {
+            current.start
+        };
+        ui.session_scroll.follow = false;
     }
 
     ui.metrics.session_total = total;
@@ -308,6 +312,48 @@ mod tests {
         assert!(
             text.contains("Which database should the cache use?"),
             "ask-user card visible alongside the scope review:\n{text}"
+        );
+    }
+
+    #[test]
+    fn applying_a_selection_pins_the_window_against_a_streaming_tail() {
+        let mut model = WorkspaceModel::new();
+        model.apply_inbound(&Inbound::Register(AgentMeta::new("lead", "goal", 0)));
+        model.apply_inbound(&Inbound::Event {
+            agent: "lead".into(),
+            event: AgentEvent::Text {
+                delta: "first-message".into(),
+            },
+        });
+
+        // Select the (already fully visible) first entry.
+        let mut ui = DeckUi {
+            session_selected: Some(0),
+            session_pending_scroll: Some(0),
+            ..DeckUi::default()
+        };
+        let area = Rect::new(0, 0, 60, 12);
+        let mut buf = Buffer::empty(area);
+        render(&model, &mut ui, area, &mut buf);
+        assert!(
+            !ui.session_scroll.follow,
+            "a selection pins the window even when no scroll nudge was needed"
+        );
+
+        // A streaming tail grows past the viewport — the pinned window must
+        // keep the selected entry visible instead of following the tail.
+        model.apply_inbound(&Inbound::Event {
+            agent: "lead".into(),
+            event: AgentEvent::Text {
+                delta: "\nnoise".repeat(40),
+            },
+        });
+        let mut buf2 = Buffer::empty(area);
+        render(&model, &mut ui, area, &mut buf2);
+        let text = buffer_text(&buf2);
+        assert!(
+            text.contains("first-message"),
+            "selected entry still visible under streaming:\n{text}"
         );
     }
 }
