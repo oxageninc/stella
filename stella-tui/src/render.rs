@@ -102,7 +102,9 @@ pub fn render(model: &SessionModel, ui: &mut UiState, frame: &mut Frame) {
     let (diff_total, diff_inner_h) = if ui.diff_open {
         let file = model.files.get(ui.selected_file);
         let diff_text = file.and_then(|f| f.latest_diff.as_deref());
-        let d_lines = diff_text.map(diff::body_lines).unwrap_or_default();
+        let d_lines = diff_text
+            .map(|d| diff::body_lines(d, file.map(|f| f.path.as_str())))
+            .unwrap_or_default();
         let (added, removed) = diff_text.map(diff::count_diff_lines).unwrap_or((0, 0));
         let d_total = d_lines.len();
         let d_inner_h = inner_height(right_area);
@@ -1195,7 +1197,7 @@ mod tests {
             "collapsed header:\n{collapsed}"
         );
         // Collapsed = header + 3 preview lines (all 3 fit within preview count).
-        let c_lines = transcript_lines(&model, false);
+        let c_lines = transcript_lines(&model, false, 0);
         assert_eq!(c_lines.len(), 4, "header + 3 preview lines");
         // Preview shows the reasoning content.
         let c_text: String = c_lines
@@ -1215,7 +1217,7 @@ mod tests {
             "expanded shows the full reasoning:\n{expanded}"
         );
         // Expanded = header + 3 content lines.
-        assert_eq!(transcript_lines(&model, true).len(), 4);
+        assert_eq!(transcript_lines(&model, true, 0).len(), 4);
     }
 
     #[test]
@@ -1223,7 +1225,7 @@ mod tests {
         let mut model = SessionModel::new();
         let long = format!("{}THE-TAIL", "reasoning noise ".repeat(20));
         model.apply(&AgentEvent::Reasoning { delta: long });
-        let lines = transcript_lines(&model, false);
+        let lines = transcript_lines(&model, false, 0);
         // 1 line of text → header + 1 preview = 2 lines.
         assert_eq!(lines.len(), 2);
         // The preview should be visible.
@@ -1241,11 +1243,11 @@ mod tests {
         model.apply(&AgentEvent::Reasoning {
             delta: "planning the refactor".into(),
         });
-        let before = transcript_lines(&model, false);
+        let before = transcript_lines(&model, false, 0);
         model.apply(&AgentEvent::Reasoning {
             delta: " now checking tests".into(),
         });
-        let after = transcript_lines(&model, false);
+        let after = transcript_lines(&model, false, 0);
         // Both produce header + 1 preview = 2 lines.
         assert_eq!(before.len(), 2);
         assert_eq!(after.len(), 2, "still header + 1 preview line");
@@ -1419,7 +1421,7 @@ mod tests {
             },
             duration_ms: 12,
         });
-        let lines = transcript_lines(&model, false);
+        let lines = transcript_lines(&model, false, 0);
         let joined: String = lines
             .iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.clone()))
