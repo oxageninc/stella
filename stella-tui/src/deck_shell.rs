@@ -20,10 +20,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind};
+use crossterm::event::{
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyEventKind, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    supports_keyboard_enhancement,
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -77,7 +82,12 @@ pub struct DeckOptions {
 struct TerminalGuard {
     raw: bool,
     alt: bool,
+    paste: bool,
     mouse: bool,
+    /// Whether the kitty keyboard protocol was pushed. When it is active, a
+    /// modified Enter (`⌘⏎`/`⌃⏎`) is reportable and the composer runs full
+    /// textarea semantics; without it the deck falls back to Enter-submits.
+    kitty: bool,
 }
 
 impl TerminalGuard {
@@ -85,16 +95,31 @@ impl TerminalGuard {
         let mut guard = Self {
             raw: false,
             alt: false,
+            paste: false,
             mouse: false,
+            kitty: false,
         };
         let mut out = io::stdout();
         enable_raw_mode()?;
         guard.raw = true;
         execute!(out, EnterAlternateScreen)?;
         guard.alt = true;
+        execute!(out, EnableBracketedPaste)?;
+        guard.paste = true;
         if mouse {
             execute!(out, EnableMouseCapture)?;
             guard.mouse = true;
+        }
+        // The kitty keyboard protocol disambiguates modified keys, letting
+        // `⌘⏎`/`⌃⏎` submit while plain `⏎` inserts a line break. Probing
+        // needs raw mode, so this comes last; best-effort (`false` on any
+        // probe error → legacy Enter semantics).
+        if matches!(supports_keyboard_enhancement(), Ok(true)) {
+            execute!(
+                out,
+                PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+            )?;
+            guard.kitty = true;
         }
         Ok(guard)
     }
@@ -103,8 +128,14 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let mut out = io::stdout();
+        if self.kitty {
+            let _ = execute!(out, PopKeyboardEnhancementFlags);
+        }
         if self.mouse {
             let _ = execute!(out, DisableMouseCapture);
+        }
+        if self.paste {
+            let _ = execute!(out, DisableBracketedPaste);
         }
         if self.alt {
             let _ = execute!(out, LeaveAlternateScreen);
@@ -311,7 +342,7 @@ pub async fn run_deck(
     let debug = DebugLog::new(opts.debug_log_path.clone());
     debug.note("deck session start");
 
-    let _guard = TerminalGuard::enter(opts.mouse_capture)?;
+    let guard = TerminalGuard::enter(opts.mouse_capture)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
 
     let mut model = WorkspaceModel::new();
@@ -319,6 +350,9 @@ pub async fn run_deck(
     let mut ui = DeckUi::new(Composer::new());
     ui.graph = opts.initial_graph.clone();
     ui.slash_commands = opts.slash_commands.clone();
+    // Enter semantics follow the terminal's actual capability (see
+    // `TerminalGuard::kitty` and `crate::composer::classify_enter`).
+    ui.enter_submits = !guard.kitty;
     let mut resources = ResourceMonitor::new();
 
     // Synthetic-event lane for `!` shell commands: spawned commands report
@@ -406,7 +440,12 @@ pub async fn run_deck(
                             DeckAction::Handled | DeckAction::Ignored => {}
                         }
                     }
-                    // Resize / mouse / paste: the next draw picks them up.
+                    // Bracketed paste lands in the composer with its line
+                    // breaks intact (large pastes collapse to a chip, L-T3).
+                    Some(Event::Paste(text)) => {
+                        ui.composer.paste(&text);
+                    }
+                    // Resize / mouse: the next draw picks them up.
                     Some(_) => {}
                     // Reader thread ended (stdin closed).
                     None => break 'run,

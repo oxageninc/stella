@@ -31,7 +31,7 @@ use unicode_width::UnicodeWidthChar;
 
 use stella_protocol::{BudgetMode, FileChangeKind, MediaKind, PrStatus, StageKind};
 
-use crate::composer::SlashMenu;
+use crate::composer::{ComposerLayout, SlashMenu, layout as composer_layout, split_row_at};
 use crate::model::{AskUserPrompt, FileState, Hud, SessionModel, TranscriptEntry};
 use crate::ui::{PanelFocus, UiState, ViewportMetrics};
 use crate::{diff, theme};
@@ -56,7 +56,13 @@ pub fn render(model: &SessionModel, ui: &mut UiState, frame: &mut Frame) {
             (prompt.options.len() as u16 + 4).min(10),
         ));
     }
-    constraints.push(Constraint::Length(3));
+    // The composer band grows with its soft-wrapped content (textarea
+    // semantics) up to a cap, then scrolls to keep the cursor row visible.
+    // Text width: the band spans the root minus 2 border columns and the
+    // 2-column `› ` prompt prefix.
+    let c_layout = composer_layout(&ui.composer, root.width.saturating_sub(4).max(1) as usize);
+    let composer_rows = c_layout.rows.len().clamp(1, COMPOSER_MAX_ROWS) as u16;
+    constraints.push(Constraint::Length(composer_rows + 2));
     let bands = Layout::vertical(constraints).split(root);
 
     let hud_area = bands[0];
@@ -149,10 +155,18 @@ pub fn render(model: &SessionModel, ui: &mut UiState, frame: &mut Frame) {
     }
 
     // ---- Composer.
-    let composer_line = ui.composer.display_line();
     let composer_focused = ui.focus == PanelFocus::Composer;
+    let composer_blank = ui.composer.is_blank();
+    let enter_submits = ui.enter_submits;
     guarded_panel(frame, composer_area, "composer", |buf| {
-        render_composer(&composer_line, composer_focused, composer_area, buf)
+        render_composer(
+            &c_layout,
+            composer_blank,
+            composer_focused,
+            enter_submits,
+            composer_area,
+            buf,
+        )
     });
 
     // ---- Slash-command popup, floating just above the composer (drawn last
@@ -188,72 +202,6 @@ pub(crate) fn inner_width(area: Rect) -> usize {
 // ---------------------------------------------------------------------------
 // Word-aware line wrapping (pre-wrap so scroll math stays line-exact, L-T4)
 // ---------------------------------------------------------------------------
-
-/// Pre-wrap styled lines to fit `max_width` display columns. Lines that
-/// already fit pass through unchanged; lines that overflow are split at word
-/// boundaries (preferring spaces, hard-breaking long words) into multiple
-/// `Line`s, each preserving the original span styles.
-///
-/// This runs *before* the scroll window calculation so the line-exact scroll
-/// math operates on visual (wrapped) rows — the rendered text never overflows
-/// horizontally and the scroll offset stays accurate.
-pub(crate) fn wrap_lines(lines: Vec<Line<'static>>, max_width: usize) -> Vec<Line<'static>> {
-    if max_width == 0 {
-        return lines;
-    }
-    let mut out = Vec::with_capacity(lines.len());
-    for line in lines {
-        if line.width() <= max_width {
-            out.push(line);
-        } else {
-            wrap_one(line, max_width, &mut out);
-        }
-    }
-    out
-}
-
-/// Wrap a single overflowing line into multiple lines of at most `max_width`.
-fn wrap_one(line: Line<'static>, max_width: usize, out: &mut Vec<Line<'static>>) {
-    // Flatten the line's spans into (char, style) pairs so we can measure and
-    // split at arbitrary positions while preserving styling.
-    let styled: Vec<(char, Style)> = line
-        .spans
-        .iter()
-        .flat_map(|s| s.content.chars().map(move |c| (c, s.style)))
-        .collect();
-
-    let mut current: Vec<(char, Style)> = Vec::new();
-    let mut current_w = 0usize;
-
-    let flush = |cur: &mut Vec<(char, Style)>, out: &mut Vec<Line<'static>>| {
-        if !cur.is_empty() {
-            out.push(Line::from(styled_chars_to_spans(std::mem::take(cur))));
-        }
-    };
-
-    for (ch, style) in styled {
-        let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
-        if current_w + cw > max_width && !current.is_empty() {
-            // Prefer breaking at the last space so words stay intact.
-            if let Some(space_idx) = current.iter().rposition(|(c, _)| *c == ' ') {
-                let remainder: Vec<(char, Style)> = current.split_off(space_idx);
-                // `current` now holds everything before the space.
-                flush(&mut current, out);
-                current = remainder;
-                current_w = current
-                    .iter()
-                    .map(|(c, _)| UnicodeWidthChar::width(*c).unwrap_or(0))
-                    .sum();
-            } else {
-                flush(&mut current, out);
-                current_w = 0;
-            }
-        }
-        current.push((ch, style));
-        current_w += cw;
-    }
-    flush(&mut current, out);
-}
 
 /// Coalesce adjacent same-styled characters into spans for compact output.
 fn styled_chars_to_spans(chars: Vec<(char, Style)>) -> Vec<Span<'static>> {
@@ -604,6 +552,7 @@ pub(crate) fn render_slash_popup(menu: &SlashMenu, selected: usize, area: Rect, 
             }
             Line::from(vec![
                 Span::styled(marker.to_string(), name_style),
+                Span::styled(format!("{} ", c.kind.glyph()), name_style),
                 Span::styled(c.name.clone(), name_style),
                 Span::styled("  ", desc_style),
                 Span::styled(c.description.clone(), desc_style),
@@ -623,21 +572,68 @@ pub(crate) fn render_slash_popup(menu: &SlashMenu, selected: usize, area: Rect, 
         .render(area, buf);
 }
 
-fn render_composer(line: &str, focused: bool, area: Rect, buf: &mut Buffer) {
-    let prompt = Span::styled(
-        "› ",
-        Style::new().fg(if focused {
-            Color::Green
+/// Cap on the composer's visible content rows: it grows with the prompt up
+/// to this, then scrolls to keep the cursor row in view.
+pub(crate) const COMPOSER_MAX_ROWS: usize = 8;
+
+/// The multi-line composer panel. Rows come pre-wrapped from
+/// [`crate::composer::layout`]; this draws the capped window that keeps the
+/// cursor row visible, with a block cursor at the exact cursor column.
+fn render_composer(
+    layout: &ComposerLayout,
+    blank: bool,
+    focused: bool,
+    enter_submits: bool,
+    area: Rect,
+    buf: &mut Buffer,
+) {
+    let accent = Style::new().fg(if focused {
+        Color::Green
+    } else {
+        Color::DarkGray
+    });
+    let cursor_style = Style::new()
+        .fg(Color::Green)
+        .add_modifier(Modifier::REVERSED);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    if blank {
+        // Empty composer: the cursor block plus a key hint matched to the
+        // terminal's Enter semantics.
+        let hint = if enter_submits {
+            "⏎ send · ⌥⏎ newline"
         } else {
-            Color::DarkGray
-        }),
-    );
-    let mut spans = vec![prompt, Span::raw(line.to_string())];
-    if focused {
-        spans.push(Span::styled("▏", Style::new().fg(Color::Green)));
+            "⏎ newline · ⌘⏎ send · ⌥[ start · ⌥] end"
+        };
+        let mut spans = vec![Span::styled("› ", accent)];
+        if focused {
+            spans.push(Span::styled(" ", cursor_style));
+            spans.push(Span::raw(" "));
+        }
+        spans.push(Span::styled(hint, Style::new().fg(Color::DarkGray)));
+        lines.push(Line::from(spans));
+    } else {
+        let visible = inner_height(area).max(1);
+        let first = (layout.cursor_row + 1).saturating_sub(visible);
+        for (i, row) in layout.rows.iter().enumerate().skip(first).take(visible) {
+            // The prompt glyph marks the first row; continuations align.
+            let prefix = if i == 0 { "› " } else { "  " };
+            let mut spans = vec![Span::styled(prefix, accent)];
+            if focused && i == layout.cursor_row {
+                let (before, under, after) = split_row_at(row, layout.cursor_col);
+                spans.push(Span::raw(before));
+                spans.push(Span::styled(
+                    under.map(String::from).unwrap_or_else(|| " ".into()),
+                    cursor_style,
+                ));
+                spans.push(Span::raw(after));
+            } else {
+                spans.push(Span::raw(row.clone()));
+            }
+            lines.push(Line::from(spans));
+        }
     }
     let block = Block::default().borders(Borders::ALL).title(" prompt ");
-    Paragraph::new(Line::from(spans))
+    Paragraph::new(Text::from(lines))
         .block(block)
         .render(area, buf);
 }
@@ -685,9 +681,7 @@ fn wrap_one_indent(
     let mut current: Vec<(char, Style)> = Vec::new();
     let mut current_w = 0usize;
 
-    let flush = |cur: &mut Vec<(char, Style)>,
-                 first: bool,
-                 out: &mut Vec<Line<'static>>| {
+    let flush = |cur: &mut Vec<(char, Style)>, first: bool, out: &mut Vec<Line<'static>>| {
         if !cur.is_empty() {
             let pairs = std::mem::take(cur);
             if first {
@@ -1332,13 +1326,38 @@ mod tests {
         );
         ui.slash_selected = 1;
         let text = draw(&model, &mut ui, 100, 30);
+        // The glyph is double-width: its trailing filler cell dumps as an
+        // extra space before the explicit separator.
         assert!(
-            text.contains("▸ /diff"),
-            "selection marker on the second row:\n{text}"
+            text.contains("▸ 🔒  /diff"),
+            "selection marker + builtin glyph on the second row:\n{text}"
         );
         assert!(
             text.contains("/ commands · 2"),
             "popup title with the match count:\n{text}"
+        );
+    }
+
+    #[test]
+    fn slash_popup_glyphs_distinguish_builtin_from_custom_commands() {
+        let model = SessionModel::new();
+        let mut composer = Composer::new();
+        composer.insert_char('/');
+        let mut ui = UiState::new(
+            composer,
+            vec![
+                SlashCommand::new("/help", "show help"),
+                SlashCommand::custom("/fix-bug", "fix the named bug"),
+            ],
+        );
+        let text = draw(&model, &mut ui, 100, 30);
+        assert!(
+            text.contains("🔒  /help"),
+            "productized commands carry the lock glyph:\n{text}"
+        );
+        assert!(
+            text.contains("⚡  /fix-bug"),
+            "custom commands carry the lightning glyph:\n{text}"
         );
     }
 

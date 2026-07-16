@@ -25,10 +25,15 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind};
+use crossterm::event::{
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyEventKind, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    supports_keyboard_enhancement,
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -129,30 +134,50 @@ fn append_json_line(path: &PathBuf, kind: &str, payload: serde_json::Value) -> i
     writeln!(file, "{line}")
 }
 
-/// Restores the terminal (raw mode + alternate screen, and mouse capture if it
-/// was enabled) on drop — including during a panic unwind.
+/// Restores the terminal (raw mode + alternate screen + bracketed paste, and
+/// mouse capture / keyboard-enhancement flags if they were enabled) on drop —
+/// including during a panic unwind.
 struct TerminalGuard {
     mouse: bool,
+    /// Whether the kitty keyboard protocol was pushed. When it is active, a
+    /// modified Enter (`⌘⏎`/`⌃⏎`) is reportable and the composer runs full
+    /// textarea semantics; without it the shell falls back to Enter-submits.
+    kitty: bool,
 }
 
 impl TerminalGuard {
     fn enter(mouse: bool) -> io::Result<Self> {
         enable_raw_mode()?;
         let mut out = io::stdout();
-        execute!(out, EnterAlternateScreen)?;
+        execute!(out, EnterAlternateScreen, EnableBracketedPaste)?;
         if mouse {
             execute!(out, EnableMouseCapture)?;
         }
-        Ok(Self { mouse })
+        // The kitty keyboard protocol disambiguates modified keys, letting
+        // `⌘⏎`/`⌃⏎` submit while plain `⏎` inserts a line break. Probing
+        // needs raw mode, so this comes last; best-effort (`false` on any
+        // probe error → legacy Enter semantics).
+        let kitty = matches!(supports_keyboard_enhancement(), Ok(true));
+        if kitty {
+            execute!(
+                out,
+                PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+            )?;
+        }
+        Ok(Self { mouse, kitty })
     }
 }
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let mut out = io::stdout();
+        if self.kitty {
+            let _ = execute!(out, PopKeyboardEnhancementFlags);
+        }
         if self.mouse {
             let _ = execute!(out, DisableMouseCapture);
         }
+        let _ = execute!(out, DisableBracketedPaste);
         let _ = execute!(out, LeaveAlternateScreen);
         let _ = disable_raw_mode();
     }
@@ -214,7 +239,7 @@ pub async fn run(
     // Order matters: declare the hook guard first so it drops *last* — the
     // terminal is restored before the panic hook is put back.
     let _hook_guard = PanicHookGuard::install(opts.debug_log_path.clone());
-    let _term_guard = TerminalGuard::enter(opts.mouse_capture)?;
+    let term_guard = TerminalGuard::enter(opts.mouse_capture)?;
 
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
 
@@ -223,6 +248,9 @@ pub async fn run(
         Composer::with_paste_threshold(opts.paste_line_threshold),
         opts.slash_commands,
     );
+    // Enter semantics follow the terminal's actual capability (see
+    // `TerminalGuard::kitty` and `crate::composer::classify_enter`).
+    ui.enter_submits = !term_guard.kitty;
 
     // A blocking reader thread forwards crossterm input events to the async
     // loop. It polls so it can observe the shutdown flag and exit promptly.
@@ -276,7 +304,12 @@ pub async fn run(
                             ShellAction::Handled | ShellAction::Ignored => {}
                         }
                     }
-                    // Resize/paste/other events: the next draw picks them up.
+                    // Bracketed paste lands in the composer with its line
+                    // breaks intact (large pastes collapse to a chip, L-T3).
+                    Some(Event::Paste(text)) => {
+                        ui.composer.paste(&text);
+                    }
+                    // Resize/other events: the next draw picks them up.
                     Some(_) => {}
                     // Reader thread ended (stdin closed).
                     None => break,
