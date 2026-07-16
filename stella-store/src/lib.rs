@@ -334,7 +334,7 @@ const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
 
 /// Every table the store owns — the allowlist for [`Store::count`] and the
 /// fresh-file probe in [`Store::migrate`].
-const TABLES: [&str; 8] = [
+const TABLES: [&str; 9] = [
     "executions",
     "events",
     "telemetry",
