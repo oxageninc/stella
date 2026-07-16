@@ -136,7 +136,11 @@ fn activity_strip_active(model: &WorkspaceModel) -> bool {
 /// "current task, one line" read), and the queued count with its shortcut.
 fn render_activity_strip(model: &WorkspaceModel, ui: &DeckUi, area: Rect, buf: &mut Buffer) {
     let pending = model.queue.pending();
-    let right_text = if pending > 0 {
+    // A double-Esc parked the backlog: say why nothing is dispatching and
+    // what will happen next (the user's next prompt runs first).
+    let right_text = if pending > 0 && ui.dispatch_held {
+        format!("⏸ {pending} held — your next prompt runs first ")
+    } else if pending > 0 {
         format!("▸ {pending} queued · ctrl+t open ")
     } else {
         String::new()
@@ -325,7 +329,7 @@ fn cpu_bar(pct: f64) -> String {
 /// A centered help overlay listing the deck's keys.
 fn render_help(area: Rect, buf: &mut Buffer) {
     let w = area.width.min(62);
-    let h = area.height.min(21);
+    let h = area.height.min(23);
     let popup = Rect {
         x: area.x + (area.width.saturating_sub(w)) / 2,
         y: area.y + (area.height.saturating_sub(h)) / 2,
@@ -384,6 +388,14 @@ fn render_help(area: Rect, buf: &mut Buffer) {
         )),
         Line::from(Span::styled(
             "  Files:  Enter  open the diff",
+            theme::body(),
+        )),
+        Line::from(Span::styled(
+            "  Esc          stop the turn (next queued runs)",
+            theme::body(),
+        )),
+        Line::from(Span::styled(
+            "  Esc Esc      stop & hold — type what runs next",
             theme::body(),
         )),
         Line::from(Span::styled("  Ctrl-C       quit", theme::body())),
@@ -460,6 +472,25 @@ mod tests {
         let mut buf3 = Buffer::empty(area);
         render_activity_strip(&later, &ui, area, &mut buf3);
         assert_ne!(buffer_text(&buf), buffer_text(&buf3));
+    }
+
+    #[test]
+    fn activity_strip_flags_a_held_queue() {
+        let model = running_model_with_queue();
+        let mut ui = DeckUi::default();
+        ui.dispatch_held = true;
+        let area = Rect::new(0, 0, 90, 1);
+        let mut buf = Buffer::empty(area);
+        render_activity_strip(&model, &ui, area, &mut buf);
+        let text = buffer_text(&buf);
+        assert!(
+            text.contains("2 held — your next prompt runs first"),
+            "held hint shown:\n{text}"
+        );
+        assert!(
+            !text.contains("ctrl+t open"),
+            "the held hint replaces the queue hint:\n{text}"
+        );
     }
 
     #[test]

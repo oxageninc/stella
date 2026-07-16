@@ -335,6 +335,13 @@ pub async fn run_deck(
                                     WorkspaceInput::Enqueue { text } => {
                                         model.queue.enqueue(text.clone(), model.now_ms);
                                     }
+                                    // The first submission after a double-Esc
+                                    // hold: front-insert, exactly as the
+                                    // driver will (it runs before the prompt
+                                    // the hold returned to the queue).
+                                    WorkspaceInput::EnqueueFront { text } => {
+                                        model.queue.enqueue_front(text.clone(), model.now_ms);
+                                    }
                                     WorkspaceInput::QueueRemove { index } => {
                                         model.queue.remove(*index);
                                     }
