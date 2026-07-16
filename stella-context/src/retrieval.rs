@@ -135,8 +135,9 @@ impl ContextStore {
         };
 
         // 2. Gather candidates under one lock acquisition — no await is
-        //    held here (packing below briefly re-acquires for neighbors). The
-        //    domain filter (if any) is applied here so every downstream signal
+        //    held here (the graph-neighbor expansion in 4b briefly
+        //    re-acquires the connection for its 1-hop lookup). The domain
+        //    filter (if any) is applied here so every downstream signal
         //    sees only the in-scope nodes.
         let fp_id = self.fingerprint().id();
         let (nodes, vectors, anchor_ids, domains_by_id) = {
@@ -155,9 +156,9 @@ impl ContextStore {
                 nodes.retain(|n| !excluded.contains(&n.id));
                 vectors.retain(|(id, _)| !excluded.contains(id));
             }
-            // One grouped scan instead of one statement per live node —
-            // entries for filtered-out nodes are harmless (lookups below are
-            // keyed by candidate id only).
+            // One grouped scan (live nodes only) instead of one statement
+            // per node — entries for scope-filtered nodes are harmless
+            // (lookups below are keyed by candidate id only).
             let domains_by_id: HashMap<i64, Vec<String>> = domains_by_node(&conn)?;
             (nodes, vectors, anchor_ids, domains_by_id)
         };

@@ -55,7 +55,7 @@
 //! do given the caller's own `approve`/`file_exists` facts
 //! ([`decide_promotion`]).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use crate::glob::match_glob;
 
@@ -655,7 +655,7 @@ pub fn mine_candidates(
         };
         if crate::mining::already_captured(
             &text,
-            existing_rules.iter().map(|r| r.text.clone()),
+            existing_rules.iter().map(|r| r.text.as_str()),
             config.min_similarity,
         ) {
             continue;

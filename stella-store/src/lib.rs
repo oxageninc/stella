@@ -144,30 +144,52 @@ impl UsageStatsRow {
     }
 }
 
-/// Best-effort hardening of the workspace `.stella/` directory. The store
-/// holds full session transcripts (prompts, tool outputs — which can carry
-/// file contents), so:
+/// Hardening of the workspace `.stella/` directory. The store holds full
+/// session transcripts (prompts, tool outputs — which can carry file
+/// contents), so:
 /// - a directory this call just created gets owner-only permissions on unix,
 ///   matching the credentials file's 0600-from-birth discipline; a
-///   pre-existing directory keeps whatever permissions the user chose;
+///   pre-existing directory keeps whatever permissions the user chose. If
+///   that chmod FAILS, the error propagates and the store refuses to open:
+///   proceeding would write transcripts into a world-readable directory.
+///   (The CLI treats a failed open as observability loss — it warns once
+///   and the session runs on without persistence.)
 /// - a `.gitignore` covering the *generated* artifacts (databases, their WAL
 ///   siblings, the reflections mining log) is dropped once if absent, so
 ///   transcripts are never committed and pushed by accident. Deliberately
 ///   NOT `*`: settings.json, mcp.toml, tools/, skills/ and memories/ are
-///   user-authored and meant to be committable.
-///
-/// Failures here are non-fatal by design (the DB open right after will
-/// surface a genuinely unusable directory).
-fn harden_workspace_dir(dir: &Path, created: bool) {
+///   user-authored and meant to be committable. Created with `create_new`
+///   so a file that appears concurrently is never truncated (no
+///   check-then-write TOCTOU): `AlreadyExists` — pre-existing or racing —
+///   means "leave it alone", and any other failure stays best-effort
+///   ignored (the DB open right after surfaces a genuinely unusable
+///   directory).
+fn harden_workspace_dir(dir: &Path, created: bool) -> Result<()> {
     #[cfg(unix)]
     if created {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).map_err(|e| {
+            StoreError(format!(
+                "could not restrict permissions on freshly created {} (chmod 0700 failed: {e}); \
+                 refusing transcript persistence rather than writing sensitive session data \
+                 into a world-readable directory",
+                dir.display()
+            ))
+        })?;
     }
     let gitignore = dir.join(".gitignore");
-    if !gitignore.exists() {
-        let _ = std::fs::write(&gitignore, "*.db\n*.db-wal\n*.db-shm\nreflections.jsonl\n");
+    // create_new: AlreadyExists (pre-existing or created by a concurrent
+    // session between any check and this open) leaves the file untouched —
+    // success; other errors are best-effort ignored, like the write itself.
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&gitignore)
+    {
+        use std::io::Write;
+        let _ = file.write_all(b"*.db\n*.db-wal\n*.db-shm\nreflections.jsonl\n");
     }
+    Ok(())
 }
 
 pub struct Store {
@@ -181,7 +203,7 @@ impl Store {
         let dir = workspace_root.join(".stella");
         let created = !dir.exists();
         std::fs::create_dir_all(&dir).map_err(|e| StoreError(e.to_string()))?;
-        harden_workspace_dir(&dir, created);
+        harden_workspace_dir(&dir, created)?;
         Self::init(Connection::open(dir.join("store.db"))?)
     }
 
@@ -1170,6 +1192,8 @@ mod tests {
         assert!(!gitignore.lines().any(|l| l.trim() == "*"));
 
         // A pre-existing .gitignore is left alone (user may have customized).
+        // Under create_new this same path also covers the race where another
+        // session drops the file between open's checks — never truncated.
         std::fs::write(dir.join(".gitignore"), "custom\n").unwrap();
         drop(Store::open(&root).unwrap());
         assert_eq!(

@@ -1063,16 +1063,21 @@ pub(crate) fn tag_edge_domains(
     Ok(added)
 }
 
-/// Every node's domain names in one scan, sorted per node for stable
+/// Every LIVE node's domain names in one scan, sorted per node for stable
 /// citation display — the batched form of the old per-node query. Recall
 /// runs this once per prompt; one statement per live node was an N+1 whose
-/// cost grew with lifetime memory size.
+/// cost grew with lifetime memory size. Superseded nodes are filtered in
+/// SQL (same liveness predicate as [`live_nodes`]): recall only looks up
+/// live candidates, so loading dead nodes' tags made the scan grow with
+/// historical store size for no reader.
 pub(crate) fn domains_by_node(
     conn: &Connection,
 ) -> Result<std::collections::HashMap<i64, Vec<String>>, ContextError> {
     let mut stmt = conn.prepare(
         "SELECT nd.node_id, d.name FROM node_domains nd
          JOIN domain d ON d.id = nd.domain_id
+         JOIN node n ON n.id = nd.node_id
+         WHERE n.superseded_at IS NULL
          ORDER BY nd.node_id, d.name",
     )?;
     let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;

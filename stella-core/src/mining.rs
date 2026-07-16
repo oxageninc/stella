@@ -16,23 +16,24 @@ const STOPWORDS: &[&str] = &[
 ];
 
 /// Split text into lowercased, de-stopped terms (>2 chars) for lexical
-/// scoring/clustering (TS: `terms`).
+/// scoring/clustering (TS: `terms`). Stopword checks scan the 43-item
+/// static slice directly — this runs inside the clustering loops, and a
+/// per-call `HashSet` rebuild cost more than the linear scans it saved.
 pub(crate) fn terms(text: &str) -> Vec<String> {
-    let stopwords: HashSet<&str> = STOPWORDS.iter().copied().collect();
     let mut out = Vec::new();
     let mut current = String::new();
     for ch in text.to_lowercase().chars() {
         if ch.is_ascii_alphanumeric() || ch == '_' {
             current.push(ch);
         } else if !current.is_empty() {
-            if current.len() > 2 && !stopwords.contains(current.as_str()) {
+            if current.len() > 2 && !STOPWORDS.contains(&current.as_str()) {
                 out.push(std::mem::take(&mut current));
             } else {
                 current.clear();
             }
         }
     }
-    if current.len() > 2 && !stopwords.contains(current.as_str()) {
+    if current.len() > 2 && !STOPWORDS.contains(&current.as_str()) {
         out.push(current);
     }
     out
@@ -124,16 +125,17 @@ pub(crate) fn representative_text<T>(cluster: &[T], text: impl Fn(&T) -> &str) -
 
 /// `true` when any existing artifact already says essentially the same
 /// thing — the candidate's terms overlap one of the `haystacks` past
-/// `min_similarity`. Each miner builds its own haystack (a rule's text; a
-/// skill's name+description+body) (TS: `alreadyCaptured`).
-pub(crate) fn already_captured(
+/// `min_similarity`. Each miner builds its own haystack (a rule's text —
+/// borrowed `&str`s, no clone; a skill's composed name+description+body —
+/// owned `String`s): anything `AsRef<str>` works (TS: `alreadyCaptured`).
+pub(crate) fn already_captured<S: AsRef<str>>(
     text: &str,
-    haystacks: impl IntoIterator<Item = String>,
+    haystacks: impl IntoIterator<Item = S>,
     min_similarity: f64,
 ) -> bool {
     let t: HashSet<String> = terms(text).into_iter().collect();
     haystacks.into_iter().any(|haystack| {
-        let ht: HashSet<String> = terms(&haystack).into_iter().collect();
+        let ht: HashSet<String> = terms(haystack.as_ref()).into_iter().collect();
         jaccard(&t, &ht) >= min_similarity
     })
 }
