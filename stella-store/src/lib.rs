@@ -194,6 +194,8 @@ pub struct MemoryCitationStats {
     pub positive_streak: i64,
     /// `positive_streak > PROMOTION_CITATIONS_REQUIRED` — the promotion gate.
     pub eligible: bool,
+}
+
 /// One extension-authored workspace rule, as stored: the full rule markdown
 /// in the `.stella/rules/*.md` authoring format plus the writer's label.
 #[derive(Debug, Clone, PartialEq)]
