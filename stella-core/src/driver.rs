@@ -315,17 +315,21 @@ impl<'a> Engine<'a> {
             }
         }
 
-        let reason = format!(
-            "reached the step cap ({}) without completing — this is the belt-and-suspenders \
-             backstop; loop detection should normally catch a stuck turn first",
-            self.config.max_steps
-        );
-        let _ = events.send(AgentEvent::Error {
-            message: reason.clone(),
-            retryable: false,
-        });
-        TurnOutcome::Aborted { reason }
-    }
+            // ---- Telemetry for the call that just committed: exactly one
+            // ---- StepUsage per landed step — the metering record.
+            let _ = events.send(AgentEvent::StepUsage {
+                step,
+                model: result.model.clone(),
+                input_tokens: result.usage.input_tokens,
+                output_tokens: result.usage.output_tokens,
+                cached_input_tokens: result.usage.cached_input_tokens,
+                cache_write_tokens: result.usage.cache_write_tokens,
+                estimated_input_tokens,
+                cost_usd: result.cost_usd,
+                duration_ms: call_duration_ms,
+                retries: retries.len() as u32,
+                tool_calls: result.tool_calls.len(),
+            });
 
     /// Compaction, before every model call, per the running estimate
     /// (L-E3 dedup+evict, stable system prefix — the system message is
@@ -1594,6 +1598,7 @@ mod tests {
                 input_tokens: 1000,
                 output_tokens: 50,
                 cached_input_tokens: 800,
+                cache_write_tokens: 120,
             };
             result
         };
@@ -1632,6 +1637,7 @@ mod tests {
                 step,
                 input_tokens,
                 cached_input_tokens,
+                cache_write_tokens,
                 retries,
                 tool_calls,
                 cost_usd,
@@ -1642,6 +1648,7 @@ mod tests {
                     step,
                     input_tokens,
                     cached_input_tokens,
+                    cache_write_tokens,
                     retries,
                     tool_calls,
                     cost_usd,
@@ -1650,14 +1657,15 @@ mod tests {
         }
         // Two committed model calls → exactly two metering records; the
         // 429'd attempt shows up as retries: 1 on step 0, never as its own
-        // record.
+        // record. Cache writes flow through from the provider's usage
+        // envelope — never re-derived, never dropped to 0.
         assert_eq!(
             usages.len(),
             2,
             "one StepUsage per committed step: {usages:?}"
         );
-        assert_eq!(usages[0], (0, 1000, 800, 1, 1, 0.0001));
-        assert_eq!(usages[1], (1, 1000, 800, 0, 0, 0.0001));
+        assert_eq!(usages[0], (0, 1000, 800, 120, 1, 1, 0.0001));
+        assert_eq!(usages[1], (1, 1000, 800, 120, 0, 0, 0.0001));
     }
 
     // ---- Token-drift calibration -------------------------------------------
@@ -1763,6 +1771,7 @@ mod tests {
                 input_tokens: 4_000,
                 output_tokens: 50,
                 cached_input_tokens: 0,
+                cache_write_tokens: 0,
             };
             // Vary each call's input: `tool_call_result` reuses one command,
             // and three byte-identical bash calls are exactly what

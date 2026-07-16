@@ -155,10 +155,9 @@ fn relative_symlink_target(from_dir: &Path, target: &Path) -> PathBuf {
 pub struct SyncOutcome {
     /// Created links as `(kind, name)`.
     pub linked: Vec<(ExtensionKind, String)>,
-    /// Entries skipped by the plan (symlink sources, existing names). The
-    /// progress line reports only links and errors, so outside of tests this
-    /// count is currently write-only — kept because dropping it would erase
-    /// the only record of "found but not adopted" a future line can report.
+    /// Entries skipped by the plan (symlink sources, existing names).
+    /// Asserted by the sync tests only — the bin build never reads it (the
+    /// progress line reports links and errors), hence the lint exception.
     #[allow(dead_code)]
     pub skipped: usize,
     pub errors: Vec<String>,

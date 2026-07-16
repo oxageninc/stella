@@ -378,7 +378,8 @@ pub fn plan_extension_sync(
         std::collections::HashSet<String>,
     > = std::collections::HashMap::new();
     for source in sources {
-        if let std::collections::hash_map::Entry::Vacant(vacant) = present_files.entry(source.kind)
+        if let std::collections::hash_map::Entry::Vacant(vacant) =
+            present_files.entry(source.kind)
         {
             let targets = existing(source.kind);
             vacant.insert(targets.file_names.into_iter().collect());
