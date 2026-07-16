@@ -15,7 +15,10 @@
 //!   future estimates), cache read hits, cache misses, cache writes, cost
 //!   (computed from the model card's pricing × token counts in the
 //!   adapter), duration, retries, tool-call count.
-//! - **files_touched** — the CRUD ledger per execution.
+//! - **files_touched** — the file-touch telemetry per execution: one row per
+//!   normalized workspace-relative path, carrying its deduplicated CRUD
+//!   letters, session line-delta totals, and the ordered JSON audit log of
+//!   every individual touch (event, reason, per-touch line delta).
 //! - **file_locks** — schema + API for cooperative file claims in multi-agent
 //!   work. Reserved: no shipping command acquires locks yet.
 //! - **graph_nodes / graph_edges** — schema reserved as a future seam for a
@@ -106,6 +109,20 @@ pub struct TelemetryRow {
     pub duration_ms: u64,
     pub retries: u32,
     pub tool_calls: u64,
+}
+
+/// One session-level file-touch record, ready to persist: the normalized
+/// workspace-relative path, its deduplicated CRUD letters in first-occurrence
+/// order (e.g. `"RUD"`), the session line-delta totals, and the ordered
+/// audit log serialized as a JSON array of
+/// `{event, reason, lines_added, lines_removed}` objects.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FileTouchRow {
+    pub path: String,
+    pub ops: String,
+    pub lines_added: u64,
+    pub lines_removed: u64,
+    pub events_json: String,
 }
 
 /// One aggregated analytics row per (provider, model): the numbers behind
@@ -211,10 +228,13 @@ type Migration = fn(&rusqlite::Transaction<'_>) -> Result<()>;
 /// a file at `user_version` i to i + 1. Fresh files never run these — they
 /// get [`create_latest_schema`] and are stamped at [`SCHEMA_VERSION`]
 /// directly.
-const MIGRATIONS: [Migration; 1] = [
+const MIGRATIONS: [Migration; 2] = [
     // v0 → v1: dedupe events/telemetry, then retrofit the UNIQUE keys
     // their write paths have always assumed.
     migrate_v0_to_v1,
+    // v1 → v2: files_touched grows line-delta totals + the JSON audit log,
+    // and the UNIQUE (execution_id, path) key.
+    migrate_v1_to_v2,
 ];
 
 /// The schema version this build writes — the `PRAGMA user_version` of
@@ -248,11 +268,6 @@ const UNCHANGED_TABLES: &str = "CREATE TABLE IF NOT EXISTS executions (
        finished_at TEXT,
        outcome TEXT,
        cost_usd REAL NOT NULL DEFAULT 0
-     );
-     CREATE TABLE IF NOT EXISTS files_touched (
-       execution_id INTEGER NOT NULL,
-       path TEXT NOT NULL,
-       ops TEXT NOT NULL
      );
      CREATE TABLE IF NOT EXISTS file_locks (
        path TEXT PRIMARY KEY,
@@ -290,6 +305,29 @@ fn events_ddl(table: &str) -> String {
            event_type TEXT NOT NULL,
            payload TEXT NOT NULL,
            UNIQUE (execution_id, seq)
+         );"
+    )
+}
+
+/// `files_touched` DDL at [`SCHEMA_VERSION`] — see [`events_ddl`] for why it
+/// is name-parameterized.
+///
+/// UNIQUE (execution_id, path): one session record per normalized path —
+/// the ledger aggregates every touch of a file into one record before
+/// persisting, so a duplicate path is a double-write, not data. `events` is
+/// the ordered JSON audit log (`[{event, reason, lines_added,
+/// lines_removed}, …]`); rows persisted before v2 carry the backfill
+/// defaults (zero deltas, empty log).
+fn files_touched_ddl(table: &str) -> String {
+    format!(
+        "CREATE TABLE {table} (
+           execution_id INTEGER NOT NULL,
+           path TEXT NOT NULL,
+           ops TEXT NOT NULL,
+           lines_added INTEGER NOT NULL DEFAULT 0,
+           lines_removed INTEGER NOT NULL DEFAULT 0,
+           events TEXT NOT NULL DEFAULT '[]',
+           UNIQUE (execution_id, path)
          );"
     )
 }
@@ -339,6 +377,7 @@ fn create_latest_schema(tx: &rusqlite::Transaction<'_>) -> Result<()> {
     tx.execute_batch(UNCHANGED_TABLES)?;
     tx.execute_batch(&events_ddl("events"))?;
     tx.execute_batch(&telemetry_ddl("telemetry"))?;
+    tx.execute_batch(&files_touched_ddl("files_touched"))?;
     tx.execute_batch(TELEMETRY_INDEX)?;
     Ok(())
 }
@@ -403,6 +442,16 @@ fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
 /// created fresh in the v1 shape: empty, nothing to dedupe.
 fn migrate_v0_to_v1(tx: &rusqlite::Transaction<'_>) -> Result<()> {
     tx.execute_batch(UNCHANGED_TABLES)?;
+    // files_touched changed shape again in v2, so it left UNCHANGED_TABLES —
+    // but a v1 database has its ERA's shape, which this step must keep
+    // producing (the v2 rebuild right after runs against it).
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS files_touched (
+           execution_id INTEGER NOT NULL,
+           path TEXT NOT NULL,
+           ops TEXT NOT NULL
+         );",
+    )?;
     // New executions must never reuse an id that historic rows already
     // reference: a reused id mis-attributes those orphaned rows to the new
     // run, and — with the UNIQUE keys this migration retrofits — collides
@@ -487,6 +536,32 @@ fn migrate_v0_to_v1(tx: &rusqlite::Transaction<'_>) -> Result<()> {
         tx.execute_batch(&telemetry_ddl("telemetry"))?;
     }
     tx.execute_batch(TELEMETRY_INDEX)?;
+    Ok(())
+}
+
+/// v1 → v2: `files_touched` grows per-file line-delta totals and the ordered
+/// JSON audit log ([`FileTouchRow`]), plus the UNIQUE (execution_id, path)
+/// key its writer has always assumed (the ledger emits exactly one record
+/// per normalized path per execution). SQLite cannot ALTER a UNIQUE
+/// constraint in, so the table is rebuilt per lang_altertable §7 with the
+/// same newest-row keep-rule as [`migrate_v0_to_v1`]. Legacy rows predate
+/// line telemetry and are backfilled with the column defaults: zero deltas,
+/// `'[]'` audit log.
+fn migrate_v1_to_v2(tx: &rusqlite::Transaction<'_>) -> Result<()> {
+    if table_exists(tx, "files_touched")? {
+        tx.execute_batch(&files_touched_ddl("files_touched_v2"))?;
+        tx.execute_batch(
+            "INSERT INTO files_touched_v2 (execution_id, path, ops)
+             SELECT execution_id, path, ops FROM files_touched
+             WHERE rowid IN (SELECT max(rowid) FROM files_touched GROUP BY execution_id, path);
+             DROP TABLE files_touched;
+             ALTER TABLE files_touched_v2 RENAME TO files_touched;",
+        )?;
+    } else {
+        // Partial v1 files exist just like partial v0 files: nothing to
+        // rebuild, create the v2 shape fresh.
+        tx.execute_batch(&files_touched_ddl("files_touched"))?;
+    }
     Ok(())
 }
 
@@ -719,17 +794,24 @@ impl Store {
         Ok(samples)
     }
 
-    /// Persist the CRUD ledger for an execution.
-    pub fn record_files_touched(
-        &self,
-        execution_id: i64,
-        files: &[(String, String)],
-    ) -> Result<()> {
+    /// Persist the file-touch telemetry for an execution: one row per
+    /// normalized path. UNIQUE (execution_id, path) makes a duplicate record
+    /// for the same path an error instead of a silent double-count.
+    pub fn record_files_touched(&self, execution_id: i64, files: &[FileTouchRow]) -> Result<()> {
         let conn = self.lock();
-        for (path, ops) in files {
+        for row in files {
             conn.execute(
-                "INSERT INTO files_touched (execution_id, path, ops) VALUES (?, ?, ?)",
-                params![execution_id, path, ops],
+                "INSERT INTO files_touched \
+                 (execution_id, path, ops, lines_added, lines_removed, events) \
+                 VALUES (?, ?, ?, ?, ?, ?)",
+                params![
+                    execution_id,
+                    row.path,
+                    row.ops,
+                    row.lines_added as i64,
+                    row.lines_removed as i64,
+                    row.events_json,
+                ],
             )?;
         }
         Ok(())
@@ -971,13 +1053,118 @@ mod tests {
             )
             .unwrap();
         store
-            .record_files_touched(id, &[("src/main.rs".into(), "RU".into())])
+            .record_files_touched(id, &[touch_row("src/main.rs", "RU", 18, 4)])
             .unwrap();
         store.finish_execution(id, "completed", 0.0042).unwrap();
 
         assert_eq!(store.count("telemetry").unwrap(), 1);
         assert_eq!(store.count("files_touched").unwrap(), 1);
         assert_eq!(store.count("executions").unwrap(), 1);
+    }
+
+    /// A file-touch row with a one-entry audit log carrying the same deltas.
+    fn touch_row(path: &str, ops: &str, added: u64, removed: u64) -> FileTouchRow {
+        FileTouchRow {
+            path: path.into(),
+            ops: ops.into(),
+            lines_added: added,
+            lines_removed: removed,
+            events_json: format!(
+                "[{{\"event\":\"U\",\"reason\":\"test\",\
+                 \"lines_added\":{added},\"lines_removed\":{removed}}}]"
+            ),
+        }
+    }
+
+    #[test]
+    fn files_touched_rows_roundtrip_line_deltas_and_audit_log() {
+        let store = Store::in_memory().unwrap();
+        let id = store.begin_execution("run", "p", "zai", "glm-5.2").unwrap();
+        store
+            .record_files_touched(id, &[touch_row("src/render.rs", "RU", 18, 4)])
+            .unwrap();
+
+        let conn = store.lock();
+        let (added, removed, events): (i64, i64, String) = conn
+            .query_row(
+                "SELECT lines_added, lines_removed, events FROM files_touched \
+                 WHERE execution_id = ? AND path = 'src/render.rs'",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((added, removed), (18, 4));
+        let parsed: serde_json::Value = serde_json::from_str(&events).unwrap();
+        assert_eq!(parsed[0]["event"], "U");
+        assert_eq!(parsed[0]["lines_added"], 18);
+    }
+
+    #[test]
+    fn files_touched_rejects_a_duplicate_path_per_execution() {
+        let store = Store::in_memory().unwrap();
+        let id = store.begin_execution("run", "p", "zai", "glm-5.2").unwrap();
+        store
+            .record_files_touched(id, &[touch_row("src/a.rs", "R", 0, 0)])
+            .unwrap();
+        assert!(
+            store
+                .record_files_touched(id, &[touch_row("src/a.rs", "RU", 1, 0)])
+                .is_err(),
+            "a second session record for the same normalized path must violate UNIQUE"
+        );
+        // The same path under a DIFFERENT execution is a fresh session record.
+        let other = store.begin_execution("run", "p", "zai", "glm-5.2").unwrap();
+        store
+            .record_files_touched(other, &[touch_row("src/a.rs", "R", 0, 0)])
+            .unwrap();
+    }
+
+    #[test]
+    fn v2_migration_rebuilds_files_touched_with_dedupe_and_backfill() {
+        let root = temp_root("v2_files_touched");
+        {
+            let conn = Connection::open(root.join(".stella/store.db")).unwrap();
+            conn.execute_batch(LEGACY_V0_SCHEMA).unwrap();
+            // Historic double-write of the same path the v0/v1 shapes
+            // accepted — the newest row must survive the rebuild.
+            conn.execute_batch(
+                "INSERT INTO executions (kind, prompt, provider, model)
+                   VALUES ('run', 'p', 'zai', 'glm-5.2');
+                 INSERT INTO files_touched (execution_id, path, ops) VALUES (1, 'src/a.rs', 'R');
+                 INSERT INTO files_touched (execution_id, path, ops) VALUES (1, 'src/a.rs', 'RU');
+                 INSERT INTO files_touched (execution_id, path, ops) VALUES (1, 'src/b.rs', 'D');",
+            )
+            .unwrap();
+        }
+
+        let store = Store::open(&root).unwrap();
+        assert_eq!(user_version(&store), SCHEMA_VERSION);
+        assert_eq!(store.count("files_touched").unwrap(), 2);
+        {
+            let conn = store.lock();
+            let (ops, added, removed, events): (String, i64, i64, String) = conn
+                .query_row(
+                    "SELECT ops, lines_added, lines_removed, events FROM files_touched \
+                     WHERE execution_id = 1 AND path = 'src/a.rs'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .unwrap();
+            assert_eq!(ops, "RU", "newest row per (execution_id, path) survives");
+            assert_eq!((added, removed), (0, 0), "legacy rows backfill zero deltas");
+            assert_eq!(events, "[]", "legacy rows backfill an empty audit log");
+        }
+        // The retrofitted key holds and new-shape writes work.
+        assert!(
+            store
+                .record_files_touched(1, &[touch_row("src/a.rs", "R", 0, 0)])
+                .is_err()
+        );
+        store
+            .record_files_touched(1, &[touch_row("src/new.rs", "C", 7, 0)])
+            .unwrap();
+        drop(store);
+        std::fs::remove_dir_all(&root).ok();
     }
 
     /// A telemetry row shaped for drift tests — only the sample-relevant

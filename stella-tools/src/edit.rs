@@ -21,7 +21,8 @@ impl Tool for EditFile {
                     "path": { "type": "string", "description": "File path relative to workspace root" },
                     "old_string": { "type": "string", "description": "Exact text to find" },
                     "new_string": { "type": "string", "description": "Replacement text" },
-                    "replace_all": { "type": "boolean", "description": "Replace all occurrences (default false)" }
+                    "replace_all": { "type": "boolean", "description": "Replace all occurrences (default false)" },
+                    "reason": { "type": "string", "description": "Why you are editing this file — recorded in the session's file-touch audit log" }
                 },
                 "required": ["path", "old_string", "new_string"]
             }),

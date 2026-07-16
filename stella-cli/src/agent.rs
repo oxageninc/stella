@@ -398,7 +398,7 @@ async fn run_pipeline_one_shot(
             }
             Err(_) => ("error", 0.0),
         };
-        if !record_execution_end(store, *id, &files, outcome_label, cost) {
+        if !record_execution_end(store, *id, &registry, outcome_label, cost) {
             warn_store_write_failed("the audit record (files touched / outcome)");
         }
     }
@@ -1880,7 +1880,7 @@ async fn run_turn(
             TurnOutcome::Completed { cost_usd, .. } => ("completed", *cost_usd),
             TurnOutcome::Aborted { .. } => ("aborted", 0.0),
         };
-        if !record_execution_end(store, *id, &files, outcome_label, cost) {
+        if !record_execution_end(store, *id, registry, outcome_label, cost) {
             warn_store_write_failed("the audit record (files touched / outcome)");
         }
     }
@@ -1902,6 +1902,9 @@ async fn run_turn(
             "reason": reason,
             "model": format!("{}/{}", cfg.provider.id, cfg.model_id),
             "events": collected,
+            // The session file-touch telemetry payload (one record per
+            // normalized path: crud_events, line-delta totals, audit log).
+            "files_touched": registry.file_touch_telemetry().to_json(),
         });
         println!(
             "{}",
@@ -2007,24 +2010,44 @@ fn spawn_renderer(
     })
 }
 
-/// Best-effort end-of-execution records: which files the agent touched and
-/// how the run ended. A failure must not abort the turn, but it must not
-/// vanish either — the store is the durable audit record of what the agent
-/// did. Returns `false` when either write failed so the caller can surface
-/// a warning on its own channel (stderr for the CLI surfaces, a deck event
-/// for the TUI, where stderr belongs to the alternate screen).
+/// Best-effort end-of-execution records: the session's file-touch telemetry
+/// (read straight off the registry's ledger) and how the run ended. A
+/// failure must not abort the turn, but it must not vanish either — the
+/// store is the durable audit record of what the agent did. Returns `false`
+/// when either write failed so the caller can surface a warning on its own
+/// channel (stderr for the CLI surfaces, a deck event for the TUI, where
+/// stderr belongs to the alternate screen).
 pub(crate) fn record_execution_end(
     store: &Store,
     execution_id: i64,
-    files: &[(String, String)],
+    registry: &ToolRegistry,
     outcome_label: &str,
     cost_usd: f64,
 ) -> bool {
-    let files_ok = store.record_files_touched(execution_id, files).is_ok();
+    let files = file_touch_rows(registry);
+    let files_ok = store.record_files_touched(execution_id, &files).is_ok();
     let finish_ok = store
         .finish_execution(execution_id, outcome_label, cost_usd)
         .is_ok();
     files_ok && finish_ok
+}
+
+/// The registry's session file-touch telemetry as store rows: one per
+/// normalized path, `ops` as the deduplicated CRUD letters in
+/// first-occurrence order, and the ordered audit log serialized to JSON.
+fn file_touch_rows(registry: &ToolRegistry) -> Vec<stella_store::FileTouchRow> {
+    registry
+        .file_touch_telemetry()
+        .files_touched
+        .into_iter()
+        .map(|record| stella_store::FileTouchRow {
+            ops: record.crud_events.iter().map(|op| op.letter()).collect(),
+            lines_added: record.lines_added,
+            lines_removed: record.lines_removed,
+            events_json: serde_json::to_string(&record.events).unwrap_or_else(|_| "[]".into()),
+            path: record.path,
+        })
+        .collect()
 }
 
 /// The stderr form of the store-write warning, for the non-deck surfaces.
@@ -2181,7 +2204,7 @@ async fn run_goal_turn(
             GoalOutcome::Met { cost_usd, .. } => ("goal_met", *cost_usd),
             GoalOutcome::Unmet { cost_usd, .. } => ("goal_unmet", *cost_usd),
         };
-        if !record_execution_end(store, *id, &files, outcome_label, cost) {
+        if !record_execution_end(store, *id, registry, outcome_label, cost) {
             warn_store_write_failed("the audit record (files touched / outcome)");
         }
     }
