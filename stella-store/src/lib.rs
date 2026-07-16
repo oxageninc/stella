@@ -1975,7 +1975,9 @@ mod tests {
     fn skill_usage_records_per_execution_version_rows() {
         let store = Store::in_memory().unwrap();
         assert_eq!(user_version(&store), SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 5, "skill_usage lands at v5 on this branch");
+        // skill_usage lands at v5; the additive mcp_usage migration takes v6
+        // behind it (reconciled at cascade-merge), so SCHEMA_VERSION is now 6.
+        assert_eq!(SCHEMA_VERSION, 6);
 
         let id = store
             .begin_execution("deck", "format the sql", "zai", "glm-5.2")

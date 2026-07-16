@@ -270,7 +270,11 @@ impl RegistryServer {
         for remote in &self.remotes {
             let (transport, auth) = remote_to_option(remote);
             options.push(InstallOption {
-                label: format!("remote · {} · {}", non_empty(&remote.kind, "http"), remote.url),
+                label: format!(
+                    "remote · {} · {}",
+                    non_empty(&remote.kind, "http"),
+                    remote.url
+                ),
                 transport,
                 auth,
             });
@@ -499,7 +503,11 @@ impl RegistryClient {
         limit: u32,
     ) -> Result<RegistryPage, McpError> {
         let url = format!("{}{SERVERS_PATH}", self.base_url);
-        let limit = if limit == 0 { DEFAULT_PAGE_LIMIT } else { limit };
+        let limit = if limit == 0 {
+            DEFAULT_PAGE_LIMIT
+        } else {
+            limit
+        };
         let mut params: Vec<(&str, String)> = vec![("limit", limit.to_string())];
         if let Some(q) = query.map(str::trim).filter(|q| !q.is_empty()) {
             params.push(("search", q.to_string()));
@@ -580,7 +588,11 @@ mod tests {
         assert!(page.next_cursor.is_some(), "next cursor present");
         assert_eq!(page.count, Some(page.entries.len() as u64));
         // Status flags are lifted out of `_meta`.
-        assert!(page.entries.iter().any(|e| e.status.as_deref() == Some("active")));
+        assert!(
+            page.entries
+                .iter()
+                .any(|e| e.status.as_deref() == Some("active"))
+        );
         assert!(page.entries.iter().any(|e| e.is_latest == Some(true)));
     }
 
@@ -640,8 +652,18 @@ mod tests {
         }
         // The required + secret env vars are surfaced for the auth flow; the
         // secret one is flagged, and no secret value is ever preset.
-        assert!(stdio.auth.iter().any(|f| f.name == "GCS_BUCKET" && f.required));
-        assert!(stdio.auth.iter().any(|f| f.name == "GCS_PRIVATE_KEY" && f.secret));
+        assert!(
+            stdio
+                .auth
+                .iter()
+                .any(|f| f.name == "GCS_BUCKET" && f.required)
+        );
+        assert!(
+            stdio
+                .auth
+                .iter()
+                .any(|f| f.name == "GCS_PRIVATE_KEY" && f.secret)
+        );
     }
 
     #[test]
@@ -677,7 +699,10 @@ mod tests {
 
     #[test]
     fn sanitize_alias_strips_path_and_reserved_separator() {
-        assert_eq!(sanitize_alias("com.pulsemcp/remote-filesystem"), "remote-filesystem");
+        assert_eq!(
+            sanitize_alias("com.pulsemcp/remote-filesystem"),
+            "remote-filesystem"
+        );
         assert_eq!(sanitize_alias("ai.smithery/A__B"), "A_B");
         assert_eq!(sanitize_alias("weird//name!!"), "name");
         // Never empty, never contains `__`.

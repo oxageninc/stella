@@ -35,7 +35,11 @@ pub struct McpUsageRecord {
 
 impl McpUsageRecord {
     /// Build a record, stamping the call time from the system clock.
-    pub fn now(server: impl Into<String>, tool: impl Into<String>, reason: impl Into<String>) -> Self {
+    pub fn now(
+        server: impl Into<String>,
+        tool: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Self {
         Self {
             server: server.into(),
             tool: tool.into(),

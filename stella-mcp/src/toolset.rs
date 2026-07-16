@@ -266,10 +266,7 @@ impl McpToolSet {
                         .and_then(Value::as_str)
                         .unwrap_or_default()
                         .to_string();
-                    push_usage(
-                        ledger,
-                        McpUsageRecord::now(client.name(), raw_tool, reason),
-                    );
+                    push_usage(ledger, McpUsageRecord::now(client.name(), raw_tool, reason));
                 }
                 output
             }
@@ -555,7 +552,10 @@ mod tests {
         let set = McpToolSet::from_clients(vec![client]).with_usage_ledger(ledger.clone());
 
         let out = set
-            .execute("mcp__files__read", &serde_json::json!({ "reason": "inspect config" }))
+            .execute(
+                "mcp__files__read",
+                &serde_json::json!({ "reason": "inspect config" }),
+            )
             .await;
         assert!(!out.is_error());
 
@@ -571,12 +571,8 @@ mod tests {
     async fn disabled_server_is_hidden_from_schemas_and_errors_on_execute() {
         let client = connected_client("files", "read").await;
         let disabled: DisabledServers = Arc::new(Mutex::new(HashSet::new()));
-        disabled
-            .lock()
-            .unwrap()
-            .insert("files".to_string());
-        let set =
-            McpToolSet::from_clients(vec![client]).with_disabled_servers(disabled.clone());
+        disabled.lock().unwrap().insert("files".to_string());
+        let set = McpToolSet::from_clients(vec![client]).with_disabled_servers(disabled.clone());
 
         // Hidden from the advertised schema while disabled.
         assert!(

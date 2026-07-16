@@ -27,7 +27,10 @@ async fn search_sends_search_limit_and_cursor_query_params_and_parses_the_page()
         .expect("the mock matches only when all three params are sent");
 
     assert!(!page.entries.is_empty(), "recorded page has entries");
-    assert!(page.next_cursor.is_some(), "recorded page has a next cursor");
+    assert!(
+        page.next_cursor.is_some(),
+        "recorded page has a next cursor"
+    );
 }
 
 #[tokio::test]

@@ -299,6 +299,32 @@ mod tests {
     }
 
     #[test]
+    fn mcp_registry_url_defaults_and_takes_the_last_scope() {
+        // Unset → the official default.
+        let empty = Settings::default();
+        assert_eq!(empty.mcp_registry_url(), stella_mcp::DEFAULT_REGISTRY_URL);
+
+        let dir = tempfile::tempdir().unwrap();
+        let user = write(
+            dir.path(),
+            "user.json",
+            r#"{"mcp": {"registry_url": "https://user.registry/"}}"#,
+        );
+        let project = write(
+            dir.path(),
+            "project.json",
+            r#"{"mcp": {"registry_url": "https://project.registry/"}}"#,
+        );
+        // Last scope wins.
+        let merged = Settings::load_from(&[user.clone(), project]).unwrap();
+        assert_eq!(merged.mcp_registry_url(), "https://project.registry/");
+        // A scope that doesn't speak `mcp` leaves the earlier value intact.
+        let bare = write(dir.path(), "bare.json", r#"{"providers": {}}"#);
+        let merged = Settings::load_from(&[user, bare]).unwrap();
+        assert_eq!(merged.mcp_registry_url(), "https://user.registry/");
+    }
+
+    #[test]
     fn hooks_concatenate_across_scopes_instead_of_replacing() {
         let dir = tempfile::tempdir().unwrap();
         let user = write(

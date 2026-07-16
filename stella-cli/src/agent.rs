@@ -288,7 +288,13 @@ async fn run_pipeline_one_shot(
         Arc::new(ToolRegistry::new_detected(cfg.workspace_root.clone()).await);
     populate_schema_index(&registry, &cfg.workspace_root);
     crate::rules::enforce_workspace_rules(&registry, &cfg.workspace_root);
-    let mcp = connect_mcp(cfg, registry.clone(), Some(registry.mcp_usage_ledger()), format == OutputFormat::Text).await;
+    let mcp = connect_mcp(
+        cfg,
+        registry.clone(),
+        Some(registry.mcp_usage_ledger()),
+        format == OutputFormat::Text,
+    )
+    .await;
     let base_tools: &dyn ToolExecutor = match &mcp {
         Some(set) => set,
         None => &*registry,
@@ -737,7 +743,13 @@ async fn run_raw_one_shot(
         std::sync::Arc::new(ToolRegistry::new_detected(cfg.workspace_root.clone()).await);
     populate_schema_index(&registry, &cfg.workspace_root);
     crate::rules::enforce_workspace_rules(&registry, &cfg.workspace_root);
-    let mcp = connect_mcp(cfg, registry.clone(), Some(registry.mcp_usage_ledger()), format == OutputFormat::Text).await;
+    let mcp = connect_mcp(
+        cfg,
+        registry.clone(),
+        Some(registry.mcp_usage_ledger()),
+        format == OutputFormat::Text,
+    )
+    .await;
     let base_tools: &dyn ToolExecutor = match &mcp {
         Some(set) => set,
         None => &*registry,
@@ -833,7 +845,13 @@ pub async fn run_goal_cmd(
         std::sync::Arc::new(ToolRegistry::new_detected(cfg.workspace_root.clone()).await);
     populate_schema_index(&registry, &cfg.workspace_root);
     crate::rules::enforce_workspace_rules(&registry, &cfg.workspace_root);
-    let mcp = connect_mcp(cfg, registry.clone(), Some(registry.mcp_usage_ledger()), true).await;
+    let mcp = connect_mcp(
+        cfg,
+        registry.clone(),
+        Some(registry.mcp_usage_ledger()),
+        true,
+    )
+    .await;
     let base_tools: &dyn ToolExecutor = match &mcp {
         Some(set) => set,
         None => &*registry,
@@ -909,7 +927,13 @@ pub async fn run_interactive(cfg: &Config, budget_limit: Option<f64>) -> Result<
     let provider = build_provider(cfg)?;
     let registry: std::sync::Arc<ToolRegistry> =
         std::sync::Arc::new(ToolRegistry::new_detected(cfg.workspace_root.clone()).await);
-    let mcp = connect_mcp(cfg, registry.clone(), Some(registry.mcp_usage_ledger()), true).await;
+    let mcp = connect_mcp(
+        cfg,
+        registry.clone(),
+        Some(registry.mcp_usage_ledger()),
+        true,
+    )
+    .await;
     populate_schema_index(&registry, &cfg.workspace_root);
     crate::rules::enforce_workspace_rules(&registry, &cfg.workspace_root);
     let base_tools: &dyn ToolExecutor = match &mcp {

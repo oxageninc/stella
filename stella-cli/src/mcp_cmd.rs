@@ -24,9 +24,8 @@ pub fn mcp_toml_path(workspace_root: &Path) -> PathBuf {
 pub fn load_config(workspace_root: &Path) -> Result<McpConfig, String> {
     let path = mcp_toml_path(workspace_root);
     match std::fs::read_to_string(&path) {
-        Ok(text) => {
-            McpConfig::from_toml_str(&text).map_err(|e| format!("{} is invalid: {e}", path.display()))
-        }
+        Ok(text) => McpConfig::from_toml_str(&text)
+            .map_err(|e| format!("{} is invalid: {e}", path.display())),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(McpConfig::default()),
         Err(e) => Err(format!("cannot read {}: {e}", path.display())),
     }
@@ -151,7 +150,9 @@ pub async fn resolve_install(
         .entries
         .into_iter()
         .find(|e| e.server.name == name)
-        .ok_or_else(|| format!("no registry server named `{name}` — try `stella mcp search {name}`"))?;
+        .ok_or_else(|| {
+            format!("no registry server named `{name}` — try `stella mcp search {name}`")
+        })?;
     let alias = entry.server.default_alias();
     let mut options = entry.server.install_options();
     if options.is_empty() {
@@ -177,9 +178,7 @@ pub fn run(cmd: &crate::McpCmd) -> Result<(), String> {
             &query.join(" "),
             limit.unwrap_or(stella_mcp::registry::DEFAULT_PAGE_LIMIT),
         ),
-        crate::McpCmd::Install { name, alias } => {
-            run_install(&workspace_root, name, alias.clone())
-        }
+        crate::McpCmd::Install { name, alias } => run_install(&workspace_root, name, alias.clone()),
         crate::McpCmd::Remove { name } => run_remove(&workspace_root, name),
         crate::McpCmd::Usage => run_usage(&workspace_root),
     }
@@ -219,7 +218,8 @@ fn run_list(workspace_root: &Path) -> Result<(), String> {
     }
     println!(
         "\n  {}",
-        "enable/disable is per-session — toggle servers live in the deck's MCP tab (/mcp).".dimmed()
+        "enable/disable is per-session — toggle servers live in the deck's MCP tab (/mcp)."
+            .dimmed()
     );
     Ok(())
 }
@@ -233,7 +233,14 @@ fn run_search(workspace_root: &Path, query: &str, limit: u32) -> Result<(), Stri
         println!("  {}", "no matching servers".dimmed());
         return Ok(());
     }
-    for entry in &page.entries {
+    // The registry returns one row per published version; collapse to one row
+    // per server name (MCP servers are not versioned in stella's config).
+    let mut seen = std::collections::HashSet::new();
+    for entry in page
+        .entries
+        .iter()
+        .filter(|e| seen.insert(e.server.name.clone()))
+    {
         let server = &entry.server;
         let kinds = install_kinds(server);
         println!(
@@ -249,10 +256,7 @@ fn run_search(workspace_root: &Path, query: &str, limit: u32) -> Result<(), Stri
     if page.next_cursor.is_some() {
         println!("\n  {}", "more results available (pagination)".dimmed());
     }
-    println!(
-        "\n  {}",
-        "install with: stella mcp install <name>".dimmed()
-    );
+    println!("\n  {}", "install with: stella mcp install <name>".dimmed());
     Ok(())
 }
 
@@ -310,7 +314,9 @@ fn run_usage(workspace_root: &Path) -> Result<(), String> {
         let reason = if stat.last_reason.is_empty() {
             String::new()
         } else {
-            format!("· {}", truncate(&stat.last_reason, 60)).dimmed().to_string()
+            format!("· {}", truncate(&stat.last_reason, 60))
+                .dimmed()
+                .to_string()
         };
         println!(
             "  {} {} {} {} {}",
@@ -325,7 +331,7 @@ fn run_usage(workspace_root: &Path) -> Result<(), String> {
 }
 
 /// A compact "npm, remote, …" list of a server's install kinds, for search.
-fn install_kinds(server: &stella_mcp::RegistryServer) -> String {
+pub(crate) fn install_kinds(server: &stella_mcp::RegistryServer) -> String {
     let mut kinds: Vec<String> = Vec::new();
     if !server.remotes.is_empty() {
         kinds.push("remote".to_string());

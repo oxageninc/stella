@@ -303,7 +303,10 @@ mod tests {
             env,
         };
         let shown = format!("{stdio:?}");
-        assert!(!shown.contains("super-secret-token"), "value leaked: {shown}");
+        assert!(
+            !shown.contains("super-secret-token"),
+            "value leaked: {shown}"
+        );
         assert!(shown.contains("API_KEY"), "key should be visible: {shown}");
         assert!(shown.contains("<redacted>"));
         // Non-secret command line stays visible for debugging.
