@@ -34,7 +34,12 @@
 //!   truncates the partial turn out of the conversation so the next prompt
 //!   starts from the last committed state. Never a mid-await corruption — the
 //!   dropped future takes its channel senders with it and the forwarder
-//!   drains what was already emitted.
+//!   drains what was already emitted. After a plain cancel the loop pops the
+//!   next queued prompt as usual ("interrupt current, run next" — the deck's
+//!   single Esc). A double-Esc `StopAndHold` is the same clean cancel plus
+//!   queue discipline: the interrupted prompt returns to the FRONT of the
+//!   backlog and dispatch parks until the user's next submission, which
+//!   arrives as `EnqueueFront` and runs ahead of it.
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -103,8 +108,12 @@ fn debug_log_path() -> Option<PathBuf> {
 enum TurnEnd {
     /// The turn future resolved (completed or aborted-with-reason).
     Finished(Result<(), String>),
-    /// The user stopped it mid-flight; the future was dropped.
-    Cancelled,
+    /// The user stopped it mid-flight; the future was dropped. `hold` is the
+    /// double-Esc variant: the interrupted prompt goes back to the FRONT of
+    /// the backlog and dispatch parks until the user's next submission
+    /// (which runs ahead of it). A plain cancel (`hold: false`) lets the
+    /// loop auto-dispatch the next queued prompt as usual.
+    Cancelled { hold: bool },
     /// The deck is going down; stop driving entirely.
     Quit,
 }
@@ -237,20 +246,50 @@ pub async fn run_deck_session(cfg: &Config, budget_limit: Option<f64>) -> Result
 
     // ── The driver loop ─────────────────────────────────────────────────────
     let mut queue: VecDeque<String> = VecDeque::new();
+    // Double-Esc hold: while set, the backlog stays parked and the loop
+    // waits for the user's next submission instead of popping the queue.
+    let mut held = false;
     'session: loop {
-        // Take the next prompt: backlog first, else wait for deck input.
-        let prompt = match queue.pop_front() {
+        // Take the next prompt: backlog first (unless held), else wait for
+        // deck input.
+        let next = if held { None } else { queue.pop_front() };
+        let prompt = match next {
             Some(text) => text,
             None => match sub_rx.recv().await {
                 None => break 'session,
                 Some(WorkspaceInput::Quit) => break 'session,
-                Some(WorkspaceInput::Enqueue { text }) => text,
-                Some(WorkspaceInput::ToAgent {
+                // Any submission releases a hold and runs NOW — ahead of the
+                // parked backlog. `EnqueueFront` is the deck's explicit
+                // front-insert (sent while it knows dispatch is held); a
+                // plain `Enqueue` behaves identically here because running
+                // the text immediately IS the front of the queue.
+                Some(WorkspaceInput::Enqueue { text })
+                | Some(WorkspaceInput::EnqueueFront { text })
+                | Some(WorkspaceInput::ToAgent {
                     input: UserInput::Prompt { text },
                     ..
-                }) => text,
+                }) => {
+                    held = false;
+                    text
+                }
+                // While a hold parks a non-empty backlog at this recv, the
+                // user can still edit it from the queue popup — mirror the
+                // edits exactly like the in-turn arm does. (Before holds
+                // existed the queue was always empty by the time this recv
+                // ran, so these inputs had nothing to act on here.)
+                Some(WorkspaceInput::QueueRemove { index }) => {
+                    if index < queue.len() {
+                        queue.remove(index);
+                    }
+                    continue 'session;
+                }
+                Some(WorkspaceInput::QueueClear) => {
+                    queue.clear();
+                    continue 'session;
+                }
                 // A stray answer/decision/control with no turn in flight has
-                // nothing to act on.
+                // nothing to act on (StopAndHold included: with no turn
+                // there is nothing to cancel or return to the queue).
                 Some(_) => continue 'session,
             },
         };
@@ -259,6 +298,10 @@ pub async fn run_deck_session(cfg: &Config, budget_limit: Option<f64>) -> Result
             agent: LEAD.to_string(),
             text: prompt.clone(),
         });
+        // What the user actually submitted — a hold-cancel returns THIS to
+        // the queue, not the expansion a custom command may rewrite `prompt`
+        // into below (re-dispatching it re-expands).
+        let submitted = prompt.clone();
 
         // Session-level slash commands are the driver's, never the model's —
         // the deck's popup enqueues them like any prompt (tab switches and
@@ -361,6 +404,10 @@ pub async fn run_deck_session(cfg: &Config, budget_limit: Option<f64>) -> Result
                         | Some(WorkspaceInput::ToAgent {
                             input: UserInput::Prompt { text }, ..
                         }) => queue.push_back(text),
+                        // An explicit front-insert stays a front-insert even
+                        // if a turn started before it arrived — the deck's
+                        // queue view already shows it first.
+                        Some(WorkspaceInput::EnqueueFront { text }) => queue.push_front(text),
                         // The deck's queue editor mutates its own view of the
                         // backlog and mirrors each edit here so the dispatch
                         // queue never drifts from what the user is looking at.
@@ -378,7 +425,13 @@ pub async fn run_deck_session(cfg: &Config, budget_limit: Option<f64>) -> Result
                         Some(WorkspaceInput::ToAgent { input: UserInput::Cancel, .. })
                         | Some(WorkspaceInput::Control {
                             control: stella_tui::AgentControl::Stop, ..
-                        }) => break TurnEnd::Cancelled,
+                        }) => break TurnEnd::Cancelled { hold: false },
+                        // Double-Esc: cancel AND park dispatch — the
+                        // interrupted prompt returns to the front of the
+                        // backlog and the user's next submission runs first.
+                        Some(WorkspaceInput::StopAndHold { .. }) => {
+                            break TurnEnd::Cancelled { hold: true }
+                        }
                         // Scope review is not engine-driven yet, and deep
                         // pause/resume/restart need the fleet supervisor —
                         // both named seams, both no-ops here.
@@ -422,10 +475,22 @@ pub async fn run_deck_session(cfg: &Config, budget_limit: Option<f64>) -> Result
                     m.reflect_and_record(&*provider, &messages, true).await;
                 }
             }
-            TurnEnd::Cancelled => {
+            TurnEnd::Cancelled { hold } => {
                 // Erase the partial turn: the next prompt continues from the
                 // last committed conversation state.
                 messages.truncate(turn_base);
+                if hold {
+                    // Double-Esc: the interrupted prompt returns to the FRONT
+                    // of the backlog and dispatch parks until the user's next
+                    // submission, which will run ahead of it. PromptRequeued
+                    // mirrors the front-insert into the deck's queue view.
+                    held = true;
+                    queue.push_front(submitted.clone());
+                    let _ = in_tx.send(Inbound::PromptRequeued {
+                        agent: LEAD.to_string(),
+                        text: submitted.clone(),
+                    });
+                }
                 if let Some((store, id)) = &execution
                     && store.finish_execution(*id, "cancelled", 0.0).is_err()
                 {

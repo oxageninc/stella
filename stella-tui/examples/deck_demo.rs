@@ -58,7 +58,10 @@ async fn main() -> std::io::Result<()> {
         let mut n = 0u32;
         while let Some(input) = sub_rx.recv().await {
             match input {
-                WorkspaceInput::Enqueue { text } => {
+                // The demo has no real dispatch queue, so a front-insert
+                // (the first submission after a double-Esc hold) starts a
+                // scripted run just like a plain enqueue.
+                WorkspaceInput::Enqueue { text } | WorkspaceInput::EnqueueFront { text } => {
                     n += 1;
                     let id = format!("you:{n}");
                     let _ = react_tx.send(Inbound::Register(
@@ -76,6 +79,14 @@ async fn main() -> std::io::Result<()> {
                         AgentControl::Stop => AgentStatus::Killed,
                     };
                     let _ = react_tx.send(Inbound::Status { agent, status });
+                }
+                // Double-Esc: with no real backlog to requeue, the demo just
+                // stops the agent — the same terminal status as Stop.
+                WorkspaceInput::StopAndHold { agent } => {
+                    let _ = react_tx.send(Inbound::Status {
+                        agent,
+                        status: AgentStatus::Killed,
+                    });
                 }
                 // Gate answers (scope decisions, ask-user replies) loop back
                 // as the inbound events a real engine would emit, so the

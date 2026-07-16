@@ -28,11 +28,17 @@ use crate::composer::{
     handle_slash_popup_key, slash_popup_matches,
 };
 use crate::deck::{DeckTab, WorkspaceModel};
-use crate::envelope::{AgentControl, AgentId, Inbound, WorkspaceInput};
+use crate::envelope::{AgentControl, AgentId, AgentStatus, Inbound, WorkspaceInput};
 use crate::graph::GraphSnapshot;
 use crate::input::{ScopeDecision, UserInput};
 use crate::scroll::ScrollState;
 use crate::splash::SplashState;
+
+/// How long a turn-stopping Esc stays armed for the double-Esc escalation: a
+/// second Esc inside this window (with no other key in between) is "full
+/// stop" — cancel, requeue at the front, hold dispatch for the user's next
+/// prompt. Outside it, an Esc is just another single stop.
+pub const ESC_DOUBLE_WINDOW: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Viewport sizes recorded by the last render, so the pure key handler can do
 /// line-exact scroll clamping without knowing the terminal size.
@@ -111,6 +117,16 @@ pub struct DeckUi {
     /// consecutive `ctrl+o` escalates to the all-thinking toggle. Any other
     /// key disarms.
     pub ctrl_o_primed: bool,
+    /// When a turn-stopping Esc armed the double-Esc escalation. A second
+    /// Esc inside [`ESC_DOUBLE_WINDOW`] with no other key in between sends
+    /// [`WorkspaceInput::StopAndHold`]; any other key — or an Esc claimed by
+    /// a modal context (popup, editor, gate) — disarms.
+    pub esc_armed_at: Option<std::time::Instant>,
+    /// Set by a double-Esc: dispatch is held driver-side until the next
+    /// submission, which goes out as [`WorkspaceInput::EnqueueFront`] so it
+    /// runs before the prompt the hold returned to the queue. Cleared the
+    /// moment that submission is sent.
+    pub dispatch_held: bool,
     /// The Session tab's incremental transcript fold cache.
     pub session_fold: crate::views::session::SessionFold,
 }
@@ -146,6 +162,8 @@ impl Default for DeckUi {
             expanded_rev: 0,
             evicted_seen: std::collections::HashMap::new(),
             ctrl_o_primed: false,
+            esc_armed_at: None,
+            dispatch_held: false,
             session_fold: crate::views::session::SessionFold::default(),
         }
     }
@@ -261,6 +279,33 @@ fn clamp(model: &WorkspaceModel, ui: &mut DeckUi) {
 }
 
 /// Map one key to a [`DeckAction`]. Pure over `(key, model)`, mutating `ui`.
+///
+/// ## Esc precedence
+///
+/// Esc already carries several meanings; the FIRST matching context wins,
+/// top to bottom (each rule is claimed at the corresponding point in this
+/// function's flow):
+///
+/// 1. splash up — any key, Esc included, dismisses it
+/// 2. help overlay open — any key closes it
+/// 3. queue editor open — Esc closes the editor
+/// 4. slash popup active — Esc dismisses the popup (clears the composer)
+/// 5. scope-review gate pending, composer empty — Esc aborts the plan
+/// 6. Files tab with the diff open — Esc closes the diff
+/// 7. Session tab with a message highlighted — Esc clears the highlight
+/// 8. armed by a turn-stopping Esc within [`ESC_DOUBLE_WINDOW`], no other
+///    key in between — Esc escalates to [`WorkspaceInput::StopAndHold`]
+///    (cancel, requeue the interrupted prompt at the front, hold dispatch
+///    for the user's next submission)
+/// 9. focused agent [`AgentStatus::Running`] — Esc stops the in-flight turn
+///    ([`AgentControl::Stop`]; the driver truncates the partial turn and
+///    auto-dispatches the next queued prompt)
+/// 10. otherwise Esc is ignored
+///
+/// The composer's content never gates rules 8–9: the cursor always lives in
+/// the global composer, so a stop must leave a typed draft untouched. A
+/// pending ask-user gate never reaches them either — it folds the agent to
+/// [`AgentStatus::WaitingInput`], which fails rule 9's `Running` check.
 pub fn handle_deck_key(key: KeyEvent, model: &WorkspaceModel, ui: &mut DeckUi) -> DeckAction {
     if key.kind == KeyEventKind::Release {
         return DeckAction::Ignored;
@@ -271,6 +316,14 @@ pub fn handle_deck_key(key: KeyEvent, model: &WorkspaceModel, ui: &mut DeckUi) -
     if !is_ctrl_o {
         ui.ctrl_o_primed = false;
     }
+
+    // The double-Esc pair: EVERY key consumes the armed state up front; only
+    // the unclaimed turn-stopping Esc at the tail re-arms, and only an
+    // unclaimed second Esc escalates. An Esc claimed by any modal context
+    // (popup dismiss, editor close, gate abort, …) therefore breaks the pair
+    // exactly like a non-Esc key would.
+    let is_esc = matches!(key.code, KeyCode::Esc);
+    let esc_armed = ui.esc_armed_at.take();
 
     // Ctrl-C: clean cancel + quit, from anywhere.
     if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
@@ -390,34 +443,64 @@ pub fn handle_deck_key(key: KeyEvent, model: &WorkspaceModel, ui: &mut DeckUi) -
         return action;
     }
 
-    // Textarea editing beats per-tab navigation once the composer has
-    // content: Enter breaks the line / the chord submits, and cursor motion
-    // moves through the prompt instead of scrolling the active tab. A blank
-    // composer leaves all of these to the tabs (handle_edit_key gates its
-    // motion on the buffer internally).
-    if !ui.composer.is_blank() {
-        match classify_enter(&key, ui.enter_submits) {
-            EnterAction::Submit => return dispatch_submission(ui),
-            EnterAction::Newline => {
-                ui.composer.insert_newline();
-                return DeckAction::Handled;
-            }
-            EnterAction::NotEnter => {}
-        }
-    }
-    if handle_edit_key(key, &mut ui.composer) {
-        return DeckAction::Handled;
-    }
-
-    // Per-tab navigation for non-typing keys, then composer editing.
-    match ui.tab {
+    // Per-tab navigation for non-typing keys…
+    if let Some(action) = match ui.tab {
         DeckTab::Agents => handle_agents_key(key, model, ui, composer_empty),
         DeckTab::Traces => handle_traces_key(key, model, ui, composer_empty),
         DeckTab::Graph => handle_graph_key(key, ui, composer_empty),
         DeckTab::Files => handle_files_key(key, model, ui, composer_empty),
         DeckTab::Session => handle_session_key(key, model, ui),
+    } {
+        return action;
     }
-    .unwrap_or_else(|| handle_composer_key(key, ui))
+
+    // …then the turn-interrupt Esc (rules 8–9 of the precedence list): it
+    // fires only once every other Esc context has declined the key. The
+    // composer never claims Esc, so a typed draft survives both forms.
+    if is_esc {
+        if esc_armed.is_some_and(|at| at.elapsed() <= ESC_DOUBLE_WINDOW) {
+            // Second consecutive Esc inside the window: full stop — cancel,
+            // requeue the interrupted prompt at the front, hold dispatch for
+            // the user's next submission. Deliberately NOT gated on
+            // `Running`: the first Esc's cancel may already have folded
+            // (status `Failed`) while the auto-dispatched next prompt has
+            // produced no event yet, and that gap is exactly when the second
+            // press lands. The driver no-ops if nothing is in flight.
+            if let Some(agent) = focused_id(model, ui) {
+                ui.dispatch_held = true;
+                return DeckAction::Send(WorkspaceInput::StopAndHold { agent });
+            }
+        } else if let Some(entry) = model.agents.get(ui.focused)
+            && entry.status == AgentStatus::Running
+        {
+            // First Esc: cancel the in-flight turn. The driver truncates the
+            // partial turn out of the conversation and auto-dispatches the
+            // next queued prompt — "interrupt current, run next".
+            ui.esc_armed_at = Some(std::time::Instant::now());
+            return DeckAction::Send(WorkspaceInput::Control {
+                agent: entry.meta.id.clone(),
+                control: AgentControl::Stop,
+            });
+        }
+    }
+
+    handle_composer_key(key, ui)
+}
+
+/// Route one submitted prompt. The first submission after a double-Esc hold
+/// goes to the FRONT of the queue (and is what releases the hold) so it runs
+/// before the returned prompt; everything else appends. This is an explicit
+/// [`WorkspaceInput::EnqueueFront`] rather than a driver-side "held"
+/// reinterpretation of a plain Enqueue: the deck mirrors every queue edit
+/// locally at send time, and a message whose meaning depended on driver
+/// state the deck cannot see would let the two queue views drift.
+fn submit_prompt(ui: &mut DeckUi, text: String) -> DeckAction {
+    if ui.dispatch_held {
+        ui.dispatch_held = false;
+        DeckAction::Send(WorkspaceInput::EnqueueFront { text })
+    } else {
+        DeckAction::Send(WorkspaceInput::Enqueue { text })
+    }
 }
 
 /// The names of the slash commands matching the composer, or empty when the
@@ -455,7 +538,7 @@ fn handle_slash_key(key: KeyEvent, matches: &[String], ui: &mut DeckUi) -> Optio
             // Everything else — including `/help` — is enqueued for the
             // driver, which owns the session vocabulary and answers into the
             // transcript (a transient overlay would leave no record).
-            _ => DeckAction::Send(WorkspaceInput::Enqueue { text }),
+            _ => submit_prompt(ui, text),
         }),
     }
 }
@@ -859,6 +942,31 @@ fn handle_composer_key(key: KeyEvent, ui: &mut DeckUi) -> DeckAction {
         EnterAction::NotEnter => {}
     }
     match key.code {
+        KeyCode::Enter => match ui.composer.take_submission() {
+            // A `!`-prefixed line is a shell command: it executes IMMEDIATELY,
+            // bypassing the prompt queue and any busy agent entirely.
+            Some(text) if text.trim_start().starts_with('!') => {
+                // Strip only the single leading `!` dispatch marker — not
+                // every leading `!` — so a command whose own text starts
+                // with `!` (e.g. `!!foo`, meant as the shell command `!foo`)
+                // is not rewritten into something else.
+                let leading = text.trim_start();
+                let cmd = leading
+                    .strip_prefix('!')
+                    .unwrap_or(leading)
+                    .trim()
+                    .to_string();
+                if cmd.is_empty() {
+                    DeckAction::Ignored
+                } else {
+                    DeckAction::Shell(cmd)
+                }
+            }
+            // Any other prompt ALWAYS enqueues — never blocks on a busy
+            // agent. After a double-Esc hold it enqueues at the FRONT.
+            Some(text) => submit_prompt(ui, text),
+            None => DeckAction::Ignored,
+        },
         KeyCode::Backspace => {
             ui.composer.backspace();
             ui.slash_selected = 0;
@@ -1266,6 +1374,280 @@ mod tests {
         assert_eq!(
             handle_deck_key(ctrl('c'), &model, &mut ui),
             DeckAction::Quit
+        );
+    }
+
+    /// A one-agent model whose lead is mid-turn (`Running`).
+    fn running_model() -> WorkspaceModel {
+        let mut m = model_with(&["lead"]);
+        m.apply_inbound(&Inbound::Event {
+            agent: "lead".into(),
+            event: AgentEvent::Text {
+                delta: "working".into(),
+            },
+        });
+        m
+    }
+
+    /// The single-Esc outcome: a clean stop for the lead's in-flight turn.
+    fn stop_lead() -> DeckAction {
+        DeckAction::Send(WorkspaceInput::Control {
+            agent: "lead".into(),
+            control: AgentControl::Stop,
+        })
+    }
+
+    #[test]
+    fn esc_stops_a_running_turn_and_arms_the_double_press() {
+        let model = running_model();
+        let mut ui = ready_ui();
+        assert_eq!(
+            handle_deck_key(key(KeyCode::Esc), &model, &mut ui),
+            stop_lead()
+        );
+        assert!(
+            ui.esc_armed_at.is_some(),
+            "the stop arms the double-Esc window"
+        );
+    }
+
+    #[test]
+    fn esc_with_no_turn_running_stays_inert() {
+        let model = model_with(&["lead"]); // Queued — nothing in flight
+        let mut ui = ready_ui();
+        assert_eq!(
+            handle_deck_key(key(KeyCode::Esc), &model, &mut ui),
+            DeckAction::Ignored,
+            "an idle Esc must not send a stray stop"
+        );
+        assert!(ui.esc_armed_at.is_none());
+    }
+
+    #[test]
+    fn a_typed_draft_survives_both_esc_forms() {
+        let model = running_model();
+        let mut ui = ready_ui();
+        for c in "keep me".chars() {
+            handle_deck_key(ch(c), &model, &mut ui);
+        }
+        // The cursor lives in the global composer, so the stop fires even
+        // mid-draft — and must leave the draft untouched.
+        assert_eq!(
+            handle_deck_key(key(KeyCode::Esc), &model, &mut ui),
+            stop_lead()
+        );
+        assert_eq!(ui.composer.buffer(), "keep me");
+        assert_eq!(
+            handle_deck_key(key(KeyCode::Esc), &model, &mut ui),
+            DeckAction::Send(WorkspaceInput::StopAndHold {
+                agent: "lead".into()
+            })
+        );
+        assert_eq!(
+            ui.composer.buffer(),
+            "keep me",
+            "neither cancel form clears what the user typed"
+        );
+    }
+
+    #[test]
+    fn double_esc_inside_the_window_escalates_to_stop_and_hold() {
+        let model = running_model();
+        let mut ui = ready_ui();
+        assert_eq!(
+            handle_deck_key(key(KeyCode::Esc), &model, &mut ui),
+            stop_lead()
+        );
+        assert_eq!(
+            handle_deck_key(key(KeyCode::Esc), &model, &mut ui),
+            DeckAction::Send(WorkspaceInput::StopAndHold {
+                agent: "lead".into()
+            })
+        );
+        assert!(
+            ui.dispatch_held,
+            "the deck now front-inserts its next submission"
+        );
+        assert!(
+            ui.esc_armed_at.is_none(),
+            "the pair resets after escalating"
+        );
+    }
+
+    #[test]
+    fn the_second_esc_fires_even_if_the_cancel_already_folded() {
+        // Between the two presses the first cancel's error event may fold
+        // (status `Failed`) before the auto-dispatched next prompt produces
+        // any event — the escalation must not be lost to that gap.
+        let mut model = running_model();
+        let mut ui = ready_ui();
+        assert_eq!(
+            handle_deck_key(key(KeyCode::Esc), &model, &mut ui),
+            stop_lead()
+        );
+        model.apply_inbound(&Inbound::Event {
+            agent: "lead".into(),
+            event: AgentEvent::Error {
+                message: "turn stopped by user".into(),
+                retryable: false,
+            },
+        });
+        assert_eq!(
+            handle_deck_key(key(KeyCode::Esc), &model, &mut ui),
+            DeckAction::Send(WorkspaceInput::StopAndHold {
+                agent: "lead".into()
+            })
+        );
+    }
+
+    #[test]
+    fn an_intervening_key_breaks_the_double_esc_pair() {
+        let model = running_model();
+        let mut ui = ready_ui();
+        handle_deck_key(key(KeyCode::Esc), &model, &mut ui);
+        handle_deck_key(ch('x'), &model, &mut ui); // types into the composer
+        assert!(ui.esc_armed_at.is_none(), "any other key disarms");
+        assert_eq!(
+            handle_deck_key(key(KeyCode::Esc), &model, &mut ui),
+            stop_lead(),
+            "the next Esc is a fresh single stop, not an escalation"
+        );
+    }
+
+    #[test]
+    fn a_stale_arm_outside_the_window_does_not_escalate() {
+        let model = running_model();
+        let mut ui = ready_ui();
+        // Backdate the arm past the window. (If the monotonic clock is too
+        // young to backdate, `checked_sub` leaves it unarmed — which expects
+        // the same single-stop outcome.)
+        ui.esc_armed_at = std::time::Instant::now()
+            .checked_sub(ESC_DOUBLE_WINDOW + std::time::Duration::from_secs(1));
+        assert_eq!(
+            handle_deck_key(key(KeyCode::Esc), &model, &mut ui),
+            stop_lead(),
+            "past the window, Esc is a single stop again"
+        );
+    }
+
+    #[test]
+    fn esc_dismisses_the_slash_popup_instead_of_stopping_the_turn() {
+        let model = running_model();
+        let mut ui = ready_ui();
+        ui.slash_commands = vec![SlashCommand::new("/help", "help")];
+        handle_deck_key(ch('/'), &model, &mut ui);
+        assert_eq!(
+            handle_deck_key(key(KeyCode::Esc), &model, &mut ui),
+            DeckAction::Handled,
+            "rule 4: the popup claims Esc — no stop is sent"
+        );
+        assert!(ui.esc_armed_at.is_none(), "a claimed Esc never arms");
+    }
+
+    #[test]
+    fn an_esc_claimed_by_the_queue_editor_breaks_the_pair_too() {
+        let mut model = model_with_queue(&["one"]);
+        model.apply_inbound(&Inbound::Event {
+            agent: "lead".into(),
+            event: AgentEvent::Text { delta: "hi".into() },
+        });
+        let mut ui = ready_ui();
+        ui.queue_open = true;
+        ui.esc_armed_at = Some(std::time::Instant::now());
+        assert_eq!(
+            handle_deck_key(key(KeyCode::Esc), &model, &mut ui),
+            DeckAction::Handled,
+            "rule 3: the queue editor claims Esc — no stop is sent"
+        );
+        assert!(!ui.queue_open, "…it closed the editor");
+        assert!(ui.esc_armed_at.is_none(), "…and broke the double-Esc pair");
+    }
+
+    #[test]
+    fn esc_still_aborts_a_pending_scope_review() {
+        let mut model = model_with(&["lead"]);
+        model.apply_inbound(&Inbound::Event {
+            agent: "lead".into(),
+            event: AgentEvent::ScopeReview {
+                proposal: stella_protocol::ScopeProposal {
+                    summary: "big".into(),
+                    steps: vec![],
+                    estimated_files: 3,
+                    estimated_cost_usd: None,
+                },
+            },
+        });
+        let mut ui = ready_ui();
+        assert_eq!(
+            handle_deck_key(key(KeyCode::Esc), &model, &mut ui),
+            DeckAction::Send(WorkspaceInput::ToAgent {
+                agent: "lead".into(),
+                input: UserInput::ScopeDecision(ScopeDecision::Abort),
+            }),
+            "rule 5: the gate claims Esc — never a turn stop"
+        );
+    }
+
+    #[test]
+    fn esc_closes_an_open_diff_before_it_stops_the_turn() {
+        let model = running_model();
+        let mut ui = ready_ui();
+        ui.tab = DeckTab::Files;
+        ui.files_diff_open = true;
+        assert_eq!(
+            handle_deck_key(key(KeyCode::Esc), &model, &mut ui),
+            DeckAction::Handled,
+            "rule 6: the diff overlay claims Esc"
+        );
+        assert!(!ui.files_diff_open);
+    }
+
+    #[test]
+    fn esc_clears_a_session_highlight_before_it_stops_the_turn() {
+        let mut model = running_model();
+        with_tool_exchange(&mut model, "lead");
+        let mut ui = ready_ui();
+        handle_deck_key(key(KeyCode::Up), &model, &mut ui);
+        assert!(ui.session_selected.is_some());
+        assert_eq!(
+            handle_deck_key(key(KeyCode::Esc), &model, &mut ui),
+            DeckAction::Handled,
+            "rule 7: the highlight claims Esc first"
+        );
+        assert_eq!(ui.session_selected, None);
+        // With nothing left to claim it, the NEXT Esc stops the turn (and
+        // since the claimed Esc broke the pair, it is a single stop).
+        assert_eq!(
+            handle_deck_key(key(KeyCode::Esc), &model, &mut ui),
+            stop_lead()
+        );
+    }
+
+    #[test]
+    fn the_first_submission_after_a_hold_enqueues_at_the_front() {
+        let model = model_with(&["lead"]);
+        let mut ui = ready_ui();
+        ui.dispatch_held = true;
+        for c in "urgent fix".chars() {
+            handle_deck_key(ch(c), &model, &mut ui);
+        }
+        assert_eq!(
+            handle_deck_key(key(KeyCode::Enter), &model, &mut ui),
+            DeckAction::Send(WorkspaceInput::EnqueueFront {
+                text: "urgent fix".into()
+            }),
+            "the held submission jumps the queue"
+        );
+        assert!(!ui.dispatch_held, "the submission releases the hold");
+        for c in "later".chars() {
+            handle_deck_key(ch(c), &model, &mut ui);
+        }
+        assert_eq!(
+            handle_deck_key(key(KeyCode::Enter), &model, &mut ui),
+            DeckAction::Send(WorkspaceInput::Enqueue {
+                text: "later".into()
+            }),
+            "after the hold clears, submissions append as usual"
         );
     }
 

@@ -122,6 +122,13 @@ pub enum Inbound {
     /// bar's "queued" count goes down the moment work actually starts, and a
     /// trace row records which agent picked the prompt up.
     PromptStarted { agent: AgentId, text: String },
+    /// The driver cancelled a turn on [`WorkspaceInput::StopAndHold`]
+    /// (double-Esc) and returned that turn's prompt to the FRONT of its
+    /// dispatch backlog. Folded as a front-insert into the deck's
+    /// [`PromptQueue`](crate::deck::PromptQueue) — the exact inverse of
+    /// [`Inbound::PromptStarted`]'s front-pop — so the queue view keeps
+    /// matching what will actually run.
+    PromptRequeued { agent: AgentId, text: String },
     /// A refreshed code-graph snapshot for the Graph tab. Unlike the other
     /// variants this is **not** a folded event — the graph is an out-of-band
     /// read-model (see `COMMAND_DECK_DESIGN.md` → "The purity boundary"). It
@@ -149,6 +156,12 @@ pub enum WorkspaceInput {
     /// Queue a brand-new prompt without blocking on any busy agent — the
     /// router picks the model/agent. The deck never gates input on agent state.
     Enqueue { text: String },
+    /// Queue a prompt at the FRONT: the first submission after a
+    /// [`WorkspaceInput::StopAndHold`]. The deck sends this instead of
+    /// [`WorkspaceInput::Enqueue`] while dispatch is held, so the user's new
+    /// prompt runs before the prompt the hold returned to the queue — and
+    /// receiving it is what releases the hold.
+    EnqueueFront { text: String },
     /// Remove one not-yet-dispatched prompt from the queue (0 = oldest). The
     /// deck's queue editor sends this for `ctrl+x` delete and for pulling a
     /// prompt back into the composer to edit it.
@@ -161,6 +174,12 @@ pub enum WorkspaceInput {
         agent: AgentId,
         control: AgentControl,
     },
+    /// Double-Esc: cancel `agent`'s in-flight turn, return that turn's
+    /// prompt to the FRONT of the queue, and HOLD dispatch until the user's
+    /// next submission — "full stop; what I type next runs first". A single
+    /// Esc is the plain [`AgentControl::Stop`]: cancel, and the next queued
+    /// prompt dispatches automatically.
+    StopAndHold { agent: AgentId },
     /// Tear down the deck.
     Quit,
 }

@@ -239,6 +239,20 @@ impl WorkspaceModel {
                     self.agents[idx].model.push_user_prompt(text);
                 }
             }
+            Inbound::PromptRequeued { agent, text } => {
+                // The driver cancelled a turn (double-Esc) and returned its
+                // prompt to the front of its backlog. Front-insert the mirror
+                // — the exact inverse of `PromptStarted`'s front-pop — so the
+                // queue view keeps matching what will actually run next.
+                let ts = self.now_ms;
+                self.queue.enqueue_front(text.clone(), ts);
+                self.trace.push(TraceRow {
+                    ts,
+                    agent: agent.clone(),
+                    kind: TraceKind::Stage,
+                    summary: format!("↩ {}", snip(text)),
+                });
+            }
             // The graph snapshot and the slash vocabulary are out-of-band
             // read-models, not part of the event-log fold — the view state
             // owns them, applied in `ingest_inbound`, so the model
@@ -440,6 +454,12 @@ pub struct PromptQueue {
 impl PromptQueue {
     pub fn enqueue(&mut self, text: String, ts: u64) {
         self.items.push_back(QueuedPrompt { text, ts });
+    }
+    /// Insert at the FRONT: a double-Esc requeue (the interrupted prompt
+    /// runs before the rest of the backlog) or the first submission after a
+    /// hold (the user's new prompt runs before even that).
+    pub fn enqueue_front(&mut self, text: String, ts: u64) {
+        self.items.push_front(QueuedPrompt { text, ts });
     }
     /// Number of not-yet-dispatched prompts.
     pub fn pending(&self) -> usize {
@@ -999,6 +1019,42 @@ mod tests {
             text: "driver-side prompt".into(),
         });
         assert_eq!(w.queue.pending(), 1);
+    }
+
+    #[test]
+    fn prompt_requeued_returns_the_prompt_to_the_front_of_the_queue() {
+        let mut w = WorkspaceModel::new();
+        w.apply_inbound(&reg("lead"));
+        w.queue.enqueue("second".into(), 1);
+        w.queue.enqueue("third".into(), 2);
+        // A double-Esc cancelled "first" mid-turn; the driver returned it to
+        // the front of its backlog and mirrored that here.
+        w.apply_inbound(&Inbound::PromptRequeued {
+            agent: "lead".into(),
+            text: "first".into(),
+        });
+        assert_eq!(w.queue.pending(), 3);
+        assert_eq!(
+            w.queue.items.front().map(|q| q.text.as_str()),
+            Some("first")
+        );
+        let row = w.trace.rows.back().expect("a trace row was recorded");
+        assert_eq!(row.agent, "lead");
+        assert!(row.summary.contains("first"), "{}", row.summary);
+    }
+
+    #[test]
+    fn front_inserts_stack_so_the_newest_front_insert_runs_first() {
+        // Double-Esc requeues the interrupted prompt at the front; the user's
+        // next submission front-inserts ABOVE it — new prompt, then the
+        // returned prompt, then the rest of the backlog.
+        let mut q = PromptQueue::default();
+        q.enqueue("rest".into(), 1);
+        q.enqueue_front("returned".into(), 2);
+        q.enqueue_front("new".into(), 3);
+        assert_eq!(q.take_next().as_deref(), Some("new"));
+        assert_eq!(q.take_next().as_deref(), Some("returned"));
+        assert_eq!(q.take_next().as_deref(), Some("rest"));
     }
 
     #[test]
