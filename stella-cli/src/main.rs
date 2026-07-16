@@ -25,6 +25,7 @@ mod extensions;
 mod fleet_cmd;
 mod interactive;
 mod memory;
+mod memory_cmd;
 mod ocp;
 mod rules;
 mod runtime;
@@ -237,11 +238,43 @@ enum Command {
         provider: Option<String>,
     },
 
+    /// Inspect the project's memories through the citation feedback loop —
+    /// most-cited first, usefulness scores, truthfulness — and promote an
+    /// eligible memory to a project rule (.stella/rules/). Reads local state
+    /// only; needs no API key.
+    Memory {
+        #[command(subcommand)]
+        cmd: MemoryCmd,
+    },
+
     /// Show current configuration
     Config,
 
     /// Print the version and exit
     Version,
+}
+
+/// `stella memory` subcommands — the inspection and promotion surface of the
+/// memory-citation loop (agents cite the memories that informed a turn via
+/// the `cite_memory` tool; the citations aggregate into the eligibility gate
+/// `promote` enforces).
+#[derive(Subcommand)]
+enum MemoryCmd {
+    /// List memories ranked by citation count, with average usefulness,
+    /// truthfulness rate, and rule-promotion eligibility
+    List {
+        /// Output format: table (aligned) or json
+        #[arg(long, value_enum, default_value = "table")]
+        format: memory_cmd::MemoryFormat,
+    },
+    /// Promote an eligible memory to a project rule at
+    /// .stella/rules/<slug>.md. Eligibility is strict: cited successfully
+    /// MORE THAN 10 consecutive times since its last negative remark — one
+    /// negative citation resets the count until it is re-earned.
+    Promote {
+        /// The memory's stable id (nod_…) as shown by `stella memory list`
+        id: String,
+    },
 }
 
 /// The version string shown by `--version` and `stella version`: the crate
@@ -368,6 +401,14 @@ fn run(cli: Cli) -> Result<(), String> {
             // it is `Copy`, so deref rather than move.
             return stats::run_stats(*format, provider.as_deref());
         }
+        Some(Command::Memory { cmd }) => {
+            // Reads local stores only (list) / writes one rule file
+            // (promote) — works with zero API keys.
+            return match cmd {
+                MemoryCmd::List { format } => memory_cmd::run_memory_list(*format),
+                MemoryCmd::Promote { id } => memory_cmd::run_memory_promote(id),
+            };
+        }
         Some(Command::Version) => {
             println!("stella v{}", version_string());
             return Ok(());
@@ -467,6 +508,7 @@ fn run(cli: Cli) -> Result<(), String> {
         | Command::Tools { .. }
         | Command::Graph { .. }
         | Command::Stats { .. }
+        | Command::Memory { .. }
         | Command::Models
         | Command::Version => {
             unreachable!("handled before provider resolution")

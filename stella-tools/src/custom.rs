@@ -104,6 +104,7 @@ pub const RESERVED_NAMES: &[&str] = &[
     "explorations",
     "save_exploration",
     "save_memory",
+    "cite_memory",
     // The definition of done + build/test
     "verify_done",
     "build_project",

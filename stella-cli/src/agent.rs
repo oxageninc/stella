@@ -418,7 +418,9 @@ async fn run_pipeline_one_shot(
             Err(_) => ("error", 0.0),
         };
         if !record_execution_end(store, *id, &registry, outcome_label, cost) {
-            warn_store_write_failed("the audit record (files touched / outcome)");
+            warn_store_write_failed(
+                "the audit record (files touched / memory citations / outcome)",
+            );
         }
     }
 
@@ -1893,7 +1895,9 @@ async fn run_turn(
             TurnOutcome::Aborted { .. } => ("aborted", 0.0),
         };
         if !record_execution_end(store, *id, registry, outcome_label, cost) {
-            warn_store_write_failed("the audit record (files touched / outcome)");
+            warn_store_write_failed(
+                "the audit record (files touched / memory citations / outcome)",
+            );
         }
     }
 
@@ -2023,11 +2027,13 @@ fn spawn_renderer(
 }
 
 /// Best-effort end-of-execution records: the session's file-touch telemetry
-/// (read straight off the registry's ledger) and how the run ended. A
-/// failure must not abort the turn, but it must not vanish either — the
-/// store is the durable audit record of what the agent did. Returns `false`
-/// when either write failed so the caller can surface a warning on its own
-/// channel (stderr for the CLI surfaces, a deck event for the TUI, where
+/// (read straight off the registry's ledger), the memory citations the
+/// `cite_memory` tool collected this turn (drained, so each lands under
+/// exactly one execution — the promotion gate counts them), and how the run
+/// ended. A failure must not abort the turn, but it must not vanish either —
+/// the store is the durable audit record of what the agent did. Returns
+/// `false` when any write failed so the caller can surface a warning on its
+/// own channel (stderr for the CLI surfaces, a deck event for the TUI, where
 /// stderr belongs to the alternate screen).
 pub(crate) fn record_execution_end(
     store: &Store,
@@ -2038,10 +2044,14 @@ pub(crate) fn record_execution_end(
 ) -> bool {
     let files = file_touch_rows(registry);
     let files_ok = store.record_files_touched(execution_id, &files).is_ok();
+    let citations = memory_citation_rows(registry);
+    let citations_ok = store
+        .record_memory_citations(execution_id, &citations)
+        .is_ok();
     let finish_ok = store
         .finish_execution(execution_id, outcome_label, cost_usd)
         .is_ok();
-    files_ok && finish_ok
+    files_ok && citations_ok && finish_ok
 }
 
 /// The registry's session file-touch telemetry as store rows: one per
@@ -2058,6 +2068,23 @@ fn file_touch_rows(registry: &ToolRegistry) -> Vec<stella_store::FileTouchRow> {
             lines_removed: record.lines_removed,
             events_json: serde_json::to_string(&record.events).unwrap_or_else(|_| "[]".into()),
             path: record.path,
+        })
+        .collect()
+}
+
+/// The registry's memory citations as store rows. This DRAINS the ledger
+/// (unlike the cumulative file-touch snapshot) so each citation persists
+/// under exactly one execution — the >10 promotion count must never be
+/// inflated by re-persisting a citation under later turns.
+fn memory_citation_rows(registry: &ToolRegistry) -> Vec<stella_store::MemoryCitationRow> {
+    registry
+        .take_memory_citations()
+        .into_iter()
+        .map(|c| stella_store::MemoryCitationRow {
+            memory_id: c.memory_id,
+            useful_score: c.useful_score,
+            truthful: c.truthful,
+            remark: c.remark,
         })
         .collect()
 }
@@ -2217,7 +2244,9 @@ async fn run_goal_turn(
             GoalOutcome::Unmet { cost_usd, .. } => ("goal_unmet", *cost_usd),
         };
         if !record_execution_end(store, *id, registry, outcome_label, cost) {
-            warn_store_write_failed("the audit record (files touched / outcome)");
+            warn_store_write_failed(
+                "the audit record (files touched / memory citations / outcome)",
+            );
         }
     }
     tui::files_touched_panel(&files);
