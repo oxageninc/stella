@@ -243,8 +243,7 @@ mod tests {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .respond_with(
-                wiremock::ResponseTemplate::new(200)
-                    .set_delay(std::time::Duration::from_secs(5)),
+                wiremock::ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(5)),
             )
             .mount(&server)
             .await;

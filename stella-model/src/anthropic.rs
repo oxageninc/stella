@@ -166,7 +166,6 @@ fn classify_anthropic_stream_error(err: &AnthropicStreamError) -> ProviderError 
     }
 }
 
-
 #[derive(Deserialize, Debug, Default)]
 struct AnthropicMessageStart {
     #[serde(default)]

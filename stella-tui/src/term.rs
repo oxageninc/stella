@@ -161,8 +161,7 @@ impl PanicHookGuard {
                     serde_json::json!({ "info": info.to_string() }),
                 );
             }
-            let caught_panel_panic =
-                cfg!(panic = "unwind") && IN_GUARDED_PANEL.with(Cell::get);
+            let caught_panel_panic = cfg!(panic = "unwind") && IN_GUARDED_PANEL.with(Cell::get);
             if !caught_panel_panic {
                 state.restore();
                 eprintln!("{info}");

@@ -603,8 +603,7 @@ async fn fetch_all_tools(
                 description: tool.description.unwrap_or_default(),
                 name: tool.name,
                 input_schema: normalize_schema(tool.input_schema),
-                safe_to_retry: tool.annotations.read_only_hint
-                    || tool.annotations.idempotent_hint,
+                safe_to_retry: tool.annotations.read_only_hint || tool.annotations.idempotent_hint,
             });
         }
         match page.next_cursor {
@@ -966,10 +965,11 @@ mod tests {
         let healed: std::sync::Mutex<Option<Box<dyn Transport>>> =
             std::sync::Mutex::new(Some(Box::new(healed)));
 
-        let mut client = McpClient::new("srv", Box::new(initial)).with_test_reconnector(move || {
-            let t = healed.lock().unwrap().take().expect("one reconnect");
-            async move { Ok(t) }
-        });
+        let mut client =
+            McpClient::new("srv", Box::new(initial)).with_test_reconnector(move || {
+                let t = healed.lock().unwrap().take().expect("one reconnect");
+                async move { Ok(t) }
+            });
         client.initialize().await.unwrap();
 
         // The dropped mutating call surfaces as an error naming the ambiguity…
