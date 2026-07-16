@@ -54,6 +54,10 @@ pub struct ToolRegistry {
     late_tools: std::sync::RwLock<HashMap<String, Arc<dyn Tool>>>,
     root: PathBuf,
     touched: std::sync::Mutex<FileTouchLedger>,
+    /// The session's memory-citation ledger, shared with the registered
+    /// `cite_memory` tool instance and drained per execution by
+    /// [`ToolRegistry::take_memory_citations`].
+    citations: crate::memory::CitationLedger,
     schema_index: std::sync::Mutex<SchemaIndex>,
     /// The session's extension hook bus, once a host attaches one
     /// ([`ToolRegistry::attach_bus`]). Every emission is `None`-guarded, so
@@ -110,6 +114,7 @@ impl ToolRegistry {
         issue_backend: Option<crate::issues::IssueBackend>,
         media_backend: Option<crate::media::MediaBackend>,
     ) -> Self {
+        let citations: crate::memory::CitationLedger = Arc::default();
         let mut tools: HashMap<String, Arc<dyn Tool>> = HashMap::new();
         let mut entries: Vec<Arc<dyn Tool>> = vec![
             Arc::new(crate::read::ReadFile),
@@ -122,6 +127,7 @@ impl ToolRegistry {
             Arc::new(crate::exploration::Explorations),
             Arc::new(crate::exploration::SaveExploration),
             Arc::new(crate::memory::SaveMemory),
+            Arc::new(crate::memory::CiteMemory(citations.clone())),
             Arc::new(crate::verify::VerifyDone),
             Arc::new(crate::project::BuildProject),
             Arc::new(crate::project::RunTests),
@@ -158,6 +164,7 @@ impl ToolRegistry {
             late_tools: std::sync::RwLock::new(HashMap::new()),
             root,
             touched: std::sync::Mutex::new(FileTouchLedger::default()),
+            citations,
             schema_index: std::sync::Mutex::new(SchemaIndex::default()),
             bus: std::sync::RwLock::new(None),
         }
@@ -693,6 +700,15 @@ impl ToolRegistry {
             .snapshot()
     }
 
+    /// Drain the memory citations the `cite_memory` tool recorded since the
+    /// last drain. Draining (unlike the cumulative file-touch snapshot) is
+    /// what lets the CLI persist each citation under exactly one execution —
+    /// re-persisting under later executions would inflate the promotion
+    /// eligibility count.
+    pub fn take_memory_citations(&self) -> Vec<crate::memory::MemoryCitation> {
+        std::mem::take(&mut *self.citations.lock().unwrap_or_else(|p| p.into_inner()))
+    }
+
     /// Comma-separated sorted list of registered tool names, for error
     /// messages.
     pub fn available_names(&self) -> String {
@@ -814,6 +830,7 @@ mod tests {
             "explorations",
             "save_exploration",
             "save_memory",
+            "cite_memory",
             "verify_done",
             "build_project",
             "run_tests",
@@ -827,14 +844,14 @@ mod tests {
         ] {
             assert!(names.contains(&expected.to_string()), "missing {expected}");
         }
-        assert_eq!(names.len(), 20, "unexpected tool count: {names:?}");
+        assert_eq!(names.len(), 21, "unexpected tool count: {names:?}");
     }
 
     #[test]
     fn issue_tools_absent_without_a_configured_backend() {
         let reg = ToolRegistry::with_issue_backend(PathBuf::from("/tmp"), None);
         let names: Vec<String> = reg.schemas().iter().map(|s| s.name.clone()).collect();
-        assert_eq!(names.len(), 15, "unexpected tool count: {names:?}");
+        assert_eq!(names.len(), 16, "unexpected tool count: {names:?}");
         for absent in [
             "create_issue",
             "update_issue",
@@ -1550,6 +1567,29 @@ mod tests {
             reg.file_touch_telemetry().files_touched[0].path,
             "quarantine.txt",
             "the ledger records the path the tool actually touched"
+        );
+    }
+
+    #[tokio::test]
+    async fn cite_memory_dispatches_through_the_registry_and_drains_once() {
+        let (_dir, reg) = telemetry_fixture();
+        exec_ok(
+            &reg,
+            "cite_memory",
+            serde_json::json!({
+                "memory_id": "nod_0123456789abcdef01234567",
+                "useful_score": 5,
+                "truthful": true,
+                "remark": "named the failing module outright",
+            }),
+        )
+        .await;
+        let drained = reg.take_memory_citations();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].memory_id, "nod_0123456789abcdef01234567");
+        assert!(
+            reg.take_memory_citations().is_empty(),
+            "a drained citation must never persist under a second execution"
         );
     }
 

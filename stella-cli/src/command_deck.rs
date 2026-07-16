@@ -887,7 +887,7 @@ async fn run_lead_turn(
                 agent: LEAD.to_string(),
                 event: AgentEvent::Error {
                     message: "store write failed — the audit record (files touched / \
-                              outcome) for this execution is incomplete"
+                              memory citations / outcome) for this execution is incomplete"
                         .to_string(),
                     retryable: true,
                 },
