@@ -1248,9 +1248,7 @@ pub(crate) fn graph_snapshot(
     }
     let graph = stella_graph::CodeGraph::open(workspace_root, &db_path).ok()?;
     let focus = graph.busiest_file().ok()??;
-    let hood = graph
-        .file_neighborhood(std::path::Path::new(&focus))
-        .ok()?;
+    let hood = graph.file_neighborhood(std::path::Path::new(&focus)).ok()?;
     graph.shutdown();
 
     let mut nodes = vec![GraphNode {

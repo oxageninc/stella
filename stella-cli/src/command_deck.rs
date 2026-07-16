@@ -422,10 +422,12 @@ async fn run_deck_command(
     };
     match trimmed {
         "/help" => {
-            say("commands: /help · /clear (reset conversation) · /models (list providers) · \
+            say(
+                "commands: /help · /clear (reset conversation) · /models (list providers) · \
                  /init (index the workspace: domains + code graph) · /files · /diff · /graph \
                  (switch tabs) — anything else is a prompt. ctrl+t queue · ? overlay help"
-                .to_string());
+                    .to_string(),
+            );
         }
         "/clear" => {
             messages.clear();

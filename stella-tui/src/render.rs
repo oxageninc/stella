@@ -389,11 +389,24 @@ pub(crate) fn render_transcript(
     area: Rect,
     buf: &mut Buffer,
 ) {
-    let total = lines.len();
     let visible: Vec<Line<'static>> = lines
         .get(window.clone())
         .map(<[Line]>::to_vec)
         .unwrap_or_default();
+    render_transcript_window(visible, window, lines.len(), following, area, buf);
+}
+
+/// [`render_transcript`] for a caller that already materialized just the
+/// visible window (the deck's fold cache clones ≤ one viewport of lines per
+/// frame instead of the whole history); `total` sizes the title.
+pub(crate) fn render_transcript_window(
+    visible: Vec<Line<'static>>,
+    window: Range<usize>,
+    total: usize,
+    following: bool,
+    area: Rect,
+    buf: &mut Buffer,
+) {
     let title = if following {
         format!(" transcript · {total} lines · following ")
     } else {
@@ -685,9 +698,7 @@ fn wrap_one_indent(
     let mut current: Vec<(char, Style)> = Vec::new();
     let mut current_w = 0usize;
 
-    let flush = |cur: &mut Vec<(char, Style)>,
-                 first: bool,
-                 out: &mut Vec<Line<'static>>| {
+    let flush = |cur: &mut Vec<(char, Style)>, first: bool, out: &mut Vec<Line<'static>>| {
         if !cur.is_empty() {
             let pairs = std::mem::take(cur);
             if first {
@@ -751,7 +762,7 @@ pub(crate) fn transcript_lines(
 ) -> Vec<Line<'static>> {
     let mut out = Vec::new();
     for entry in &model.transcript {
-        entry_lines(entry, expand_thinking, width, &mut out);
+        entry_lines(entry, expand_thinking, expand_thinking, width, &mut out);
     }
     out
 }
@@ -759,6 +770,7 @@ pub(crate) fn transcript_lines(
 pub(crate) fn entry_lines(
     entry: &TranscriptEntry,
     expand_thinking: bool,
+    expanded: bool,
     width: usize,
     out: &mut Vec<Line<'static>>,
 ) {
@@ -801,7 +813,8 @@ pub(crate) fn entry_lines(
         }
         TranscriptEntry::Reasoning(text) => {
             let total_lines = text.lines().count().max(1);
-            let chevron = if expand_thinking { "⏶" } else { "⏵" };
+            let show_all = expand_thinking || expanded;
+            let chevron = if show_all { "⏶" } else { "⏵" };
             out.push(Line::from(vec![
                 Span::styled(format!("{chevron} "), Style::new().fg(theme::AMBER)),
                 Span::styled(
@@ -812,7 +825,7 @@ pub(crate) fn entry_lines(
             let reasoning_style = Style::new()
                 .fg(Color::DarkGray)
                 .add_modifier(Modifier::ITALIC);
-            if expand_thinking {
+            if show_all {
                 for l in text.split('\n') {
                     out.push(Line::from(Span::styled(
                         format!("  {l}"),
@@ -836,13 +849,15 @@ pub(crate) fn entry_lines(
                 }
                 if total_lines > preview_count {
                     out.push(Line::from(Span::styled(
-                        "  ⋯ ctrl+r to expand",
+                        "  ⋯ ctrl+o expands this thought · ctrl+r all",
                         Style::new().fg(Color::DarkGray),
                     )));
                 }
             }
         }
-        TranscriptEntry::ToolStart { name, input, .. } => {
+        TranscriptEntry::ToolStart {
+            name, input, raw, ..
+        } => {
             let line = Line::from(vec![
                 Span::styled(
                     label_tag(name),
@@ -851,10 +866,23 @@ pub(crate) fn entry_lines(
                 Span::styled(input.clone(), Style::new().fg(Color::DarkGray)),
             ]);
             wrap_one_indent(line, width, LABEL_COL, out);
+            if expanded {
+                // ctrl+o: the full argument object, pretty-printed and dim.
+                let pretty = serde_json::from_str::<serde_json::Value>(raw)
+                    .and_then(|v| serde_json::to_string_pretty(&v))
+                    .unwrap_or_else(|_| raw.clone());
+                for l in pretty.lines() {
+                    out.push(Line::from(Span::styled(
+                        format!("    {l}"),
+                        Style::new().fg(theme::MUTED),
+                    )));
+                }
+            }
         }
         TranscriptEntry::ToolResult {
             ok,
             summary,
+            full,
             duration_ms,
             ..
         } => {
@@ -863,18 +891,49 @@ pub(crate) fn entry_lines(
             } else {
                 ("✗", Color::Red)
             };
-            let line = Line::from(vec![
-                Span::styled(
-                    label_tag(glyph),
-                    Style::new().fg(color).add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(summary.clone()),
-                Span::styled(
-                    format!("  ({duration_ms}ms)"),
-                    Style::new().fg(Color::DarkGray),
-                ),
-            ]);
-            wrap_one_indent(line, width, LABEL_COL, out);
+            let extra = full.lines().count().saturating_sub(1);
+            if expanded {
+                let line = Line::from(vec![
+                    Span::styled(
+                        label_tag(glyph),
+                        Style::new().fg(color).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!("({} lines · {duration_ms}ms)", extra + 1),
+                        Style::new().fg(Color::DarkGray),
+                    ),
+                ]);
+                wrap_one_indent(line, width, LABEL_COL, out);
+                for l in full.lines() {
+                    out.push(Line::from(Span::styled(
+                        format!("    {l}"),
+                        Style::new().fg(theme::MUTED),
+                    )));
+                }
+            } else {
+                // Collapsed: exactly one output line; the hint names how many
+                // more ctrl+o would reveal. Multi-line output NEVER floods the
+                // transcript uninvited.
+                let first = full
+                    .lines()
+                    .find(|l| !l.trim().is_empty())
+                    .unwrap_or(summary.as_str());
+                let shown: String = first.chars().take(160).collect();
+                let hint = if extra > 0 {
+                    format!("  (+{extra} lines · {duration_ms}ms)")
+                } else {
+                    format!("  ({duration_ms}ms)")
+                };
+                let line = Line::from(vec![
+                    Span::styled(
+                        label_tag(glyph),
+                        Style::new().fg(color).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(shown),
+                    Span::styled(hint, Style::new().fg(Color::DarkGray)),
+                ]);
+                wrap_one_indent(line, width, LABEL_COL, out);
+            }
         }
         TranscriptEntry::Retry { attempt, reason } => out.push(Line::from(Span::styled(
             format!("↻ retry #{attempt}: {reason}"),

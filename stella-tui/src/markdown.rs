@@ -7,7 +7,7 @@
 //! each line. The output is a vector of styled [`Line`]s that the transcript
 //! renderer and word-wrapper consume unchanged.
 
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use crate::theme;
@@ -29,10 +29,7 @@ pub fn render(text: &str) -> Vec<Line<'static>> {
         }
 
         if in_code_block {
-            out.push(Line::from(Span::styled(
-                format!("  {raw}"),
-                code_style(),
-            )));
+            out.push(Line::from(Span::styled(format!("  {raw}"), code_style())));
             continue;
         }
 
@@ -54,8 +51,7 @@ pub fn render(text: &str) -> Vec<Line<'static>> {
 
         // ── Blockquote (> ...) ─────────────────────────────────────────────
         if let Some(rest) = raw.strip_prefix("> ") {
-            let mut spans =
-                vec![Span::styled("▎ ", Style::new().fg(theme::MUTED))];
+            let mut spans = vec![Span::styled("▎ ", Style::new().fg(theme::MUTED))];
             spans.extend(parse_inline_spans(rest));
             out.push(Line::from(spans));
             continue;
@@ -64,7 +60,8 @@ pub fn render(text: &str) -> Vec<Line<'static>> {
         // ── Bullet list (- / * / +) ────────────────────────────────────────
         let lead = raw.trim_start();
         let indent = raw.len() - lead.len();
-        if let Some(rest) = lead.strip_prefix("- ")
+        if let Some(rest) = lead
+            .strip_prefix("- ")
             .or_else(|| lead.strip_prefix("* "))
             .or_else(|| lead.strip_prefix("+ "))
         {
@@ -118,10 +115,7 @@ fn parse_inline_spans(text: &str) -> Vec<Span<'static>> {
 
     while i < chars.len() {
         // **bold** or __bold__
-        if (chars[i] == '*' || chars[i] == '_')
-            && i + 1 < chars.len()
-            && chars[i + 1] == chars[i]
-        {
+        if (chars[i] == '*' || chars[i] == '_') && i + 1 < chars.len() && chars[i + 1] == chars[i] {
             let delim: String = std::iter::repeat_n(chars[i], 2).collect();
             let Some(end) = find_str(&chars, i + 2, &delim) else {
                 buf.push(chars[i]);
@@ -173,10 +167,7 @@ fn parse_inline_spans(text: &str) -> Vec<Span<'static>> {
         }
 
         // ~~strike~~
-        if chars[i] == '~'
-            && i + 1 < chars.len()
-            && chars[i + 1] == '~'
-        {
+        if chars[i] == '~' && i + 1 < chars.len() && chars[i + 1] == '~' {
             let Some(end) = find_str(&chars, i + 2, "~~") else {
                 buf.push(chars[i]);
                 i += 1;
@@ -209,7 +200,7 @@ fn parse_inline_spans(text: &str) -> Vec<Span<'static>> {
                     format!("{link_text} ({url})")
                 },
                 Style::new()
-                    .fg(Color::Blue)
+                    .fg(theme::RUN)
                     .add_modifier(Modifier::UNDERLINED),
             ));
             i = paren + 1;
@@ -260,15 +251,17 @@ fn strip_numbered(lead: &str) -> Option<&str> {
     if digits_end == 0 || digits_end >= lead.len() {
         return None;
     }
-    lead.get(digits_end..)?.strip_prefix(". ").or_else(|| lead.get(digits_end..)?.strip_prefix(") "))
+    lead.get(digits_end..)?
+        .strip_prefix(". ")
+        .or_else(|| lead.get(digits_end..)?.strip_prefix(") "))
 }
 
 /// Build a heading line with level-appropriate styling.
 fn heading_line(content: &str, level: usize) -> Line<'static> {
     let prefix = match level {
-        1 => "",
-        2 => "",
-        _ => "",
+        1 => "◆ ",
+        2 => "◈ ",
+        _ => "· ",
     };
     let style = match level {
         1 | 2 => theme::heading(),
@@ -282,7 +275,7 @@ fn heading_line(content: &str, level: usize) -> Line<'static> {
 
 /// Style for inline code spans and fenced code blocks.
 fn code_style() -> Style {
-    Style::new().fg(Color::Yellow)
+    Style::new().fg(theme::WARN)
 }
 
 // ── Search helpers ─────────────────────────────────────────────────────────
@@ -304,7 +297,10 @@ fn find_str(chars: &[char], start: usize, needle: &str) -> Option<usize> {
 
 /// Find the index of `target` in `chars[start..]`, or `None`.
 fn find_char(chars: &[char], start: usize, target: char) -> Option<usize> {
-    chars[start..].iter().position(|&c| c == target).map(|p| start + p)
+    chars[start..]
+        .iter()
+        .position(|&c| c == target)
+        .map(|p| start + p)
 }
 
 /// Find a single delimiter (e.g. `*`) while skipping doubled pairs (`**`).
@@ -370,7 +366,7 @@ mod tests {
         // Three spans: "inline ", code, " here"
         let code_span = &lines[0].spans[1];
         assert_eq!(code_span.content, "code");
-        assert_eq!(code_span.style.fg, Some(Color::Yellow));
+        assert_eq!(code_span.style.fg, Some(theme::WARN));
     }
 
     #[test]
@@ -384,9 +380,9 @@ mod tests {
                 "heading is bold"
             );
         }
-        assert_eq!(collect_spans_text(&lines[0]), "Title");
-        assert_eq!(collect_spans_text(&lines[1]), "Subtitle");
-        assert_eq!(collect_spans_text(&lines[2]), "Section");
+        assert_eq!(collect_spans_text(&lines[0]), "\u{25c6} Title");
+        assert_eq!(collect_spans_text(&lines[1]), "\u{25c8} Subtitle");
+        assert_eq!(collect_spans_text(&lines[2]), "\u{b7} Section");
     }
 
     #[test]
@@ -411,7 +407,10 @@ mod tests {
         let lines = render("```\nfn main() {}\n```");
         assert_eq!(lines.len(), 1);
         let text = collect_spans_text(&lines[0]);
-        assert!(text.contains("fn main"), "code block content visible: {text}");
+        assert!(
+            text.contains("fn main"),
+            "code block content visible: {text}"
+        );
     }
 
     #[test]

@@ -89,6 +89,9 @@ pub enum TranscriptEntry {
         call_id: String,
         name: String,
         input: String,
+        /// The call's compact-JSON arguments, capped — the expanded (ctrl+o)
+        /// view pretty-prints these; `input` stays the humanized one-liner.
+        raw: String,
         /// The workspace-relative path the call targets, parsed from its
         /// input's `path` field (every file tool uses that key). Retained so a
         /// mutating tool's `ToolResult` can be correlated back to the file it
@@ -98,8 +101,14 @@ pub enum TranscriptEntry {
     /// A tool invocation finished — `ok` is `false` for a typed tool error.
     ToolResult {
         call_id: String,
+        /// Resolved from the matching `ToolStart` at fold time so call and
+        /// result rows read as one aligned pair.
+        name: String,
         ok: bool,
         summary: String,
+        /// The output, capped at [`OUTPUT_BUDGET`] chars — the collapsed row
+        /// shows one line; ctrl+o reveals this.
+        full: String,
         duration_ms: u64,
         /// For a *successful* file-mutating tool
         /// (`write_file`/`edit_file`/`delete_file`), the reference the
@@ -255,6 +264,7 @@ impl SessionModel {
                     call_id: call.call_id.clone(),
                     name: call.name.clone(),
                     input: format_tool_input(&call.name, &call.input),
+                    raw: cap_middle(&compact_json(&call.input), INPUT_BUDGET),
                     path: tool_input_path(&call.input),
                 });
             }
@@ -263,10 +273,29 @@ impl SessionModel {
                 output,
                 duration_ms,
             } => {
-                let (ok, summary) = match output {
-                    ToolOutput::Ok { content } => (true, summarize(content)),
-                    ToolOutput::Error { message } => (false, summarize(message)),
+                let (ok, summary, full) = match output {
+                    ToolOutput::Ok { content } => {
+                        (true, summarize(content), cap_middle(content, OUTPUT_BUDGET))
+                    }
+                    ToolOutput::Error { message } => (
+                        false,
+                        summarize(message),
+                        cap_middle(message, OUTPUT_BUDGET),
+                    ),
                 };
+                // Resolve the tool's name from its start entry (results only
+                // carry the call id on the wire).
+                let name = self
+                    .transcript
+                    .iter()
+                    .rev()
+                    .find_map(|e| match e {
+                        TranscriptEntry::ToolStart {
+                            call_id: cid, name, ..
+                        } if cid == call_id => Some(name.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| "tool".to_string());
                 // Only a *successful* mutation gets an inline-diff reference —
                 // a failed call produced no `FileChange`, and rendering the
                 // path's previous diff under its ✗ would attribute a change
@@ -288,8 +317,10 @@ impl SessionModel {
                 };
                 self.transcript.push(TranscriptEntry::ToolResult {
                     call_id: call_id.clone(),
+                    name,
                     ok,
                     summary,
+                    full,
                     duration_ms: *duration_ms,
                     diff,
                 });
@@ -542,13 +573,37 @@ fn compact_json(value: &serde_json::Value) -> String {
     serde_json::to_string(value).unwrap_or_default()
 }
 
+/// Char budget for a tool call's retained compact-JSON arguments.
+pub(crate) const INPUT_BUDGET: usize = 4_096;
+/// Char budget for a tool result's retained output (outputs are already
+/// capped upstream by the tools; this bounds transcript memory).
+pub(crate) const OUTPUT_BUDGET: usize = 16_384;
+
+/// Middle-out char cap preserving head and tail (first error + final summary
+/// both matter), on char boundaries.
+fn cap_middle(text: &str, budget: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= budget {
+        return text.to_string();
+    }
+    let keep = budget.saturating_sub(16);
+    let head = keep / 2;
+    let tail = keep - head;
+    let head_str: String = chars[..head].iter().collect();
+    let tail_str: String = chars[chars.len() - tail..].iter().collect();
+    format!("{head_str}\n[… truncated …]\n{tail_str}")
+}
+
 /// Format a tool-call input as a human-readable one-liner. Instead of raw
 /// JSON, this extracts the most relevant field(s) per tool name so the
 /// transcript reads naturally — `path` for file tools, `cmd` for shell, the
 /// query for search tools, and so on.
 fn format_tool_input(name: &str, input: &serde_json::Value) -> String {
     let str_field = |key: &str| -> Option<String> {
-        input.get(key).and_then(|v| v.as_str()).map(|s| s.to_string())
+        input
+            .get(key)
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
     };
 
     // Primary field per tool — the one the user cares about at a glance.
@@ -574,7 +629,8 @@ fn format_tool_input(name: &str, input: &serde_json::Value) -> String {
         return truncate_field(&cmd, 120);
     }
 
-    if let Some(query) = str_field("query").or_else(|| str_field("pattern"))
+    if let Some(query) = str_field("query")
+        .or_else(|| str_field("pattern"))
         .or_else(|| str_field("symbol"))
     {
         return truncate_field(&query, 80);

@@ -355,6 +355,14 @@ fn render_help(area: Rect, buf: &mut Buffer) {
             theme::body(),
         )),
         Line::from(Span::styled(
+            "  ↑ ↓          select a message (Session) · Esc clears",
+            theme::body(),
+        )),
+        Line::from(Span::styled(
+            "  Ctrl-O       expand/collapse message · twice from the prompt = all thinking",
+            theme::body(),
+        )),
+        Line::from(Span::styled(
             "  Ctrl-R       expand/collapse thinking",
             theme::body(),
         )),
