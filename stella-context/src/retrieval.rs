@@ -20,8 +20,8 @@ use ocp_types::{ContextFrame, ContextQuery, Provenance};
 
 use crate::error::ContextError;
 use crate::store::{
-    ContextStore, NodeRow, domains_for_node, live_nodes, neighbors, node_ids_for_uris,
-    node_ids_excluded_by_scope, vectors_for_fingerprint,
+    ContextStore, NodeRow, domains_for_node, live_nodes, neighbors, node_ids_excluded_by_scope,
+    node_ids_for_uris, vectors_for_fingerprint,
 };
 
 /// Provenance `kind` marking a frame's domain tag, so a citation view can show
