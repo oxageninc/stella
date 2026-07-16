@@ -15,14 +15,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use colored::Colorize;
-use stella_core::ports::{SystemClock, ToolExecutor};
-use stella_core::retry::TokioSleeper;
+use stella_core::ports::ToolExecutor;
 use stella_core::router::{CircuitBreaker, ProviderProfile};
 use stella_core::{
     BudgetGuard, CalibrationMap, Engine, EngineConfig, GoalConfig, GoalOutcome, RoleTable, Router,
     TurnOutcome,
 };
-use stella_mcp::{McpConfig, McpToolSet};
+use stella_mcp::{McpConfig, McpServerConfig, McpToolSet};
 use stella_model::credential::ApiKey;
 use stella_model::provider::Provider;
 use stella_pipeline::{
@@ -44,6 +43,7 @@ use crate::config::Config;
 use crate::domains::{Domains, heuristic_domains, infer_domains};
 use crate::interactive::{InteractiveToolSet, SkillRegistry, default_ask_io};
 use crate::memory::{SessionMemory, inject_recall_block, turn_warrants_reflection};
+use crate::runtime::{SystemClock, TokioSleeper};
 use crate::tui;
 use stella_context::EpisodeOutcome;
 
@@ -1282,6 +1282,11 @@ pub(crate) async fn init_workspace(
     // directories — idempotent, never clobbers, never fatal.
     crate::extensions::sync_extensions(workspace_root, emit);
 
+    // Adopt commands/skills/agents other code agents keep in `.claude/` and
+    // `.agents/` (workspace + user scope) as symlinks into stella's own
+    // directories — idempotent, never clobbers, never fatal.
+    crate::extensions::sync_extensions(workspace_root, emit);
+
     let path = domains.save(workspace_root)?;
 
     // Persist the taxonomy into the context plane too: domain descriptions
@@ -1444,38 +1449,83 @@ pub async fn run_init(
     Ok(())
 }
 
+/// Cap on each MCP server's connect (and, until overridden, each later
+/// call) — the per-server bound `McpToolSet::connect` enforces.
+const MCP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The parse of `.stella/mcp.toml`, split from the connect so a caller that
+/// owns a UI (the deck) can announce the slow part before awaiting it (#98).
+pub(crate) enum McpPlan {
+    /// No config file, or one naming zero servers — nothing to connect.
+    None,
+    /// The config exists but is unreadable/invalid: MCP is disabled this
+    /// session, and the reason must be surfaced exactly once.
+    Invalid(String),
+    /// Servers to connect via [`connect_mcp_servers`].
+    Servers(Vec<McpServerConfig>),
+}
+
+/// Stage 1 of MCP assembly: read and parse the workspace config. Local file
+/// I/O only — never touches the network.
+pub(crate) fn load_mcp_plan(cfg: &Config) -> McpPlan {
+    let path = cfg.workspace_root.join(".stella").join("mcp.toml");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return McpPlan::None;
+    };
+    let parsed = match McpConfig::from_toml_str(&text) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            return McpPlan::Invalid(format!(
+                "{} is invalid: {e} — MCP servers disabled this session",
+                path.display()
+            ));
+        }
+    };
+    let servers = parsed.into_servers();
+    if servers.is_empty() {
+        McpPlan::None
+    } else {
+        McpPlan::Servers(servers)
+    }
+}
+
+/// Stage 2 of MCP assembly: the slow part — up to [`MCP_CONNECT_TIMEOUT`]
+/// per server. Best-effort and isolated per server (stella-mcp records
+/// failures in the set instead of propagating them); the returned set wraps
+/// `native` so non-`mcp__` tool names fall through to it.
+pub(crate) async fn connect_mcp_servers(
+    servers: &[McpServerConfig],
+    native: std::sync::Arc<dyn ToolExecutor>,
+) -> McpToolSet {
+    McpToolSet::connect(servers, MCP_CONNECT_TIMEOUT)
+        .await
+        .wrapping(native)
+}
+
 /// Connect the workspace's MCP servers (.stella/mcp.toml), wrapping the
 /// native registry so their tools merge into the agent's set under
 /// mcp__<server>__<tool> names. Absent config -> None (zero overhead).
 /// Connection is best-effort per server (stella-mcp isolates failures);
-/// failed servers are reported once in text mode, never fatal.
+/// failed servers are reported once in text mode, never fatal. Deck mode
+/// stages [`load_mcp_plan`] / [`connect_mcp_servers`] itself instead: the
+/// connect must run behind the live TUI, with diagnostics as transcript
+/// events rather than prints (#98).
 pub(crate) async fn connect_mcp(
     cfg: &Config,
     native: std::sync::Arc<dyn ToolExecutor>,
     print_diagnostics: bool,
 ) -> Option<McpToolSet> {
-    let path = cfg.workspace_root.join(".stella").join("mcp.toml");
-    let text = std::fs::read_to_string(&path).ok()?;
-    let parsed = match McpConfig::from_toml_str(&text) {
-        Ok(parsed) => parsed,
-        Err(e) => {
+    let servers = match load_mcp_plan(cfg) {
+        McpPlan::None => return None,
+        McpPlan::Invalid(reason) => {
             if print_diagnostics {
-                eprintln!(
-                    "  {} {} is invalid: {e} — MCP servers disabled this session",
-                    "!".yellow(),
-                    path.display()
-                );
+                eprintln!("  {} {reason}", "!".yellow());
             }
             return None;
         }
+        McpPlan::Servers(servers) => servers,
     };
-    let servers = parsed.into_servers();
-    if servers.is_empty() {
-        return None;
-    }
-    let set = McpToolSet::connect(&servers, std::time::Duration::from_secs(10))
-        .await
-        .wrapping(native);
+    let set = connect_mcp_servers(&servers, native).await;
     if print_diagnostics {
         for (name, reason) in set.failed_servers() {
             eprintln!(
@@ -1811,7 +1861,8 @@ async fn run_turn(
         .with_skill_registry(SkillRegistry::from_env(cfg.workspace_root.clone()));
         let hook_runner = ShellHookRunner;
         let mut engine =
-            Engine::new(provider, &tools, engine_config_for(cfg)).with_calibration(calibration);
+            Engine::with_sleeper(provider, &tools, engine_config_for(cfg), &TokioSleeper)
+                .with_calibration(calibration);
         if let Some(hooks) = &cfg.hooks {
             engine = engine.with_hooks(hooks, &hook_runner);
         }
@@ -2117,7 +2168,8 @@ async fn run_goal_turn(
             .with_skill_registry(SkillRegistry::from_env(cfg.workspace_root.clone()));
         let hook_runner = ShellHookRunner;
         let mut engine =
-            Engine::new(provider, &tools, engine_config_for(cfg)).with_calibration(calibration);
+            Engine::with_sleeper(provider, &tools, engine_config_for(cfg), &TokioSleeper)
+                .with_calibration(calibration);
         if let Some(hooks) = &cfg.hooks {
             engine = engine.with_hooks(hooks, &hook_runner);
         }
