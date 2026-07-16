@@ -25,6 +25,12 @@
 //!   memory's content still held true, and a short remark. Aggregated by
 //!   [`Store::memory_citation_stats`] into the rule-promotion eligibility
 //!   gate `stella memory` surfaces.
+//! - **rules** — extension-authored workspace rules: one row per rule id,
+//!   holding the full rule markdown in the `.stella/rules/*.md` authoring
+//!   format (the store never parses it — `stella_core::rules` does).
+//!   Written by extension providers via [`Store::upsert_rule`]; read at
+//!   session start by `stella-cli`, which merges these (lowest precedence)
+//!   with the on-disk rule files.
 //! - **file_locks** — schema + API for cooperative file claims in multi-agent
 //!   work. Reserved: no shipping command acquires locks yet.
 //! - **graph_nodes / graph_edges** — schema reserved as a future seam for a
@@ -40,7 +46,9 @@
 //! still serializes writers per file; one `Store` per session process is the
 //! contract, and internally a `Mutex<Connection>` serializes writers across
 //! in-process parallel agents. Multi-PROCESS fleets need a lock-holder (or
-//! one store per worker + merge) — documented limitation, not a silent one.
+//! one store per worker + merge) — `stella fleet` follows exactly that: its
+//! workers are threads, and the single orchestrator process holds the one
+//! `Store` that acquires and releases their file claims.
 //!
 //! # Schema versioning
 //!
@@ -186,6 +194,17 @@ pub struct MemoryCitationStats {
     pub positive_streak: i64,
     /// `positive_streak > PROMOTION_CITATIONS_REQUIRED` — the promotion gate.
     pub eligible: bool,
+/// One extension-authored workspace rule, as stored: the full rule markdown
+/// in the `.stella/rules/*.md` authoring format plus the writer's label.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RuleRow {
+    /// The rule id — the analog of a rule file's filename stem.
+    pub rule_id: String,
+    /// Full rule markdown (optional frontmatter + body). Opaque to the
+    /// store; `stella_core::rules::rule_from_file` parses it.
+    pub contents: String,
+    /// Opaque label naming the writer (extension/provider id).
+    pub source: String,
 }
 
 /// One aggregated analytics row per (provider, model): the numbers behind
@@ -300,6 +319,8 @@ const MIGRATIONS: [Migration; 3] = [
     migrate_v1_to_v2,
     // v2 → v3: the memory_citations table (purely additive — no existing
     // table changes shape).
+    // v2 → v3: the additive `rules` table (extension-authored workspace
+    // rules for the stella-core rules engine).
     migrate_v2_to_v3,
 ];
 
@@ -317,6 +338,7 @@ const TABLES: [&str; 8] = [
     "telemetry",
     "files_touched",
     "memory_citations",
+    "rules",
     "file_locks",
     "graph_nodes",
     "graph_edges",
@@ -429,6 +451,22 @@ fn telemetry_ddl(table: &str) -> String {
     )
 }
 
+/// `rules` DDL — one row per extension-authored workspace rule, keyed by
+/// rule id (the analog of a rule file's filename stem). `contents` is the
+/// FULL rule markdown in the `.stella/rules/*.md` authoring format
+/// (optional `---` frontmatter — `description:`/`guard-*:` keys — plus the
+/// rule statement body); the store never parses it, `stella_core::rules`
+/// does. `source` is an opaque label naming the writer (extension/provider
+/// id). `IF NOT EXISTS` so one batch serves both the fresh-file schema and
+/// the v2 → v3 migration.
+const RULES_TABLE: &str = "CREATE TABLE IF NOT EXISTS rules (
+       rule_id TEXT PRIMARY KEY,
+       contents TEXT NOT NULL,
+       source TEXT NOT NULL,
+       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+       updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+     );";
+
 /// `drift_samples` filters (provider, model) and sorts (execution_id DESC,
 /// step DESC) at EVERY session start, over a table that grows one row per
 /// model call forever — without this index it full-scans. Non-unique on
@@ -465,6 +503,7 @@ fn create_latest_schema(tx: &rusqlite::Transaction<'_>) -> Result<()> {
     tx.execute_batch(&events_ddl("events"))?;
     tx.execute_batch(&telemetry_ddl("telemetry"))?;
     tx.execute_batch(&files_touched_ddl("files_touched"))?;
+    tx.execute_batch(RULES_TABLE)?;
     tx.execute_batch(TELEMETRY_INDEX)?;
     tx.execute_batch(MEMORY_CITATIONS_DDL)?;
     Ok(())
@@ -657,6 +696,7 @@ fn migrate_v1_to_v2(tx: &rusqlite::Transaction<'_>) -> Result<()> {
 /// table is touched, so no rebuild, no dedupe, no backfill.
 fn migrate_v2_to_v3(tx: &rusqlite::Transaction<'_>) -> Result<()> {
     tx.execute_batch(MEMORY_CITATIONS_DDL)?;
+    tx.execute_batch(RULES_TABLE)?;
     Ok(())
 }
 
@@ -990,30 +1030,42 @@ impl Store {
     /// Cooperative file lock: succeeds only if `path` is unclaimed or
     /// already held by `holder` (re-entrant). Returns whether the lock is
     /// now held.
+    ///
+    /// `INSERT … DO NOTHING` + read-back rather than check-then-insert: two
+    /// PROCESSES racing for the same path (two fleet runs in one workspace)
+    /// resolve to one winner — the losing INSERT is a no-op, never a
+    /// primary-key error — and the read-back reports honestly for both.
     pub fn acquire_file_lock(&self, path: &str, holder: &str) -> Result<bool> {
         let conn = self.lock();
-        // Only "no such lock row" means unclaimed. A genuine query error must
-        // propagate — `.optional()` maps just the no-rows case to `None`;
-        // every other error still propagates via `?`. Swallowing a real error
-        // as "unclaimed" would drive a spurious INSERT (then a PK conflict),
-        // corrupting lock state.
-        let existing: Option<String> = conn
+        conn.execute(
+            "INSERT INTO file_locks (path, holder) VALUES (?, ?) \
+             ON CONFLICT (path) DO NOTHING",
+            params![path, holder],
+        )?;
+        // A row that vanished between the two statements means the competing
+        // holder released cross-process in that window; "not held" is the
+        // conservative truthful answer for THIS call.
+        let current: Option<String> = conn
             .query_row(
                 "SELECT holder FROM file_locks WHERE path = ?",
                 params![path],
                 |row| row.get(0),
             )
             .optional()?;
-        match existing {
-            Some(current) => Ok(current == holder),
-            None => {
-                conn.execute(
-                    "INSERT INTO file_locks (path, holder) VALUES (?, ?)",
-                    params![path, holder],
-                )?;
-                Ok(true)
-            }
-        }
+        Ok(current.as_deref() == Some(holder))
+    }
+
+    /// Who currently holds the claim on `path`, if anyone — the read half a
+    /// consumer uses to NAME the conflicting holder in its error.
+    pub fn file_lock_holder(&self, path: &str) -> Result<Option<String>> {
+        self.lock()
+            .query_row(
+                "SELECT holder FROM file_locks WHERE path = ?",
+                params![path],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(StoreError::from)
     }
 
     /// Release a lock (only the holder's release removes it).
@@ -1023,6 +1075,49 @@ impl Store {
             params![path, holder],
         )?;
         Ok(())
+    }
+
+    /// Upsert one extension-authored workspace rule — the write seam an
+    /// extension provider uses to publish a rule without touching
+    /// `.stella/rules/`. `contents` is the full rule markdown in the
+    /// authoring format `stella_core::rules::rule_from_file` parses; the
+    /// store treats it as opaque text. Re-publishing an existing `rule_id`
+    /// replaces its contents and source and bumps `updated_at`.
+    pub fn upsert_rule(&self, rule_id: &str, contents: &str, source: &str) -> Result<()> {
+        self.lock().execute(
+            "INSERT INTO rules (rule_id, contents, source) VALUES (?, ?, ?) \
+             ON CONFLICT (rule_id) DO UPDATE SET contents = excluded.contents, \
+             source = excluded.source, updated_at = CURRENT_TIMESTAMP",
+            params![rule_id, contents, source],
+        )?;
+        Ok(())
+    }
+
+    /// Delete one extension-authored rule; returns whether a row existed.
+    pub fn delete_rule(&self, rule_id: &str) -> Result<bool> {
+        let deleted = self
+            .lock()
+            .execute("DELETE FROM rules WHERE rule_id = ?", params![rule_id])?;
+        Ok(deleted > 0)
+    }
+
+    /// Every stored rule, ordered by rule id — deterministic, so the rules
+    /// section assembled from these into a session's system prompt stays
+    /// byte-stable (the prompt-cache contract).
+    pub fn list_rules(&self) -> Result<Vec<RuleRow>> {
+        let conn = self.lock();
+        let mut stmt =
+            conn.prepare("SELECT rule_id, contents, source FROM rules ORDER BY rule_id")?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(RuleRow {
+                    rule_id: row.get(0)?,
+                    contents: row.get(1)?,
+                    source: row.get(2)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     /// Upsert a graph node — the context plane's write seam.
@@ -1481,6 +1576,55 @@ mod tests {
         store
             .record_files_touched(1, &[touch_row("src/new.rs", "C", 7, 0)])
             .unwrap();
+        drop(store);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn rules_upsert_list_delete_roundtrip() {
+        let store = Store::in_memory().unwrap();
+        store
+            .upsert_rule("no-force-push", "Never force-push.", "ext:policy")
+            .unwrap();
+        store
+            .upsert_rule("a-first", "Sort me first.", "ext:policy")
+            .unwrap();
+        // Re-publishing an id replaces contents and source, never duplicates.
+        store
+            .upsert_rule(
+                "no-force-push",
+                "---\nguard-tool: Bash\nguard-deny-command: git push --force*\n---\nNever force-push.",
+                "ext:policy-v2",
+            )
+            .unwrap();
+
+        let rules = store.list_rules().unwrap();
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0].rule_id, "a-first", "ordered by rule id");
+        assert_eq!(rules[1].source, "ext:policy-v2");
+        assert!(rules[1].contents.contains("guard-tool: Bash"));
+
+        assert!(store.delete_rule("a-first").unwrap());
+        assert!(
+            !store.delete_rule("a-first").unwrap(),
+            "a second delete reports no row"
+        );
+        assert_eq!(store.count("rules").unwrap(), 1);
+    }
+
+    #[test]
+    fn v3_migration_adds_the_rules_table_to_a_legacy_file() {
+        // A legacy file upgraded through the whole migration chain must end
+        // at SCHEMA_VERSION with the rules table present and writable.
+        let root = temp_root("v3_rules");
+        {
+            let conn = Connection::open(root.join(".stella/store.db")).unwrap();
+            conn.execute_batch(LEGACY_V0_SCHEMA).unwrap();
+        }
+        let store = Store::open(&root).unwrap();
+        assert_eq!(user_version(&store), SCHEMA_VERSION);
+        store.upsert_rule("r", "rule text", "ext").unwrap();
+        assert_eq!(store.count("rules").unwrap(), 1);
         drop(store);
         std::fs::remove_dir_all(&root).ok();
     }
@@ -1979,6 +2123,20 @@ mod tests {
         assert!(!store.acquire_file_lock("src/a.rs", "agent-2").unwrap());
         store.release_file_lock("src/a.rs", "agent-1").unwrap();
         assert!(store.acquire_file_lock("src/a.rs", "agent-2").unwrap());
+    }
+
+    #[test]
+    fn file_lock_holder_names_the_current_holder() {
+        let store = Store::in_memory().unwrap();
+        assert_eq!(store.file_lock_holder("src/a.rs").unwrap(), None);
+        store.acquire_file_lock("src/a.rs", "agent-1").unwrap();
+        assert_eq!(
+            store.file_lock_holder("src/a.rs").unwrap(),
+            Some("agent-1".to_string()),
+            "a loser's conflict error must be able to name the winner"
+        );
+        store.release_file_lock("src/a.rs", "agent-1").unwrap();
+        assert_eq!(store.file_lock_holder("src/a.rs").unwrap(), None);
     }
 
     #[test]

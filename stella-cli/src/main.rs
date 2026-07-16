@@ -27,6 +27,7 @@ mod interactive;
 mod memory;
 mod memory_cmd;
 mod ocp;
+mod rules;
 mod runtime;
 mod settings;
 mod stats;
@@ -187,7 +188,8 @@ enum Command {
         tasks: Vec<String>,
 
         /// A plan file instead: .json or .toml with [[tasks]] entries
-        /// (id, title, prompt, optional depends_on + isolation)
+        /// (id, title, prompt, optional depends_on + isolation + claims —
+        /// paths held as cooperative file locks while the task runs)
         #[arg(long, value_name = "FILE", conflicts_with = "tasks")]
         plan: Option<std::path::PathBuf>,
 
@@ -198,6 +200,13 @@ enum Command {
         /// Git ref isolated worktrees branch from (default: current HEAD)
         #[arg(long)]
         base_ref: Option<String>,
+
+        /// After the fan-out, watch each fleet branch's CI to completion and
+        /// reconcile its PR status via `gh` (the fleet PR/CI monitor). Exits
+        /// non-zero if any watched branch ends red. Meaningful once the
+        /// branches are pushed — e.g. task prompts that push and open PRs.
+        #[arg(long)]
+        watch: bool,
     },
 
     /// Query the code graph built by `stella init` — symbol definitions and
@@ -454,6 +463,7 @@ fn run(cli: Cli) -> Result<(), String> {
             plan,
             max_concurrency,
             base_ref,
+            watch,
         } => {
             rt()?.block_on(fleet_cmd::run_fleet(
                 &cfg,
@@ -462,6 +472,7 @@ fn run(cli: Cli) -> Result<(), String> {
                 base_ref.as_deref(),
                 max_concurrency,
                 cli.budget,
+                watch,
             ))?;
         }
         Command::Monitor { target } => {
