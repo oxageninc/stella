@@ -1065,7 +1065,11 @@ mod tests {
             }],
             edges: vec![],
         };
-        ingest_inbound(&Inbound::GraphSnapshot(snapshot.clone()), &mut model, &mut ui);
+        ingest_inbound(
+            &Inbound::GraphSnapshot(snapshot.clone()),
+            &mut model,
+            &mut ui,
+        );
         assert_eq!(ui.graph.as_ref(), Some(&snapshot));
     }
 }
