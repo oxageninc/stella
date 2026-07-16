@@ -156,8 +156,8 @@ pub struct SyncOutcome {
     /// Created links as `(kind, name)`.
     pub linked: Vec<(ExtensionKind, String)>,
     /// Entries skipped by the plan (symlink sources, existing names).
-    /// Asserted by the sync tests only — the bin build never reads it (the
-    /// progress line reports links and errors), hence the lint exception.
+    /// Silent skips are the idempotent-rerun norm, so the init progress
+    /// line reports only links and errors — today only tests read this.
     #[allow(dead_code)]
     pub skipped: usize,
     pub errors: Vec<String>,
