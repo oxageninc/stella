@@ -26,7 +26,8 @@ impl Tool for ReadFile {
                 "properties": {
                     "path": { "type": "string", "description": "File path relative to workspace root" },
                     "offset": { "type": "integer", "description": "1-based start line (optional)" },
-                    "limit": { "type": "integer", "description": "Max lines to return (optional, default 2000)" }
+                    "limit": { "type": "integer", "description": "Max lines to return (optional, default 2000)" },
+                    "reason": { "type": "string", "description": "Why you are reading this file — recorded in the session's file-touch audit log" }
                 },
                 "required": ["path"]
             }),

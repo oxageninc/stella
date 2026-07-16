@@ -7,8 +7,15 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::Value;
+use stella_core::bus::{self, HookBus, HookDecision, HookEventDraft, names as hook_names};
 use stella_core::ports::ToolExecutor;
 use stella_protocol::tool::{ToolOutput, ToolSchema};
+
+pub use crate::file_touch::FileOp;
+use crate::file_touch::{
+    FileTouchEvent, FileTouchLedger, FileTouchTelemetry, count_lines, line_diff,
+    normalize_workspace_path,
+};
 
 /// One tool the agent can call. Input arrives as the model-produced JSON;
 /// output is always a typed `ToolOutput` (never a bare string).
@@ -22,30 +29,21 @@ pub trait Tool: Send + Sync {
     async fn execute(&self, input: &Value, root: &std::path::Path) -> ToolOutput;
 }
 
-/// One file-lifecycle op, in CRUD display order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FileOp {
-    Create,
-    Read,
-    Update,
-    Delete,
-}
-
-impl FileOp {
-    pub fn letter(self) -> char {
-        match self {
-            FileOp::Create => 'C',
-            FileOp::Read => 'R',
-            FileOp::Update => 'U',
-            FileOp::Delete => 'D',
-        }
-    }
+/// A file op classified before execution: the normalized path the ledger
+/// aggregates by, the resolved on-disk path (for pre/post content capture),
+/// and the CRUD event. Create-vs-update is decided here — it depends on
+/// whether the file exists BEFORE the write, not after.
+struct PendingTouch {
+    path: String,
+    full: PathBuf,
+    op: FileOp,
 }
 
 /// Registry of all built-in tools, keyed by name. Also the session's
-/// file-lifecycle ledger: every successful read/write/edit/delete is
-/// recorded per path (insertion-ordered), rendered by the TUI as the
-/// "Files Touched" panel and persisted as telemetry.
+/// file-lifecycle ledger: every successful read/create/update/delete is
+/// recorded per normalized path as a [`FileTouchEvent`] (CRUD event, reason,
+/// line delta) — rendered by the TUI as the "Files Touched" panel and
+/// persisted as the session's file-touch telemetry.
 pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
     /// Tools enabled AFTER construction — currently just `code_graph`, once a
@@ -55,8 +53,12 @@ pub struct ToolRegistry {
     /// three read paths (`schemas`, dispatch, name listing).
     late_tools: std::sync::RwLock<HashMap<String, Arc<dyn Tool>>>,
     root: PathBuf,
-    touched: std::sync::Mutex<Vec<(String, Vec<FileOp>)>>,
+    touched: std::sync::Mutex<FileTouchLedger>,
     schema_index: std::sync::Mutex<SchemaIndex>,
+    /// The session's extension hook bus, once a host attaches one
+    /// ([`ToolRegistry::attach_bus`]). Every emission is `None`-guarded, so
+    /// a bus-less registry behaves exactly as it did before hooks existed.
+    bus: std::sync::RwLock<Option<HookBus>>,
 }
 
 /// The known schema objects in the workspace, used by the schema gate to
@@ -155,9 +157,33 @@ impl ToolRegistry {
             tools,
             late_tools: std::sync::RwLock::new(HashMap::new()),
             root,
-            touched: std::sync::Mutex::new(Vec::new()),
+            touched: std::sync::Mutex::new(FileTouchLedger::default()),
             schema_index: std::sync::Mutex::new(SchemaIndex::default()),
+            bus: std::sync::RwLock::new(None),
         }
+    }
+
+    /// Attach the session's extension hook bus. From this point every tool
+    /// call runs the blocking policy chains (`tool.call.requested`, then
+    /// `file.created`/`file.updated`/`file.deleted` or `command.started`)
+    /// before executing, and emits the observer events documented in
+    /// `docs/hooks.md`. Also emits one `tool.registered` per registered
+    /// tool, name-sorted, so extensions see the tool surface up front.
+    pub fn attach_bus(&self, bus: HookBus) {
+        let mut schemas = ToolRegistry::schemas(self);
+        schemas.sort_by(|a, b| a.name.cmp(&b.name));
+        for schema in schemas {
+            bus.emit_named(
+                hook_names::TOOL_REGISTERED,
+                serde_json::json!({ "tool": schema.name, "read_only": schema.read_only }),
+            );
+        }
+        *self.bus.write().unwrap_or_else(|p| p.into_inner()) = Some(bus);
+    }
+
+    /// The attached hook bus, if any (cheap clone — shared inner).
+    fn bus(&self) -> Option<HookBus> {
+        self.bus.read().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
     /// Enable the `code_graph` query tool if `stella init` has since built the
@@ -191,9 +217,37 @@ impl ToolRegistry {
     /// Execute a tool by name. Returns an error `ToolOutput` if the name is
     /// unknown or the input is malformed — never panics.
     pub async fn execute(&self, name: &str, input: &Value) -> ToolOutput {
+        let bus = self.bus();
+        let started_at = std::time::Instant::now();
+
+        // Extension policy, stage 1: the `tool.call.requested` blocking
+        // chain. Runs FIRST — a `modify` decision replaces the input, and
+        // everything downstream (classification, pre-content capture, the
+        // schema gate, execution) must see the final input, not the
+        // original.
+        let mut modified_input: Option<Value> = None;
+        if let Some(bus) = &bus {
+            match self.gate_tool_call(bus, name, input) {
+                Ok(replacement) => modified_input = replacement,
+                Err(denied) => return denied,
+            }
+        }
+        let input: &Value = modified_input.as_ref().unwrap_or(input);
+
         // Classify the file op BEFORE executing: create-vs-update depends
         // on whether the file exists now, not after the write.
         let pending_op = self.classify_file_op(name, input);
+        // Updates need the pre-write content for the line diff; deletes need
+        // it for the pre-deletion line count. Lossy UTF-8 so a binary file
+        // still yields a deterministic (if approximate) line count.
+        let pre_content: Option<String> = match &pending_op {
+            Some(pending) if matches!(pending.op, FileOp::Update | FileOp::Delete) => {
+                std::fs::read(&pending.full)
+                    .ok()
+                    .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            }
+            _ => None,
+        };
 
         // Schema gate: if the target is a SQL file, parse the proposed
         // content for DDL objects and check them against the known schema
@@ -246,6 +300,20 @@ impl ToolRegistry {
             }
         }
 
+        // Extension policy, stage 2: the per-side-effect blocking chains
+        // (`file.created`/`file.updated`/`file.deleted`, `command.started`)
+        // plus the payload-hygiene detectors, then the observable
+        // `tool.call.started` (with content-bearing fields sanitized).
+        if let Some(bus) = &bus {
+            if let Err(denied) = self.gate_side_effects(bus, name, input, pending_op.as_ref()) {
+                return denied;
+            }
+            bus.emit_named(
+                hook_names::TOOL_CALL_STARTED,
+                serde_json::json!({ "tool": name, "input": bus::sanitize_tool_input(input) }),
+            );
+        }
+
         // Resolve from the primary map, falling back to the late-enabled
         // overlay. Clone the `Arc` out so the overlay's read lock is released
         // before the `.await` (a lock guard must not cross an await point).
@@ -265,6 +333,38 @@ impl ToolRegistry {
                 ),
             },
         };
+        if let Some(bus) = &bus {
+            let duration_ms = started_at.elapsed().as_millis() as u64;
+            let command = || input.get("command").and_then(|v| v.as_str()).unwrap_or("");
+            match &output {
+                ToolOutput::Error { message } => {
+                    bus.emit_named(
+                        hook_names::TOOL_CALL_FAILED,
+                        serde_json::json!({
+                            "tool": name, "error": message, "duration_ms": duration_ms,
+                        }),
+                    );
+                    if name == "bash" {
+                        bus.emit_named(
+                            hook_names::COMMAND_FAILED,
+                            serde_json::json!({ "command": command(), "error": message }),
+                        );
+                    }
+                }
+                ToolOutput::Ok { .. } => {
+                    bus.emit_named(
+                        hook_names::TOOL_CALL_COMPLETED,
+                        serde_json::json!({ "tool": name, "duration_ms": duration_ms }),
+                    );
+                    if name == "bash" {
+                        bus.emit_named(
+                            hook_names::COMMAND_COMPLETED,
+                            serde_json::json!({ "command": command() }),
+                        );
+                    }
+                }
+            }
+        }
         if !output.is_error() {
             // The write landed, so the objects it creates now exist: grow
             // the index so a duplicate later this session conflicts even
@@ -272,11 +372,160 @@ impl ToolRegistry {
             if !pending_schema.is_empty() {
                 self.record_schema_objects(&pending_schema);
             }
-            if let Some((path, op)) = pending_op {
-                self.record_touch(path, op);
+            if let Some(pending) = pending_op {
+                self.record_touch(pending, pre_content, name, input, bus.as_ref());
             }
         }
         output
+    }
+
+    /// Run the `tool.call.requested` blocking chain. `Ok(None)`: allowed
+    /// unchanged. `Ok(Some(input))`: allowed with a policy-modified input.
+    /// `Err(output)`: denied or pending approval — the error the model sees
+    /// instead of a tool result. The chain receives the RAW input (the
+    /// interception point is privileged by design); observable events carry
+    /// only sanitized inputs.
+    fn gate_tool_call(
+        &self,
+        bus: &HookBus,
+        name: &str,
+        input: &Value,
+    ) -> Result<Option<Value>, ToolOutput> {
+        let outcome = bus.emit_blocking(HookEventDraft::new(
+            hook_names::TOOL_CALL_REQUESTED,
+            serde_json::json!({ "tool": name, "input": input }),
+        ));
+        match outcome.decision {
+            HookDecision::Deny { reason } => Err(ToolOutput::Error {
+                message: format!("`{name}` was denied by an extension policy: {reason}"),
+            }),
+            HookDecision::RequireApproval { reason } => Err(ToolOutput::Error {
+                message: format!("`{name}` requires approval before it can run: {reason}"),
+            }),
+            _ => {
+                if !outcome.modified {
+                    return Ok(None);
+                }
+                match outcome.event.payload.get("input") {
+                    Some(new_input) => Ok(Some(new_input.clone())),
+                    None => {
+                        // A `modify` that dropped the `input` field is a
+                        // broken policy handler — surface it, keep the
+                        // original input rather than executing garbage.
+                        bus.emit_named(
+                            hook_names::EXTENSION_ERROR,
+                            serde_json::json!({
+                                "failed_event": hook_names::TOOL_CALL_REQUESTED,
+                                "error": "modify decision dropped the `input` field; original input kept",
+                            }),
+                        );
+                        Ok(None)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Run the per-side-effect blocking chains and payload-hygiene
+    /// detectors for one already-final input: `sensitive_operation.detected`
+    /// and `secret.detected` observers first (an auditor sees the attempt
+    /// even when a policy then denies it), then the `file.*` chain for a
+    /// classified C/U/D op and the `command.started` chain for `bash`.
+    /// These chains gate — `modify` decisions are recorded but not honored
+    /// here, because the input was already final after
+    /// `tool.call.requested`. Reads are observable but never interceptable.
+    fn gate_side_effects(
+        &self,
+        bus: &HookBus,
+        name: &str,
+        input: &Value,
+        pending: Option<&PendingTouch>,
+    ) -> Result<(), ToolOutput> {
+        if let Some(pending) = pending {
+            if bus::is_sensitive_path(&pending.path) {
+                bus.emit_named(
+                    hook_names::SENSITIVE_OPERATION_DETECTED,
+                    serde_json::json!({
+                        "path": pending.path,
+                        "tool": name,
+                        "operation": pending.op.letter().to_string(),
+                    }),
+                );
+            }
+            if matches!(name, "write_file" | "edit_file") {
+                let proposed = input
+                    .get("content")
+                    .or_else(|| input.get("new_string"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let kinds = bus::scan_for_secrets(proposed);
+                if !kinds.is_empty() {
+                    bus.emit_named(
+                        hook_names::SECRET_DETECTED,
+                        serde_json::json!({
+                            "path": pending.path,
+                            "kinds": kinds.iter().map(|k| k.as_str()).collect::<Vec<_>>(),
+                        }),
+                    );
+                }
+            }
+            let event_name = match pending.op {
+                FileOp::Create => Some(hook_names::FILE_CREATED),
+                FileOp::Update => Some(hook_names::FILE_UPDATED),
+                FileOp::Delete => Some(hook_names::FILE_DELETED),
+                FileOp::Read => None,
+            };
+            if let Some(event_name) = event_name {
+                let outcome = bus.emit_blocking(HookEventDraft::new(
+                    event_name,
+                    serde_json::json!({
+                        "path": pending.path,
+                        "tool": name,
+                        "operation": pending.op.letter().to_string(),
+                    }),
+                ));
+                match outcome.decision {
+                    HookDecision::Deny { reason } => {
+                        return Err(ToolOutput::Error {
+                            message: format!(
+                                "`{name}` on `{}` was denied by an extension policy: {reason}",
+                                pending.path
+                            ),
+                        });
+                    }
+                    HookDecision::RequireApproval { reason } => {
+                        return Err(ToolOutput::Error {
+                            message: format!(
+                                "`{name}` on `{}` requires approval: {reason}",
+                                pending.path
+                            ),
+                        });
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if name == "bash" {
+            let command = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
+            let outcome = bus.emit_blocking(HookEventDraft::new(
+                hook_names::COMMAND_STARTED,
+                serde_json::json!({ "command": command }),
+            ));
+            match outcome.decision {
+                HookDecision::Deny { reason } => {
+                    return Err(ToolOutput::Error {
+                        message: format!("command was denied by an extension policy: {reason}"),
+                    });
+                }
+                HookDecision::RequireApproval { reason } => {
+                    return Err(ToolOutput::Error {
+                        message: format!("command requires approval: {reason}"),
+                    });
+                }
+                _ => {}
+            }
+        }
+        Ok(())
     }
 
     /// Merge just-created DDL objects into the schema index (lowercased —
@@ -294,20 +543,23 @@ impl ToolRegistry {
     }
 
     /// `[C|R|U|D]`-classify a call: reads → R, writes → C (new) or U
-    /// (existing), edits → U, deletes → D. `bash` is opaque — file ops done
-    /// through the shell aren't attributable, which is why the CRUD tools
-    /// exist and the prompt steers agents toward them.
-    fn classify_file_op(&self, tool: &str, input: &Value) -> Option<(String, FileOp)> {
-        let path = input.get("path").and_then(|v| v.as_str())?.to_string();
+    /// (existing), edits → U, deletes → D. The path is normalized to its
+    /// workspace-relative POSIX form here, so equivalent spellings
+    /// (`src/./a.rs`, `src/../src/a.rs`) aggregate into one ledger record;
+    /// escaping paths classify as `None` (the tool rejects them anyway).
+    /// `bash` is opaque — file ops done through the shell aren't
+    /// attributable, which is why the CRUD tools exist and the prompt steers
+    /// agents toward them.
+    fn classify_file_op(&self, tool: &str, input: &Value) -> Option<PendingTouch> {
+        let raw = input.get("path").and_then(|v| v.as_str())?;
+        let full = crate::resolve_within_root(&self.root, raw)?;
+        let path = normalize_workspace_path(&self.root, raw)?;
         let op = match tool {
             "read_file" => FileOp::Read,
             "edit_file" => FileOp::Update,
             "delete_file" => FileOp::Delete,
             "write_file" => {
-                let exists = crate::resolve_within_root(&self.root, &path)
-                    .map(|p| p.exists())
-                    .unwrap_or(false);
-                if exists {
+                if full.exists() {
                     FileOp::Update
                 } else {
                     FileOp::Create
@@ -315,38 +567,126 @@ impl ToolRegistry {
             }
             _ => return None,
         };
-        Some((path, op))
+        Some(PendingTouch { path, full, op })
     }
 
-    fn record_touch(&self, path: String, op: FileOp) {
-        let mut touched = self.touched.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some((_, ops)) = touched.iter_mut().find(|(p, _)| *p == path) {
-            if !ops.contains(&op) {
-                ops.push(op);
+    /// Record one SUCCESSFUL file touch: derive the event's line delta per
+    /// the counting rules (R: zero; C: full new line count; U: line diff of
+    /// pre vs post content; D: full pre-deletion line count), attach the
+    /// model-supplied `reason` (or a per-op default), and append it to the
+    /// ledger. The append and its aggregate updates happen under one lock,
+    /// so concurrent tool completions never lose or interleave an event.
+    ///
+    /// With a bus attached, the touch also emits its `file.*` fact event
+    /// (path + reason + line deltas, never contents) and a
+    /// `files_touched.updated` carrying the changed record plus the ledger
+    /// `revision` assigned under the lock — concurrent touches may deliver
+    /// out of order, but consumers keep the highest revision and stay
+    /// consistent.
+    fn record_touch(
+        &self,
+        pending: PendingTouch,
+        pre_content: Option<String>,
+        tool: &str,
+        input: &Value,
+        bus: Option<&HookBus>,
+    ) {
+        let reason = input
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .unwrap_or_else(|| default_reason(pending.op).to_string());
+        let (lines_added, lines_removed) = match pending.op {
+            FileOp::Read => (0, 0),
+            FileOp::Create => (
+                input
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .map(count_lines)
+                    .unwrap_or(0),
+                0,
+            ),
+            FileOp::Update => {
+                // write_file carries the post content in its input; edit_file
+                // landed it on disk (mutating tools are never parallelized —
+                // see the read_only partition test — so this read-back sees
+                // exactly what the edit wrote).
+                let post = match tool {
+                    "write_file" => input
+                        .get("content")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    _ => std::fs::read(&pending.full)
+                        .ok()
+                        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                        .unwrap_or_default(),
+                };
+                line_diff(pre_content.as_deref().unwrap_or(""), &post)
             }
-        } else {
-            touched.push((path, vec![op]));
+            FileOp::Delete => (0, pre_content.as_deref().map(count_lines).unwrap_or(0)),
+        };
+        let path = pending.path;
+        let (revision, record, total_files) = {
+            let mut touched = self.touched.lock().unwrap_or_else(|p| p.into_inner());
+            touched.record(
+                path.clone(),
+                FileTouchEvent {
+                    event: pending.op,
+                    reason: reason.clone(),
+                    lines_added,
+                    lines_removed,
+                },
+            );
+            (touched.revision(), touched.get(&path).cloned(), touched.len())
+        };
+        if let Some(bus) = bus {
+            let fact = match pending.op {
+                FileOp::Read => hook_names::FILE_READ,
+                FileOp::Create => hook_names::FILE_CREATED,
+                FileOp::Update => hook_names::FILE_UPDATED,
+                FileOp::Delete => hook_names::FILE_DELETED,
+            };
+            bus.emit_named(
+                fact,
+                serde_json::json!({
+                    "path": path,
+                    "reason": reason,
+                    "lines_added": lines_added,
+                    "lines_removed": lines_removed,
+                }),
+            );
+            bus.emit_named(
+                hook_names::FILES_TOUCHED_UPDATED,
+                serde_json::json!({
+                    "revision": revision,
+                    "path": path,
+                    "record": record,
+                    "total_files": total_files,
+                }),
+            );
         }
     }
 
     /// Snapshot of every file touched this session, insertion-ordered,
     /// with its ops as a compact CRUD string (e.g. `"RU"`).
     pub fn files_touched(&self) -> Vec<(String, String)> {
-        let touched = self.touched.lock().unwrap_or_else(|p| p.into_inner());
-        touched
-            .iter()
-            .map(|(path, ops)| {
-                let mut ordered = [FileOp::Create, FileOp::Read, FileOp::Update, FileOp::Delete]
-                    .into_iter()
-                    .filter(|op| ops.contains(op))
-                    .map(FileOp::letter)
-                    .collect::<String>();
-                if ordered.is_empty() {
-                    ordered.push('?');
-                }
-                (path.clone(), ordered)
-            })
-            .collect()
+        self.touched
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .compact()
+    }
+
+    /// The full session file-touch telemetry payload: per normalized path,
+    /// deduplicated CRUD events (first-occurrence order), line-delta totals,
+    /// and the complete ordered audit log.
+    pub fn file_touch_telemetry(&self) -> FileTouchTelemetry {
+        self.touched
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .snapshot()
     }
 
     /// Comma-separated sorted list of registered tool names, for error
@@ -381,6 +721,17 @@ impl ToolRegistry {
         index.tables = tables;
         index.types = types;
         index.views = views;
+    }
+}
+
+/// Fallback audit-log reason when the model omitted the tool's optional
+/// `reason` field — the schema requires a non-empty human-readable string.
+fn default_reason(op: FileOp) -> &'static str {
+    match op {
+        FileOp::Create => "file created (no reason given)",
+        FileOp::Read => "file read (no reason given)",
+        FileOp::Update => "file updated (no reason given)",
+        FileOp::Delete => "file deleted (no reason given)",
     }
 }
 
@@ -720,5 +1071,332 @@ mod tests {
             .await;
         assert!(!result.is_error());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- file-touch telemetry ----------------------------------------
+
+    /// Fresh registry over a fresh tempdir, no optional backends.
+    fn telemetry_fixture() -> (tempfile::TempDir, ToolRegistry) {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = ToolRegistry::with_issue_backend(dir.path().to_path_buf(), None);
+        (dir, reg)
+    }
+
+    async fn exec_ok(reg: &ToolRegistry, name: &str, input: serde_json::Value) {
+        let out = reg.execute(name, &input).await;
+        assert!(!out.is_error(), "{name} {input} failed: {out:?}");
+    }
+
+    #[tokio::test]
+    async fn touch_read_only_file_records_one_r_with_zero_deltas() {
+        let (dir, reg) = telemetry_fixture();
+        std::fs::write(dir.path().join("notes.txt"), "one\ntwo\n").unwrap();
+
+        exec_ok(&reg, "read_file", serde_json::json!({"path": "notes.txt"})).await;
+
+        let payload = reg.file_touch_telemetry();
+        payload.validate().unwrap();
+        assert_eq!(payload.files_touched.len(), 1);
+        let record = &payload.files_touched[0];
+        assert_eq!(record.path, "notes.txt");
+        assert_eq!(record.crud_events, vec![FileOp::Read]);
+        assert_eq!((record.lines_added, record.lines_removed), (0, 0));
+        assert_eq!(record.events.len(), 1);
+        assert_eq!(
+            (record.events[0].lines_added, record.events[0].lines_removed),
+            (0, 0)
+        );
+    }
+
+    #[tokio::test]
+    async fn touch_multiple_reads_are_one_record_with_multiple_events() {
+        let (dir, reg) = telemetry_fixture();
+        std::fs::write(dir.path().join("notes.txt"), "one\ntwo\n").unwrap();
+
+        for _ in 0..3 {
+            exec_ok(&reg, "read_file", serde_json::json!({"path": "notes.txt"})).await;
+        }
+
+        let payload = reg.file_touch_telemetry();
+        payload.validate().unwrap();
+        assert_eq!(payload.files_touched.len(), 1, "one record per file");
+        let record = &payload.files_touched[0];
+        assert_eq!(record.crud_events, vec![FileOp::Read], "crud deduplicated");
+        assert_eq!(record.events.len(), 3, "audit log never deduplicated");
+    }
+
+    #[tokio::test]
+    async fn touch_create_counts_the_new_files_full_line_count() {
+        let (_dir, reg) = telemetry_fixture();
+
+        exec_ok(
+            &reg,
+            "write_file",
+            serde_json::json!({"path": "src/new.rs", "content": "a\nb\nc\n"}),
+        )
+        .await;
+
+        let payload = reg.file_touch_telemetry();
+        payload.validate().unwrap();
+        let record = &payload.files_touched[0];
+        assert_eq!(record.path, "src/new.rs");
+        assert_eq!(record.crud_events, vec![FileOp::Create]);
+        assert_eq!((record.lines_added, record.lines_removed), (3, 0));
+    }
+
+    #[tokio::test]
+    async fn touch_update_counts_the_line_diff() {
+        let (dir, reg) = telemetry_fixture();
+        std::fs::write(dir.path().join("code.rs"), "a\nb\nc\n").unwrap();
+
+        // edit_file: "b" becomes two lines — +2 −1.
+        exec_ok(
+            &reg,
+            "edit_file",
+            serde_json::json!({"path": "code.rs", "old_string": "b", "new_string": "x\ny"}),
+        )
+        .await;
+        // write_file over an existing file is also an update — the diff of
+        // pre vs post, not the full content: "a\nx\ny\nc\n" → "a\nc\n" is −2.
+        exec_ok(
+            &reg,
+            "write_file",
+            serde_json::json!({"path": "code.rs", "content": "a\nc\n"}),
+        )
+        .await;
+
+        let payload = reg.file_touch_telemetry();
+        payload.validate().unwrap();
+        let record = &payload.files_touched[0];
+        assert_eq!(record.crud_events, vec![FileOp::Update]);
+        assert_eq!(record.events.len(), 2);
+        assert_eq!(
+            (record.events[0].lines_added, record.events[0].lines_removed),
+            (2, 1)
+        );
+        assert_eq!(
+            (record.events[1].lines_added, record.events[1].lines_removed),
+            (0, 2)
+        );
+        assert_eq!((record.lines_added, record.lines_removed), (2, 3));
+    }
+
+    #[tokio::test]
+    async fn touch_delete_counts_the_full_pre_deletion_line_count() {
+        let (dir, reg) = telemetry_fixture();
+        std::fs::write(dir.path().join("doomed.txt"), "1\n2\n3\n4\n5\n").unwrap();
+
+        exec_ok(
+            &reg,
+            "delete_file",
+            serde_json::json!({"path": "doomed.txt"}),
+        )
+        .await;
+
+        let payload = reg.file_touch_telemetry();
+        payload.validate().unwrap();
+        let record = &payload.files_touched[0];
+        assert_eq!(record.crud_events, vec![FileOp::Delete]);
+        assert_eq!((record.lines_added, record.lines_removed), (0, 5));
+    }
+
+    #[tokio::test]
+    async fn touch_read_update_delete_keeps_order_and_dedupes_crud() {
+        let (dir, reg) = telemetry_fixture();
+        std::fs::write(dir.path().join("f.rs"), "a\nb\nc\n").unwrap();
+
+        exec_ok(
+            &reg,
+            "read_file",
+            serde_json::json!({"path": "f.rs", "reason": "inspect before edit"}),
+        )
+        .await;
+        exec_ok(
+            &reg,
+            "edit_file",
+            serde_json::json!({
+                "path": "f.rs", "old_string": "b", "new_string": "x\ny",
+                "reason": "split b into x and y"
+            }),
+        )
+        .await;
+        exec_ok(
+            &reg,
+            "delete_file",
+            serde_json::json!({"path": "f.rs", "reason": "no longer needed"}),
+        )
+        .await;
+
+        let payload = reg.file_touch_telemetry();
+        payload.validate().unwrap();
+        assert_eq!(payload.files_touched.len(), 1);
+        let record = &payload.files_touched[0];
+        assert_eq!(
+            record.crud_events,
+            vec![FileOp::Read, FileOp::Update, FileOp::Delete],
+            "deduplicated, first-occurrence order"
+        );
+        let ops: Vec<FileOp> = record.events.iter().map(|e| e.event).collect();
+        assert_eq!(ops, vec![FileOp::Read, FileOp::Update, FileOp::Delete]);
+        let reasons: Vec<&str> = record.events.iter().map(|e| e.reason.as_str()).collect();
+        assert_eq!(
+            reasons,
+            vec![
+                "inspect before edit",
+                "split b into x and y",
+                "no longer needed"
+            ]
+        );
+        // R: 0/0. U: +2 −1. D: −4 (the post-edit file "a\nx\ny\nc\n").
+        assert_eq!((record.lines_added, record.lines_removed), (2, 5));
+    }
+
+    #[tokio::test]
+    async fn touch_equivalent_path_spellings_aggregate_into_one_record() {
+        let (dir, reg) = telemetry_fixture();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+
+        for spelling in [
+            "src/main.rs",
+            "src/./main.rs",
+            "src/../src/main.rs",
+            "./src/main.rs",
+        ] {
+            exec_ok(&reg, "read_file", serde_json::json!({"path": spelling})).await;
+        }
+
+        let payload = reg.file_touch_telemetry();
+        payload.validate().unwrap();
+        assert_eq!(
+            payload.files_touched.len(),
+            1,
+            "equivalent spellings must aggregate: {payload:?}"
+        );
+        let record = &payload.files_touched[0];
+        assert_eq!(record.path, "src/main.rs");
+        assert_eq!(record.events.len(), 4);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn touch_concurrent_tools_lose_no_events_and_keep_totals_exact() {
+        let (dir, reg) = telemetry_fixture();
+        for i in 0..4 {
+            std::fs::write(dir.path().join(format!("read{i}.txt")), "x\n").unwrap();
+        }
+        let reg = std::sync::Arc::new(reg);
+
+        let mut handles = Vec::new();
+        // 32 concurrent reads across 4 files (read-only tools are the ones
+        // the engine actually parallelizes)...
+        for i in 0..32 {
+            let reg = reg.clone();
+            handles.push(tokio::spawn(async move {
+                let input = serde_json::json!({"path": format!("read{}.txt", i % 4)});
+                let out = reg.execute("read_file", &input).await;
+                assert!(!out.is_error(), "{out:?}");
+            }));
+        }
+        // ...plus 8 concurrent creates of distinct files.
+        for i in 0..8 {
+            let reg = reg.clone();
+            handles.push(tokio::spawn(async move {
+                let input = serde_json::json!({
+                    "path": format!("new{i}.txt"),
+                    "content": "l1\nl2\n"
+                });
+                let out = reg.execute("write_file", &input).await;
+                assert!(!out.is_error(), "{out:?}");
+            }));
+        }
+        for handle in handles {
+            handle.await.unwrap();
+        }
+
+        let payload = reg.file_touch_telemetry();
+        payload.validate().unwrap();
+        assert_eq!(payload.files_touched.len(), 12, "4 read + 8 created files");
+        let mut read_events = 0;
+        let mut created_lines = 0;
+        for record in &payload.files_touched {
+            if record.path.starts_with("read") {
+                assert_eq!(record.crud_events, vec![FileOp::Read]);
+                read_events += record.events.len();
+            } else {
+                assert_eq!(record.crud_events, vec![FileOp::Create]);
+                assert_eq!(record.events.len(), 1);
+                created_lines += record.lines_added;
+            }
+        }
+        assert_eq!(read_events, 32, "no read event may be lost");
+        assert_eq!(created_lines, 16, "8 files × 2 lines");
+    }
+
+    #[tokio::test]
+    async fn touch_failed_operations_record_nothing() {
+        let (dir, reg) = telemetry_fixture();
+        std::fs::write(dir.path().join("f.rs"), "a\n").unwrap();
+
+        // Missing file, escaping path, and a failed edit precondition.
+        for (tool, input) in [
+            ("read_file", serde_json::json!({"path": "ghost.txt"})),
+            ("read_file", serde_json::json!({"path": "../../etc/passwd"})),
+            ("delete_file", serde_json::json!({"path": "ghost.txt"})),
+            (
+                "edit_file",
+                serde_json::json!({"path": "f.rs", "old_string": "nope", "new_string": "x"}),
+            ),
+        ] {
+            let out = reg.execute(tool, &input).await;
+            assert!(out.is_error(), "{tool} {input} should fail");
+        }
+
+        assert!(
+            reg.file_touch_telemetry().files_touched.is_empty(),
+            "failed operations must not create CRUD events"
+        );
+    }
+
+    #[tokio::test]
+    async fn touch_reason_defaults_when_omitted() {
+        let (dir, reg) = telemetry_fixture();
+        std::fs::write(dir.path().join("f.rs"), "a\n").unwrap();
+
+        exec_ok(&reg, "read_file", serde_json::json!({"path": "f.rs"})).await;
+
+        let payload = reg.file_touch_telemetry();
+        payload.validate().unwrap();
+        let event = &payload.files_touched[0].events[0];
+        assert!(
+            !event.reason.is_empty(),
+            "schema requires a non-empty reason"
+        );
+    }
+
+    #[tokio::test]
+    async fn files_touched_compact_view_still_uses_crud_display_order() {
+        // The legacy (path, "RU") view feeds the TUI panel and episodic
+        // memory: letters stay in C,R,U,D display order even though the
+        // telemetry payload orders by first occurrence.
+        let (dir, reg) = telemetry_fixture();
+        std::fs::write(dir.path().join("f.rs"), "a\nb\n").unwrap();
+
+        exec_ok(
+            &reg,
+            "edit_file",
+            serde_json::json!({"path": "f.rs", "old_string": "a", "new_string": "z"}),
+        )
+        .await;
+        exec_ok(&reg, "read_file", serde_json::json!({"path": "f.rs"})).await;
+
+        assert_eq!(
+            reg.files_touched(),
+            vec![("f.rs".to_string(), "RU".to_string())]
+        );
+        assert_eq!(
+            reg.file_touch_telemetry().files_touched[0].crud_events,
+            vec![FileOp::Update, FileOp::Read],
+            "payload keeps first-occurrence order"
+        );
     }
 }

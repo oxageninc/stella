@@ -13,6 +13,7 @@ pub mod delete;
 pub mod edit;
 pub mod exec;
 pub mod exploration;
+pub mod file_touch;
 pub mod glob;
 pub mod graph;
 pub mod grep;

@@ -9,6 +9,7 @@
 //! (`02-architecture.md` §1.3).
 
 pub mod budget;
+pub mod bus;
 pub mod compaction;
 pub mod driver;
 pub mod estimator;
@@ -25,6 +26,10 @@ pub mod rules;
 pub mod skills;
 
 pub use budget::{BudgetGuard, BudgetOutcome};
+// `bus::HookEvent` (the extension-bus envelope) stays module-qualified: the
+// crate root already exports `hooks::HookEvent` (the shell-hook lifecycle
+// enum) and the two must never be confused at a glance.
+pub use bus::{ExtensionFailure, HookBus, HookDecision, HookEventDraft, HookSubscription, PolicyOutcome};
 pub use driver::{Engine, EngineConfig, TurnOutcome};
 pub use estimator::{Calibration, CalibrationMap};
 pub use extensions::{

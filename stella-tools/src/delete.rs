@@ -20,7 +20,8 @@ impl Tool for DeleteFile {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "Workspace-relative path" }
+                    "path": { "type": "string", "description": "Workspace-relative path" },
+                    "reason": { "type": "string", "description": "Why you are deleting this file — recorded in the session's file-touch audit log" }
                 },
                 "required": ["path"]
             }),

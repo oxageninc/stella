@@ -18,7 +18,8 @@ impl Tool for WriteFile {
                 "type": "object",
                 "properties": {
                     "path": { "type": "string", "description": "File path relative to workspace root" },
-                    "content": { "type": "string", "description": "Full file content to write" }
+                    "content": { "type": "string", "description": "Full file content to write" },
+                    "reason": { "type": "string", "description": "Why you are creating/overwriting this file — recorded in the session's file-touch audit log" }
                 },
                 "required": ["path", "content"]
             }),
