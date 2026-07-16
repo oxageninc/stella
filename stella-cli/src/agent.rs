@@ -1172,21 +1172,22 @@ async fn build_code_graph(workspace_root: &std::path::Path, emit: &mut dyn FnMut
     // watch.rs). `emit` stays on this side of the boundary: the only
     // pre-completion line is the one above.
     let root = workspace_root.to_path_buf();
-    let outcome = tokio::task::spawn_blocking(move || {
-        match stella_graph::CodeGraph::open(&root, &db_path) {
-            Ok(graph) => match graph.index_all() {
-                Ok(stats) => {
-                    graph.shutdown();
-                    Ok(stats)
-                }
-                Err(e) => Err(format!(
-                    "! code-graph indexing failed: {e} — run `stella init` again to retry"
-                )),
+    let outcome =
+        tokio::task::spawn_blocking(
+            move || match stella_graph::CodeGraph::open(&root, &db_path) {
+                Ok(graph) => match graph.index_all() {
+                    Ok(stats) => {
+                        graph.shutdown();
+                        Ok(stats)
+                    }
+                    Err(e) => Err(format!(
+                        "! code-graph indexing failed: {e} — run `stella init` again to retry"
+                    )),
+                },
+                Err(e) => Err(format!("! code-graph store unavailable: {e} — skipped")),
             },
-            Err(e) => Err(format!("! code-graph store unavailable: {e} — skipped")),
-        }
-    })
-    .await;
+        )
+        .await;
     match outcome {
         Ok(Ok(stats)) => {
             emit(format!(
