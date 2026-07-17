@@ -118,6 +118,11 @@ Rules:
 /// the prompt cache on every call, so they must stay dense.
 const MEMORY_PROMPT_BUDGET_CHARS: usize = 16_000;
 
+/// A/B recall measurement rate (Proposal 4): `1/N` turns suppress recall
+/// entirely so the outcome can be compared against recalled turns. 10 means
+/// ~10% of turns are control turns. 0 disables the A/B mechanism.
+const STELLA_AB_RECALL_RATE: u32 = 10;
+
 /// Assemble the session's system prompt from a `base` instruction set plus
 /// the workspace's saved memories and the workspace rules section (Tier 1
 /// soft adherence, `stella_core::rules`). Both are loaded ONCE per session
@@ -459,8 +464,13 @@ async fn run_pipeline_one_shot(
         && turn_warrants_reflection(&messages)
         && let Some(m) = &mut memory
     {
-        m.reflect_and_record(resolver.provider(), &messages, format != OutputFormat::Text)
-            .await;
+        m.reflect_and_record(
+            resolver.provider(),
+            &messages,
+            format != OutputFormat::Text,
+            result.is_ok(),
+        )
+        .await;
     }
 
     if let Some(set) = &mcp {
@@ -835,7 +845,7 @@ async fn run_raw_one_shot(
         && turn_warrants_reflection(&messages)
         && let Some(m) = &mut memory
     {
-        m.reflect_and_record(&*provider, &messages, format != OutputFormat::Text)
+        m.reflect_and_record(&*provider, &messages, format != OutputFormat::Text, true)
             .await;
     }
     if let Some(set) = &mcp {
@@ -929,7 +939,8 @@ pub async fn run_goal_cmd(
         && turn_warrants_reflection(&messages)
         && let Some(m) = &mut memory
     {
-        m.reflect_and_record(&*provider, &messages, false).await;
+        m.reflect_and_record(&*provider, &messages, false, true)
+            .await;
     }
     if let Some(set) = &mcp {
         set.close_all().await;
@@ -1163,7 +1174,8 @@ pub async fn run_interactive(cfg: &Config, budget_limit: Option<f64>) -> Result<
             } else if turn_warrants_reflection(&messages[turn_start..])
                 && let Some(m) = &mut memory
             {
-                m.reflect_and_record(&*provider, &messages, false).await;
+                m.reflect_and_record(&*provider, &messages, false, true)
+                    .await;
             }
             continue;
         }
@@ -1183,7 +1195,11 @@ pub async fn run_interactive(cfg: &Config, budget_limit: Option<f64>) -> Result<
         messages.push(CompletionMessage::user(input));
         println!();
 
-        if let Some(m) = &memory {
+        if let Some(m) = &mut memory {
+            // Proposal 4: A/B recall measurement — on ~1/10 turns (the A/B
+            // rate), suppress recall so the outcome is comparable to recalled
+            // turns. The suppressed flag rides with the turn for attribution.
+            m.maybe_suppress_recall(STELLA_AB_RECALL_RATE);
             let block = m.recall_block(input).await;
             inject_recall_block(&mut messages, block);
         }
@@ -1223,7 +1239,8 @@ pub async fn run_interactive(cfg: &Config, budget_limit: Option<f64>) -> Result<
         } else if turn_warrants_reflection(&messages[turn_start..])
             && let Some(m) = &mut memory
         {
-            m.reflect_and_record(&*provider, &messages, false).await;
+            m.reflect_and_record(&*provider, &messages, false, true)
+                .await;
         }
     }
 
@@ -1262,8 +1279,20 @@ pub(crate) async fn record_turn_episode(
     } else {
         EpisodeOutcome::Failure
     };
-    m.record_episode(prompt, episode_outcome, &turn_files, started_unix)
-        .await;
+    // Proposal 4: tag the episode summary when recall was suppressed (A/B
+    // control turn) so future analysis can compare recalled vs control.
+    let ab_tag = if m.recall_was_suppressed() {
+        " [ab-control]"
+    } else {
+        ""
+    };
+    m.record_episode(
+        &format!("{prompt}{ab_tag}"),
+        episode_outcome,
+        &turn_files,
+        started_unix,
+    )
+    .await;
 }
 
 /// Build the workspace code-graph index into `.stella/codegraph.db` (the

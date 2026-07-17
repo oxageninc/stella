@@ -12,7 +12,7 @@
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
-use ratatui::text::{Line, Span};
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget, Wrap};
 
 use crate::deck::WorkspaceModel;
@@ -396,9 +396,10 @@ fn render_edit_overlay(name: &str, buffer: &str, area: Rect, buf: &mut Buffer) {
 }
 
 /// The ctrl+o markdown preview: a large centered popup with the skill's
-/// `SKILL.md` rendered via `tui-markdown` and scrolled vertically. A `None`
-/// body renders a loading state; the scroll offset is clamped to content here
-/// (the key handler only increments it).
+/// `SKILL.md` rendered through Stella's own theme-obeying markdown renderer
+/// (the same one the transcript uses) and scrolled vertically. A `None` body
+/// renders a loading state; the scroll offset is clamped to content here (the
+/// key handler only increments it).
 fn render_preview(ui: &mut DeckUi, area: Rect, buf: &mut Buffer) {
     let Some(preview) = ui.skills.preview.as_mut() else {
         return;
@@ -441,9 +442,11 @@ fn render_preview(ui: &mut DeckUi, area: Rect, buf: &mut Buffer) {
                 .render(centered_row(body_area), buf);
         }
         Some(body) => {
-            // Render the markdown to styled `Text`, then scroll it. The offset
-            // is clamped to raw line count so the last page stays reachable.
-            let text = tui_markdown::from_str(&body);
+            // Render the markdown through Stella's own renderer so the preview
+            // stays inside the ember palette — no external crate's baby-blue
+            // headings, H1 background, or code-block fill. Then scroll it; the
+            // offset is clamped to line count so the last page stays reachable.
+            let text = Text::from(crate::markdown::render(&body));
             let content_h = text.height();
             let max_scroll = content_h.saturating_sub(body_area.height as usize) as u16;
             let scroll = preview.scroll.min(max_scroll);
