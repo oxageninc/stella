@@ -77,7 +77,7 @@ falls back to `cargo install` when no prebuilt binary matches your platform.
 **Homebrew:**
 
 ```bash
-brew install macanderson/stella/stella
+brew install macanderson/tap/stella
 ```
 
 To build from source via Homebrew:
