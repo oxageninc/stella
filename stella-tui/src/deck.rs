@@ -369,6 +369,7 @@ impl WorkspaceModel {
             | Inbound::AgentsList { .. }
             | Inbound::Skills(_)
             | Inbound::SkillSearch { .. }
+            | Inbound::SkillPreview { .. }
             | Inbound::McpServers(_)
             | Inbound::McpSearchResults(_) => {}
         }
