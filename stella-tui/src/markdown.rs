@@ -257,15 +257,35 @@ fn strip_numbered(lead: &str) -> Option<&str> {
 }
 
 /// Build a heading line with level-appropriate styling.
+///
+/// The hierarchy is gold → gold → white, all bold:
+/// * **H1** is a filled ember-gold pill — near-black [`theme::GROUND`] text on
+///   an [`theme::EMBER_GOLD`] background, with a space of padding each side so
+///   it reads as a solid title bar. This is the deliberate high-contrast
+///   replacement for the old washed-out heading (and, in the skill preview,
+///   the unreadable baby-blue-behind-white that `tui-markdown` used to draw).
+/// * **H2** is bold ember-gold text (no fill).
+/// * **H3+** is bold primary-ink text.
 fn heading_line(content: &str, level: usize) -> Line<'static> {
-    let prefix = match level {
-        1 => "◆ ",
-        2 => "◈ ",
-        _ => "· ",
-    };
-    let style = match level {
-        1 | 2 => theme::heading(),
-        _ => Style::new().fg(theme::INK).add_modifier(Modifier::BOLD),
+    if level == 1 {
+        // One span so the gold fill is a single unbroken pill behind the text.
+        let pill = Style::new()
+            .bg(theme::EMBER_GOLD)
+            .fg(theme::GROUND)
+            .add_modifier(Modifier::BOLD);
+        return Line::from(Span::styled(format!(" ◆ {content} "), pill));
+    }
+    let (prefix, style) = match level {
+        2 => (
+            "◈ ",
+            Style::new()
+                .fg(theme::EMBER_GOLD)
+                .add_modifier(Modifier::BOLD),
+        ),
+        _ => (
+            "· ",
+            Style::new().fg(theme::INK).add_modifier(Modifier::BOLD),
+        ),
     };
     Line::from(vec![
         Span::styled(prefix.to_string(), style),
@@ -380,9 +400,47 @@ mod tests {
                 "heading is bold"
             );
         }
-        assert_eq!(collect_spans_text(&lines[0]), "\u{25c6} Title");
+        // H1 is a padded pill; H2/H3 keep their glyph prefixes.
+        assert_eq!(collect_spans_text(&lines[0]), " \u{25c6} Title ");
         assert_eq!(collect_spans_text(&lines[1]), "\u{25c8} Subtitle");
         assert_eq!(collect_spans_text(&lines[2]), "\u{b7} Section");
+    }
+
+    #[test]
+    fn h1_is_a_high_contrast_gold_pill() {
+        // The exact fix the user asked for: the H1 must be a bold, filled,
+        // high-contrast bar — near-black ink on ember gold — never washed-out
+        // or a light-text-on-pale-background combination.
+        let lines = render("# Rust Async Patterns");
+        let span = &lines[0].spans[0];
+        assert_eq!(span.style.bg, Some(theme::EMBER_GOLD), "gold fill");
+        assert_eq!(span.style.fg, Some(theme::GROUND), "near-black text");
+        assert!(span.style.add_modifier.contains(Modifier::BOLD), "bold");
+    }
+
+    #[test]
+    fn no_baby_blue_cyan_in_rendered_markdown() {
+        // Links used to render in the cool cyan `RUN`; that token is now violet,
+        // so nothing markdown emits should carry the old baby-blue values.
+        const OLD_CYANS: [ratatui::style::Color; 2] = [
+            ratatui::style::Color::Rgb(0x60, 0xBF, 0xD6),
+            ratatui::style::Color::Rgb(126, 197, 214),
+        ];
+        let lines = render(
+            "# Heading\n\nBody with a [link](https://example.com) and `code`.\n\n```\nlet n = 42;\n```",
+        );
+        for line in &lines {
+            for span in &line.spans {
+                assert!(
+                    !OLD_CYANS.contains(&span.style.fg.unwrap_or(ratatui::style::Color::Reset)),
+                    "a span still uses a baby-blue fg"
+                );
+                assert!(
+                    !OLD_CYANS.contains(&span.style.bg.unwrap_or(ratatui::style::Color::Reset)),
+                    "a span still uses a baby-blue bg"
+                );
+            }
+        }
     }
 
     #[test]

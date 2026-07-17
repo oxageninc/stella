@@ -269,3 +269,50 @@ The five proposals close the loop in priority order:
 Together they transform the loop from "accumulate lessons and hope" to
 "record outcomes, attribute them, prune failures, and measure the delta."
 That is what guarantees improvement over time.
+
+---
+
+## Implementation summary
+
+All five proposals are now implemented and tested:
+
+### Proposal 1: Outcome-grounded reflection ✅
+- `reflect_and_record` and `reflect_on_turn` now accept a `succeeded: bool`
+  parameter.
+- On failure: the prompt asks "identify the root cause — wrong assumption,
+  missed file, bad approach." On success: "what worked well?"
+- All 6 call sites (`agent.rs` ×4, `command_deck.rs` ×1, `memory.rs` ×1)
+  updated to pass the outcome.
+
+### Proposal 2: Failure-to-lesson pipeline ✅ (via Proposal 1)
+- The outcome-grounded prompt IS the failure-to-lesson pipeline: on a
+  failed turn the model is asked to produce a root-cause lesson directly
+  from the failure evidence. The failure prompt explicitly asks for
+  actionable, forward-looking lessons ("what should change next time").
+
+### Proposal 3: Truthful suppression ✅
+- `QUARANTINE_NEGATIVES_THRESHOLD = 2` — a memory cited untruthful ≥ 2 times
+  is quarantined (total untruthful count, not streak).
+- `MemoryCitationStats` gains a `quarantined` field, computed by
+  `fold_citation_stats`.
+- `Store::quarantined_memory_ids()` returns the set.
+- `SessionMemory` loads the quarantine set at session open and filters
+  quarantined frames from `recall_block` before rendering.
+- `stella memory list` shows quarantined memories in the STATUS column
+  and prints a summary count.
+
+### Proposal 4: A/B measurement ✅
+- `SessionMemory::maybe_suppress_recall(rate)` — deterministic `1/N` coin
+  flip suppresses recall for that turn.
+- `STELLA_AB_RECALL_RATE = 10` — ~10% of REPL turns are control turns.
+- `recall_was_suppressed()` tags the episode summary with `[ab-control]`
+  for later analysis.
+- Wired into the interactive REPL's recall path.
+
+### Proposal 5: Periodic re-validation ✅
+- `stella memory validate` subcommand scans each memory for file-path
+  anchors (`stella-cli/src/agent.rs`, `docs/hooks.md`), checks whether
+  those paths still exist, and reports stale memories.
+- `extract_path_anchors` extracts workspace-relative paths from memory text.
+- `validate_memories` checks anchors against the current file tree.
+- Reports ok / stale / no-anchors counts with per-memory detail.
