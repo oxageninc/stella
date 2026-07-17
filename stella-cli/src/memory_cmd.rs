@@ -41,7 +41,13 @@ struct MemoryListRow {
     truthful_rate: f64,
     positive_streak: i64,
     eligible: bool,
+    #[serde(skip_serializing_if = "is_false")]
+    quarantined: bool,
     memory: String,
+}
+
+fn is_false(b: &bool) -> bool {
+    !b
 }
 
 /// Entry point for `stella memory list`.

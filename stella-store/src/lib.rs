@@ -169,6 +169,15 @@ pub const POSITIVE_SCORE_MIN: i64 = 3;
 /// is not enough).
 pub const PROMOTION_CITATIONS_REQUIRED: i64 = 10;
 
+/// A memory cited untruthful this many times (total, across its history) is
+/// quarantined: excluded from recall entirely until a human reviews it or it
+/// is re-cited as truthful. The threshold is deliberately low (2) because an
+/// untruthful memory is active harm — it misleads future turns. Every
+/// untruthful citation counts regardless of score, and one fresh truthful
+/// citation does NOT clear quarantine — only `stella memory unquarantine`
+/// (or deleting the stale memory) does.
+pub const QUARANTINE_NEGATIVES_THRESHOLD: i64 = 2;
+
 /// Per-memory citation aggregate — the data behind `stella memory` and the
 /// rule-promotion eligibility gate.
 ///
@@ -194,6 +203,11 @@ pub struct MemoryCitationStats {
     pub positive_streak: i64,
     /// `positive_streak > PROMOTION_CITATIONS_REQUIRED` — the promotion gate.
     pub eligible: bool,
+    /// Whether this memory is quarantined from recall: `negatives >=
+    /// QUARANTINE_NEGATIVES_THRESHOLD`. A quarantined memory is excluded
+    /// from recall entirely — it is active harm to surface a memory multiple
+    /// agents verified as wrong. Only `stella memory unquarantine` clears it.
+    pub quarantined: bool,
 }
 
 /// One MCP tool call, ready to persist: which server + tool, an optional
@@ -1190,6 +1204,21 @@ impl Store {
         Ok(stats)
     }
 
+    /// The public ids (`nod_…`) of memories that are quarantined from recall:
+    /// cited untruthful at least [`QUARANTINE_NEGATIVES_THRESHOLD`] times.
+    /// These are excluded from the recall block so a stale/wrong memory that
+    /// multiple agents verified as false stops misleading future turns.
+    /// Best-effort: a query failure returns an empty set (recall proceeds
+    /// unfiltered rather than failing).
+    pub fn quarantined_memory_ids(&self) -> std::collections::HashSet<String> {
+        self.memory_citation_stats()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|s| s.quarantined)
+            .map(|s| s.memory_id)
+            .collect()
+    }
+
     /// Persist the MCP tool calls recorded during an execution: one row per
     /// call, in drain order. `seq` (the batch index) with UNIQUE
     /// (execution_id, seq) makes re-persisting the same drained batch an error
@@ -1537,6 +1566,7 @@ pub fn fold_citation_stats(rows: &[MemoryCitationRow]) -> Vec<MemoryCitationStat
                 negatives: 0,
                 positive_streak: 0,
                 eligible: false,
+                quarantined: false,
             });
         }
         // `stats` is non-empty from here on (a fresh group just pushed).
@@ -1553,6 +1583,7 @@ pub fn fold_citation_stats(rows: &[MemoryCitationRow]) -> Vec<MemoryCitationStat
         entry.avg_score = score_sum as f64 / entry.citations as f64;
         entry.truthful_rate = truthful_count as f64 / entry.citations as f64;
         entry.eligible = entry.positive_streak > PROMOTION_CITATIONS_REQUIRED;
+        entry.quarantined = entry.negatives >= QUARANTINE_NEGATIVES_THRESHOLD;
     }
     stats
 }
@@ -1811,6 +1842,35 @@ mod tests {
             s.eligible,
             "the streak since the last negative is what gates"
         );
+    }
+
+    #[test]
+    fn quarantine_triggers_at_two_untruthful_citations() {
+        // One untruthful citation does not quarantine — it's a signal but
+        // the memory might have been judged wrong in one context.
+        let one_neg = vec![
+            citation("nod_x", 4, true, "held"),
+            citation("nod_x", 2, false, "stale path"),
+        ];
+        assert!(!fold_citation_stats(&one_neg)[0].quarantined);
+
+        // Two untruthful citations quarantine regardless of score.
+        let two_neg = vec![
+            citation("nod_x", 4, true, "held"),
+            citation("nod_x", 5, false, "stale"),
+            citation("nod_x", 3, false, "also stale"),
+        ];
+        let s = &fold_citation_stats(&two_neg)[0];
+        assert!(s.quarantined, "two negatives must quarantine");
+        assert_eq!(s.negatives, 2);
+
+        // A low score (truthful) is negative for promotion but does NOT
+        // count toward quarantine — quarantine is about untruthfulness.
+        let low_scores = vec![
+            citation("nod_x", 1, true, "wasted"),
+            citation("nod_x", 1, true, "wasted again"),
+        ];
+        assert!(!fold_citation_stats(&low_scores)[0].quarantined);
     }
 
     #[test]

@@ -459,8 +459,13 @@ async fn run_pipeline_one_shot(
         && turn_warrants_reflection(&messages)
         && let Some(m) = &mut memory
     {
-        m.reflect_and_record(resolver.provider(), &messages, format != OutputFormat::Text)
-            .await;
+        m.reflect_and_record(
+            resolver.provider(),
+            &messages,
+            format != OutputFormat::Text,
+            result.is_ok(),
+        )
+        .await;
     }
 
     if let Some(set) = &mcp {
@@ -835,7 +840,7 @@ async fn run_raw_one_shot(
         && turn_warrants_reflection(&messages)
         && let Some(m) = &mut memory
     {
-        m.reflect_and_record(&*provider, &messages, format != OutputFormat::Text)
+        m.reflect_and_record(&*provider, &messages, format != OutputFormat::Text, true)
             .await;
     }
     if let Some(set) = &mcp {
@@ -929,7 +934,7 @@ pub async fn run_goal_cmd(
         && turn_warrants_reflection(&messages)
         && let Some(m) = &mut memory
     {
-        m.reflect_and_record(&*provider, &messages, false).await;
+        m.reflect_and_record(&*provider, &messages, false, true).await;
     }
     if let Some(set) = &mcp {
         set.close_all().await;
@@ -1163,7 +1168,7 @@ pub async fn run_interactive(cfg: &Config, budget_limit: Option<f64>) -> Result<
             } else if turn_warrants_reflection(&messages[turn_start..])
                 && let Some(m) = &mut memory
             {
-                m.reflect_and_record(&*provider, &messages, false).await;
+                m.reflect_and_record(&*provider, &messages, false, true).await;
             }
             continue;
         }
@@ -1223,7 +1228,7 @@ pub async fn run_interactive(cfg: &Config, budget_limit: Option<f64>) -> Result<
         } else if turn_warrants_reflection(&messages[turn_start..])
             && let Some(m) = &mut memory
         {
-            m.reflect_and_record(&*provider, &messages, false).await;
+            m.reflect_and_record(&*provider, &messages, false, true).await;
         }
     }
 

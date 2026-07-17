@@ -810,7 +810,7 @@ pub async fn run_deck_session(
                     && turn_warrants_reflection(&messages[reflect_start..])
                     && let Some(m) = &mut memory
                 {
-                    m.reflect_and_record(&*provider, &messages, true).await;
+                    m.reflect_and_record(&*provider, &messages, true, true).await;
                 }
             }
             TurnEnd::Cancelled { hold } => {
@@ -1331,10 +1331,10 @@ fn parse_skill_hits(out: &str) -> Vec<SkillSearchHit> {
         }
         // A URL continuation line belongs to the hit just above it.
         if let Some(url) = skill_url_in(line) {
-            if let Some(last) = hits.last_mut() {
-                if last.url.is_empty() {
-                    last.url = url;
-                }
+            if let Some(last) = hits.last_mut()
+                && last.url.is_empty()
+            {
+                last.url = url;
             }
             continue;
         }
