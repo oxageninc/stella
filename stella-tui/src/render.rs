@@ -765,7 +765,17 @@ fn wrap_one_indent(
         let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
         if current_w + cw > content_width && !current.is_empty() {
             if let Some(space_idx) = current.iter().rposition(|(c, _)| *c == ' ') {
-                let remainder: Vec<(char, Style)> = current.split_off(space_idx);
+                let mut remainder: Vec<(char, Style)> = current.split_off(space_idx);
+                // Consume the wrap-boundary whitespace so the continuation line
+                // starts flush at the indent column. Left in place, the leading
+                // space stacks on top of `indent` and pushes every wrapped row
+                // one column right of the clean left edge — the "extra blank
+                // space after the colon" bug.
+                let lead = remainder
+                    .iter()
+                    .take_while(|(c, _)| *c == ' ')
+                    .count();
+                remainder.drain(..lead);
                 flush(&mut current, is_first, out);
                 is_first = false;
                 current = remainder;
