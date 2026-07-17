@@ -313,7 +313,9 @@ pub fn run_memory_validate() -> Result<(), String> {
 /// one slash and a recognized source extension, e.g. `stella-cli/src/agent.rs`,
 /// `src/lib.rs`, `docs/hooks.md`.
 fn extract_path_anchors(text: &str) -> Vec<String> {
-    let exts = ["rs", "py", "ts", "tsx", "js", "jsx", "go", "md", "sql", "toml"];
+    let exts = [
+        "rs", "py", "ts", "tsx", "js", "jsx", "go", "md", "sql", "toml",
+    ];
     text.split(|c: char| !c.is_alphanumeric() && c != '/' && c != '.' && c != '-' && c != '_')
         .filter(|tok| {
             tok.contains('/')
@@ -675,5 +677,49 @@ mod tests {
             lines[2].contains("  -  "),
             "uncited rows show `-`, not fake zeros: {out}"
         );
+    }
+
+    #[test]
+    fn extract_path_anchors_finds_source_paths() {
+        let text = "graph_snapshot() in stella-cli/src/agent.rs computes the \
+                    neighborhood. See also docs/hooks.md and src/lib.rs.";
+        let anchors = extract_path_anchors(text);
+        assert!(anchors.contains(&"stella-cli/src/agent.rs".to_string()));
+        assert!(anchors.contains(&"docs/hooks.md".to_string()));
+        assert!(anchors.contains(&"src/lib.rs".to_string()));
+        // No false positives from bare words.
+        assert!(!anchors.iter().any(|a| a == "graph_snapshot"));
+    }
+
+    #[test]
+    fn validate_flags_stale_path_anchors() {
+        let root = tempdir().unwrap();
+        // Create the stores + a memory node referencing a path that exists
+        // and one that does not.
+        let context_db = root.path().join(".stella").join("context.db");
+        std::fs::create_dir_all(context_db.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(root.path().join("stella-cli/src")).unwrap();
+        std::fs::write(root.path().join("stella-cli/src/agent.rs"), "pub fn x() {}").unwrap();
+        let context = stella_context::ContextStore::open(&context_db).unwrap();
+        use stella_context::{ContextDelta, MemoryInput};
+        let delta = ContextDelta {
+            memories: vec![
+                MemoryInput::reflection("agent.rs at stella-cli/src/agent.rs does X", vec![]),
+                MemoryInput::reflection("old.rs at deleted/old.rs was removed", vec![]),
+                MemoryInput::reflection("a memory with no paths at all", vec![]),
+            ],
+            ..Default::default()
+        };
+        context.upsert_sync(delta);
+        drop(context);
+
+        let rows = validate_memories(root.path()).unwrap();
+        assert_eq!(rows.len(), 3);
+        let stale = rows.iter().find(|r| r.status == "stale");
+        assert!(stale.is_some(), "must flag the deleted path");
+        let ok = rows.iter().find(|r| r.status == "ok");
+        assert!(ok.is_some(), "must verify the existing path");
+        let no_anchors = rows.iter().find(|r| r.status == "no-anchors");
+        assert!(no_anchors.is_some(), "must flag no-anchor memories");
     }
 }
