@@ -716,10 +716,7 @@ mod tests {
                         "old.rs at deleted/old.rs was removed",
                         Vec::<String>::new(),
                     ),
-                    MemoryInput::reflection(
-                        "a memory with no paths at all",
-                        Vec::<String>::new(),
-                    ),
+                    MemoryInput::reflection("a memory with no paths at all", Vec::<String>::new()),
                 ],
                 ..Default::default()
             };
