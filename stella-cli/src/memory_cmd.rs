@@ -245,6 +245,128 @@ fn join_rows(memories: Vec<NodeRow>, stats: &[MemoryCitationStats]) -> Vec<Memor
     cited
 }
 
+/// One row in the validation report (Proposal 5).
+#[derive(Debug, Clone, Serialize)]
+struct MemoryValidationRow {
+    id: String,
+    status: &'static str,
+    anchors_found: usize,
+    anchors_missing: usize,
+    memory: String,
+}
+
+/// Entry point for `stella memory validate` (Proposal 5).
+///
+/// Scans each memory for file-path anchors (workspace-relative paths like
+/// `stella-cli/src/agent.rs`), checks whether those paths still exist, and
+/// reports stale memories — ones whose referenced files have been moved or
+/// deleted, a strong signal the memory is about refactored-away code.
+pub fn run_memory_validate() -> Result<(), String> {
+    let workspace_root =
+        std::env::current_dir().map_err(|e| format!("cannot determine workspace root: {e}"))?;
+    let rows = validate_memories(&workspace_root)?;
+    if rows.is_empty() {
+        println!("No memories to validate — .stella/context.db is empty or missing.");
+        return Ok(());
+    }
+
+    let stale = rows.iter().filter(|r| r.status == "stale").count();
+    let ok = rows.iter().filter(|r| r.status == "ok").count();
+    let no_anchors = rows.iter().filter(|r| r.status == "no-anchors").count();
+
+    for row in &rows {
+        let symbol = match row.status {
+            "stale" => "⚠".yellow(),
+            "ok" => "✓".green(),
+            _ => "·".dimmed(),
+        };
+        let detail = match row.status {
+            "stale" => format!(
+                " — {} of {} anchor path(s) missing",
+                row.anchors_missing, row.anchors_found
+            ),
+            "ok" => format!(" — {} anchor(s) verified", row.anchors_found),
+            _ => String::new(),
+        };
+        println!(
+            "  {symbol} {} [{status}{detail}] {memory}",
+            row.id,
+            status = row.status,
+            memory = row.memory.chars().take(60).collect::<String>()
+        );
+    }
+
+    println!("\n  {ok} ok, {stale} stale, {no_anchors} no path anchors");
+    if stale > 0 {
+        println!(
+            "\n  {} {stale} stale memor{them} reference paths that no longer exist — \
+             cite them untruthful (or delete) to quarantine them from recall.",
+            "⚠".yellow(),
+            them = if stale == 1 { "y" } else { "ies" },
+        );
+    }
+    Ok(())
+}
+
+/// Extract workspace-relative file-path anchors from memory text. A path
+/// anchor is a token matching the pattern `word/word[/word…]` with at least
+/// one slash and a recognized source extension, e.g. `stella-cli/src/agent.rs`,
+/// `src/lib.rs`, `docs/hooks.md`.
+fn extract_path_anchors(text: &str) -> Vec<String> {
+    let exts = ["rs", "py", "ts", "tsx", "js", "jsx", "go", "md", "sql", "toml"];
+    text.split(|c: char| !c.is_alphanumeric() && c != '/' && c != '.' && c != '-' && c != '_')
+        .filter(|tok| {
+            tok.contains('/')
+                && tok
+                    .rsplit('.')
+                    .next()
+                    .is_some_and(|ext| exts.contains(&ext))
+        })
+        .map(String::from)
+        .collect()
+}
+
+/// Validate all memories in a workspace against the current file tree.
+fn validate_memories(workspace_root: &std::path::Path) -> Result<Vec<MemoryValidationRow>, String> {
+    let context_db = workspace_root.join(".stella").join("context.db");
+    if !context_db.exists() {
+        return Ok(Vec::new());
+    }
+    let context =
+        ContextStore::open(&context_db).map_err(|e| format!("cannot open context store: {e}"))?;
+    let memories = context
+        .memory_nodes()
+        .map_err(|e| format!("cannot read memories: {e}"))?;
+
+    let mut rows = Vec::new();
+    for node in &memories {
+        let anchors = extract_path_anchors(&node.content);
+        if anchors.is_empty() {
+            rows.push(MemoryValidationRow {
+                id: node.public_id.clone(),
+                status: "no-anchors",
+                anchors_found: 0,
+                anchors_missing: 0,
+                memory: node.content.trim().to_string(),
+            });
+            continue;
+        }
+        let missing = anchors
+            .iter()
+            .filter(|p| !workspace_root.join(p).exists())
+            .count();
+        let status = if missing > 0 { "stale" } else { "ok" };
+        rows.push(MemoryValidationRow {
+            id: node.public_id.clone(),
+            status,
+            anchors_found: anchors.len(),
+            anchors_missing: missing,
+            memory: node.content.trim().to_string(),
+        });
+    }
+    Ok(rows)
+}
+
 /// The promoted rule as a mining candidate, so `render_rule_markdown`
 /// produces the exact frontmatter shape `rule_from_file` parses back —
 /// promotion never invents its own rule format. Prompt-only (no guard): the
