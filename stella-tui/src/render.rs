@@ -310,10 +310,10 @@ fn error_card(area: Rect, label: &str, message: &str) -> Buffer {
 
 pub(crate) fn render_hud(hud: &Hud, area: Rect, buf: &mut Buffer) {
     let mut spans: Vec<Span<'static>> = vec![
-        Span::styled("stage: ", Style::new().fg(Color::DarkGray)),
+        Span::styled("stage: ", Style::new().fg(theme::MUTED)),
         Span::styled(
             hud.stage.map(stage_label).unwrap_or("—").to_string(),
-            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::new().fg(theme::AMBER).add_modifier(Modifier::BOLD),
         ),
         Span::raw("   "),
         Span::styled("model: ", Style::new().fg(Color::DarkGray)),
@@ -515,7 +515,7 @@ pub(crate) fn render_ask_user(
         lines.push(Line::from(vec![
             Span::styled(
                 format!("  {}. ", i + 1),
-                Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                Style::new().fg(theme::AMBER).add_modifier(Modifier::BOLD),
             ),
             Span::raw(option.clone()),
         ]));
@@ -537,7 +537,7 @@ pub(crate) fn render_ask_user(
     });
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::new().fg(Color::Cyan))
+        .border_style(Style::new().fg(theme::AMBER))
         .title(" question ");
     Paragraph::new(Text::from(lines))
         .block(block)
@@ -771,7 +771,10 @@ fn wrap_one_indent(
                 // space stacks on top of `indent` and pushes every wrapped row
                 // one column right of the clean left edge — the "extra blank
                 // space after the colon" bug.
-                let lead = remainder.iter().take_while(|(c, _)| *c == ' ').count();
+                let lead = remainder
+                    .iter()
+                    .take_while(|(c, _)| *c == ' ')
+                    .count();
                 remainder.drain(..lead);
                 flush(&mut current, is_first, out);
                 is_first = false;
