@@ -71,7 +71,7 @@ wiremock = "0.6"
 # The installers to generate for each app
 installers = ["shell", "homebrew"]
 # A GitHub repo to push Homebrew formulas to
-tap = "macanderson/homebrew-stella"
+tap = "macanderson/homebrew-tap"
 # Publish jobs to run in CI
 publish-jobs = ["homebrew"]
 # Target platforms to build apps for (Rust target-triple syntax)

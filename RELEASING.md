@@ -16,12 +16,12 @@ The tag-triggered workflow publishes the Homebrew formula to a **tap repo**.
 This has to exist and be writable before the first release:
 
 1. **Create the tap repo.** A public repo named exactly
-   [`macanderson/homebrew-stella`](https://github.com/macanderson/homebrew-stella)
-   (Homebrew maps the tap `macanderson/stella` → repo `homebrew-stella`). It can
+   [`macanderson/homebrew-tap`](https://github.com/macanderson/homebrew-tap)
+   (Homebrew maps the tap `macanderson/tap` → repo `homebrew-tap`). It can
    start empty; the release job commits `Formula/stella.rb` into it.
 
 2. **Create a push token.** A GitHub token with **contents: write** on the tap
-   repo — a fine-grained PAT scoped to `macanderson/homebrew-stella`, or a classic
+   repo — a fine-grained PAT scoped to `macanderson/homebrew-tap`, or a classic
    PAT with `repo`. The default `GITHUB_TOKEN` can't push to another repo, so a
    dedicated one is required.
 
@@ -86,8 +86,8 @@ means cutting a new version.
 Homebrew (prebuilt binary, no Rust toolchain):
 
 ```bash
-brew install macanderson/stella/stella
-# equivalently: brew tap macanderson/stella && brew install stella
+brew install macanderson/tap/stella
+# equivalently: brew tap macanderson/tap && brew install stella
 ```
 
 Shell installer (macOS/Linux, no Homebrew):

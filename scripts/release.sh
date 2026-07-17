@@ -25,7 +25,8 @@ set -euo pipefail
 
 # ── Config ──────────────────────────────────────────────────────────────────
 REPO="macanderson/stella"
-TAP_REPO="macanderson/homebrew-stella"
+TAP_REPO="macanderson/homebrew-tap"   # repo the formula is pushed to (git)
+TAP="macanderson/tap"                 # brew tap name → maps to repo homebrew-tap
 BIN="stella"
 CRATE="stella-cli"
 MAC_TARGETS=(aarch64-apple-darwin x86_64-apple-darwin)
@@ -184,15 +185,15 @@ fi
 
 # ── Verify via Homebrew (fetch = download + checksum, no install) ───────────
 info "verifying via Homebrew"
-brew tap "$REPO" >/dev/null 2>&1 || true
-brew update-reset "$(brew --repo "$REPO")" >/dev/null 2>&1 || true
-if brew fetch "${REPO}/${BIN}" >/dev/null 2>&1; then
+brew tap "$TAP" >/dev/null 2>&1 || true
+brew update-reset "$(brew --repo "$TAP")" >/dev/null 2>&1 || true
+if brew fetch "${TAP}/${BIN}" >/dev/null 2>&1; then
   ok "brew fetch + checksum verified for ${VERSION}"
 else
-  info "brew couldn't verify yet (release assets may still be propagating) — retry: brew fetch ${REPO}/${BIN}"
+  info "brew couldn't verify yet (release assets may still be propagating) — retry: brew fetch ${TAP}/${BIN}"
 fi
 
 bold ""
 ok "Released ${TAG}"
-printf '   install:  brew install %s/%s\n' "$REPO" "$BIN"
+printf '   install:  brew install %s/%s\n' "$TAP" "$BIN"
 printf '   upgrade:  brew upgrade %s\n' "$BIN"
