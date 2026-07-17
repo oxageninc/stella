@@ -221,6 +221,16 @@ pub struct AgentUseRow {
     pub reason: String,
 }
 
+/// One skill-invocation row for the `skill_usage` log — the analogue of
+/// [`AgentUseRow`] for the SKILLS tab: which skill (by name) at which pinned
+/// version was applied under an execution, with a short reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillUsageRow {
+    pub skill: String,
+    pub version: u32,
+    pub reason: String,
+}
+
 /// One aggregated analytics row per (provider, model): the numbers behind
 /// "$-per-resolved-task" receipts, straight from local telemetry.
 ///
@@ -324,7 +334,7 @@ type Migration = fn(&rusqlite::Transaction<'_>) -> Result<()>;
 /// a file at `user_version` i to i + 1. Fresh files never run these — they
 /// get [`create_latest_schema`] and are stamped at [`SCHEMA_VERSION`]
 /// directly.
-const MIGRATIONS: [Migration; 4] = [
+const MIGRATIONS: [Migration; 5] = [
     // v0 → v1: dedupe events/telemetry, then retrofit the UNIQUE keys
     // their write paths have always assumed.
     migrate_v0_to_v1,
@@ -1771,6 +1781,45 @@ mod tests {
         assert_eq!((agent.as_str(), version), ("reviewer", 2));
         assert_eq!(reason, "review the diff");
         assert!(!ts.is_empty(), "the insert stamps a timestamp");
+    }
+
+    #[test]
+    fn skill_usage_records_per_execution_version_rows() {
+        let store = Store::in_memory().unwrap();
+        assert_eq!(user_version(&store), SCHEMA_VERSION);
+        assert_eq!(SCHEMA_VERSION, 5, "skill_usage lands at v5 on this branch");
+
+        let id = store
+            .begin_execution("deck", "format the sql", "zai", "glm-5.2")
+            .unwrap();
+        store
+            .record_skill_usage(
+                id,
+                &[
+                    SkillUsageRow {
+                        skill: "sql-style".into(),
+                        version: 3,
+                        reason: "matched: sql, format".into(),
+                    },
+                    SkillUsageRow {
+                        skill: "prefer-tables".into(),
+                        version: 1,
+                        reason: "matched: tables".into(),
+                    },
+                ],
+            )
+            .unwrap();
+        assert_eq!(store.count("skill_usage").unwrap(), 2);
+        let conn = store.lock();
+        let (skill, version): (String, i64) = conn
+            .query_row(
+                "SELECT skill, version FROM skill_usage WHERE execution_id = ? \
+                 ORDER BY rowid LIMIT 1",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((skill.as_str(), version), ("sql-style", 3));
     }
 
     #[test]

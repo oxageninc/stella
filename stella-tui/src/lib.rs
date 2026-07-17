@@ -80,8 +80,8 @@ pub use deck_ui::{
     ingest_inbound,
 };
 pub use envelope::{
-    AgentControl, AgentId, AgentMeta, AgentScope, AgentStatus, AgentVersionInfo, Inbound, SkillOp,
-    SkillRow, SkillScope, SkillSearchHit, SkillsView, InstalledAgentEntry, WorkspaceInput,
+    AgentControl, AgentId, AgentMeta, AgentScope, AgentStatus, AgentVersionInfo, Inbound,
+    InstalledAgentEntry, SkillOp, SkillRow, SkillScope, SkillSearchHit, SkillsView, WorkspaceInput,
 };
 pub use graph::{GraphEdge, GraphNode, GraphSnapshot};
 pub use resource::ResourceMonitor;

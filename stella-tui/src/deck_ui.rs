@@ -1187,11 +1187,13 @@ fn handle_skills_installed_key(key: KeyEvent, ui: &mut DeckUi, ctrl: bool) -> Op
             if let Some(r) = ui.skills.view.rows.get_mut(ui.skills.sel) {
                 r.enabled = enabled;
             }
-            Some(DeckAction::Send(WorkspaceInput::Skill(SkillOp::SetEnabled {
-                scope,
-                name,
-                enabled,
-            })))
+            Some(DeckAction::Send(WorkspaceInput::Skill(
+                SkillOp::SetEnabled {
+                    scope,
+                    name,
+                    enabled,
+                },
+            )))
         }
         KeyCode::Char('x') if ctrl => {
             let Some(row) = ui.skills.view.rows.get(ui.skills.sel) else {
@@ -1209,10 +1211,9 @@ fn handle_skills_installed_key(key: KeyEvent, ui: &mut DeckUi, ctrl: bool) -> Op
                 let scope = row.scope;
                 ui.skills.searching = true;
                 ui.skills.status = Some(format!("deleting {name}…"));
-                Some(DeckAction::Send(WorkspaceInput::Skill(SkillOp::Uninstall {
-                    scope,
-                    name,
-                })))
+                Some(DeckAction::Send(WorkspaceInput::Skill(
+                    SkillOp::Uninstall { scope, name },
+                )))
             } else {
                 ui.skills.uninstall_armed = true;
                 ui.skills.status = Some(format!(
@@ -3471,5 +3472,242 @@ mod tests {
             "a typed `n` is prompt text, not the create verb"
         );
         assert_eq!(ui.composer.buffer(), "hn");
+    }
+
+    // ── SKILLS tab ──────────────────────────────────────────────────────────
+
+    // `SkillOp`, `SkillScope`, `SkillSearchHit`, `SkillsView` arrive via
+    // `use super::*`; only `SkillRow` is not imported at module scope.
+    use crate::envelope::SkillRow;
+
+    fn skills_ui() -> DeckUi {
+        let mut ui = ready_ui();
+        ui.tab = DeckTab::Skills;
+        ui
+    }
+
+    fn a_row(name: &str, scope: SkillScope, enabled: bool) -> SkillRow {
+        SkillRow {
+            scope,
+            name: name.to_string(),
+            description: "d".to_string(),
+            body: "b".to_string(),
+            origin: "workspace".to_string(),
+            enabled,
+            version: 1,
+            latest: 1,
+            removable: true,
+        }
+    }
+
+    #[test]
+    fn skills_search_pane_types_a_query_and_dispatches_a_search() {
+        let model = WorkspaceModel::new();
+        let mut ui = skills_ui();
+        ui.skills.focus = SkillsFocus::Search;
+        for c in "pdf tools".chars() {
+            handle_deck_key(ch(c), &model, &mut ui);
+        }
+        assert_eq!(ui.skills.query, "pdf tools", "typed into the query");
+        assert!(
+            ui.composer.is_empty(),
+            "the global composer never saw the keys"
+        );
+        let action = handle_deck_key(key(KeyCode::Enter), &model, &mut ui);
+        assert_eq!(
+            action,
+            DeckAction::Send(WorkspaceInput::Skill(SkillOp::Search {
+                query: "pdf tools".into()
+            }))
+        );
+    }
+
+    #[test]
+    fn skills_enter_on_a_hit_opens_the_scope_prompt_then_installs_scoped() {
+        let model = WorkspaceModel::new();
+        let mut ui = skills_ui();
+        ui.skills.focus = SkillsFocus::Search;
+        ui.skills.hits = vec![SkillSearchHit {
+            id: "acme/auth".into(),
+            label: "acme/auth  oauth".into(),
+        }];
+        ui.skills.query = "auth".into();
+        ui.skills.query_dirty = false;
+
+        let a = handle_deck_key(key(KeyCode::Enter), &model, &mut ui);
+        assert_eq!(a, DeckAction::Handled);
+        assert!(matches!(
+            ui.skills.prompt,
+            Some(SkillPrompt::Scope {
+                action: ScopeAction::Install { .. },
+                ..
+            })
+        ));
+        handle_deck_key(ch('u'), &model, &mut ui);
+        let a = handle_deck_key(key(KeyCode::Enter), &model, &mut ui);
+        assert_eq!(
+            a,
+            DeckAction::Send(WorkspaceInput::Skill(SkillOp::Install {
+                scope: SkillScope::User,
+                id: "acme/auth".into()
+            }))
+        );
+        assert!(ui.skills.prompt.is_none());
+    }
+
+    #[test]
+    fn skills_space_toggles_and_two_ctrl_x_uninstalls() {
+        let model = WorkspaceModel::new();
+        let mut ui = skills_ui();
+        ui.skills.view = SkillsView {
+            rows: vec![a_row("sql-style", SkillScope::Project, true)],
+            status: None,
+            busy: false,
+        };
+        let a = handle_deck_key(ch(' '), &model, &mut ui);
+        assert_eq!(
+            a,
+            DeckAction::Send(WorkspaceInput::Skill(SkillOp::SetEnabled {
+                scope: SkillScope::Project,
+                name: "sql-style".into(),
+                enabled: false
+            }))
+        );
+        assert!(!ui.skills.view.rows[0].enabled, "optimistic flip");
+
+        let a1 = handle_deck_key(ctrl('x'), &model, &mut ui);
+        assert_eq!(a1, DeckAction::Handled);
+        assert!(ui.skills.uninstall_armed);
+        let a2 = handle_deck_key(ctrl('x'), &model, &mut ui);
+        assert_eq!(
+            a2,
+            DeckAction::Send(WorkspaceInput::Skill(SkillOp::Uninstall {
+                scope: SkillScope::Project,
+                name: "sql-style".into()
+            }))
+        );
+    }
+
+    #[test]
+    fn skills_e_opens_edit_overlay_and_ctrl_s_saves() {
+        let model = WorkspaceModel::new();
+        let mut ui = skills_ui();
+        let mut r = a_row("sql-style", SkillScope::Project, true);
+        r.body = "old body".into();
+        ui.skills.view = SkillsView {
+            rows: vec![r],
+            status: None,
+            busy: false,
+        };
+        handle_deck_key(ch('e'), &model, &mut ui);
+        assert!(matches!(
+            ui.skills.prompt,
+            Some(SkillPrompt::Edit { ref buffer, .. }) if buffer == "old body"
+        ));
+        for c in " +more".chars() {
+            handle_deck_key(ch(c), &model, &mut ui);
+        }
+        let a = handle_deck_key(ctrl('s'), &model, &mut ui);
+        assert_eq!(
+            a,
+            DeckAction::Send(WorkspaceInput::Skill(SkillOp::Edit {
+                scope: SkillScope::Project,
+                name: "sql-style".into(),
+                body: "old body +more".into(),
+            }))
+        );
+    }
+
+    #[test]
+    fn skills_p_opens_pin_picker_and_enter_pins() {
+        let model = WorkspaceModel::new();
+        let mut ui = skills_ui();
+        let mut r = a_row("s", SkillScope::Project, true);
+        r.version = 3;
+        r.latest = 3;
+        ui.skills.view = SkillsView {
+            rows: vec![r],
+            status: None,
+            busy: false,
+        };
+        handle_deck_key(ch('p'), &model, &mut ui);
+        assert!(matches!(
+            ui.skills.prompt,
+            Some(SkillPrompt::Pin {
+                sel: 3,
+                latest: 3,
+                ..
+            })
+        ));
+        handle_deck_key(key(KeyCode::Up), &model, &mut ui);
+        handle_deck_key(key(KeyCode::Up), &model, &mut ui);
+        let a = handle_deck_key(key(KeyCode::Enter), &model, &mut ui);
+        assert_eq!(
+            a,
+            DeckAction::Send(WorkspaceInput::Skill(SkillOp::Pin {
+                scope: SkillScope::Project,
+                name: "s".into(),
+                version: 1,
+            }))
+        );
+    }
+
+    #[test]
+    fn skills_n_creates_via_description_then_scope() {
+        let model = WorkspaceModel::new();
+        let mut ui = skills_ui();
+        handle_deck_key(ch('n'), &model, &mut ui);
+        assert!(matches!(
+            ui.skills.prompt,
+            Some(SkillPrompt::CreateDescription { .. })
+        ));
+        for c in "extract tables from pdfs".chars() {
+            handle_deck_key(ch(c), &model, &mut ui);
+        }
+        let a = handle_deck_key(key(KeyCode::Enter), &model, &mut ui);
+        assert_eq!(a, DeckAction::Handled);
+        assert!(matches!(
+            ui.skills.prompt,
+            Some(SkillPrompt::Scope {
+                action: ScopeAction::Create { .. },
+                ..
+            })
+        ));
+        let a = handle_deck_key(key(KeyCode::Enter), &model, &mut ui);
+        assert_eq!(
+            a,
+            DeckAction::Send(WorkspaceInput::Skill(SkillOp::Create {
+                scope: SkillScope::Project,
+                description: "extract tables from pdfs".into(),
+            }))
+        );
+    }
+
+    #[test]
+    fn skills_snapshot_ingest_updates_view_and_clears_searching() {
+        let mut model = WorkspaceModel::new();
+        let mut ui = skills_ui();
+        ui.skills.searching = true;
+        let view = SkillsView {
+            rows: vec![a_row("a", SkillScope::Project, true)],
+            status: Some("done".into()),
+            busy: false,
+        };
+        ingest_inbound(&Inbound::Skills(view), &mut model, &mut ui);
+        assert_eq!(ui.skills.view.rows.len(), 1);
+        assert!(!ui.skills.searching, "a fresh list clears the spinner");
+        assert_eq!(ui.skills.status.as_deref(), Some("done"));
+        assert!(
+            model.agents.is_empty(),
+            "model fold ignores skills snapshots"
+        );
+    }
+
+    #[test]
+    fn skills_tab_still_leaves_via_tab_key() {
+        let model = WorkspaceModel::new();
+        let mut ui = skills_ui();
+        handle_deck_key(key(KeyCode::Tab), &model, &mut ui);
+        assert_eq!(ui.tab, DeckTab::Session, "Tab cycles Skills → Session");
     }
 }
