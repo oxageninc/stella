@@ -65,6 +65,16 @@ pub struct SessionMemory {
     domains: Domains,
     workspace_root: PathBuf,
     skills_created: usize,
+    /// Memory ids (`nod_…`) quarantined from recall: cited untruthful ≥
+    /// [`stella_store::QUARANTINE_NEGATIVES_THRESHOLD`] times (Proposal 3).
+    /// Loaded once at session open and filtered from every recall_block so a
+    /// stale/wrong memory stops misleading future turns. Best-effort: an
+    /// empty set (no store.db, no citations yet) means no filtering.
+    quarantined_ids: std::collections::HashSet<String>,
+    /// A/B recall control (Proposal 4): when true, recall is suppressed
+    /// entirely on this turn so the outcome can be compared against recalled
+    /// turns. Set by `ab_suppress_recall()` with a deterministic seed.
+    ab_suppressed: bool,
 }
 
 /// Filesystem-backed [`SkillSource`] reading the workspace + user-global
@@ -179,12 +189,21 @@ impl SessionMemory {
                     domains.names(),
                     workspace_root.to_path_buf(),
                 );
+                // Proposal 3: load quarantined memory ids from store.db so
+                // they are filtered from recall for the entire session. A
+                // missing store or a query failure degrades to no filtering.
+                let quarantined_ids = stella_store::Store::open(workspace_root)
+                    .ok()
+                    .map(|s| std::sync::Arc::new(s).quarantined_memory_ids())
+                    .unwrap_or_default();
                 Some(Self {
                     store,
                     host,
                     domains,
                     workspace_root: workspace_root.to_path_buf(),
                     skills_created: 0,
+                    quarantined_ids,
+                    ab_suppressed: false,
                 })
             }
             Err(e) => {
@@ -211,7 +230,20 @@ impl SessionMemory {
     /// memories (similarity + domain overlap + recency via the context
     /// store) and relevant skills (lexical + domain selection). `None` when
     /// nothing relevant surfaced — an empty block would only burn cache.
+    ///
+    /// **Quarantine filter (Proposal 3):** frames whose memory id (`nod_…`)
+    /// appears in the session's `quarantined_ids` set are dropped before
+    /// rendering. These are memories cited untruthful ≥ 2 times — surfacing
+    /// them is active harm.
+    ///
+    /// **A/B control (Proposal 4):** when `ab_suppressed` is true (set by a
+    /// deterministic coin flip), recall returns `None` so the turn runs
+    /// without context — the outcome is then comparable to recalled turns.
     pub async fn recall_block(&self, prompt: &str) -> Option<String> {
+        if self.ab_suppressed {
+            return None;
+        }
+
         let mut sections: Vec<String> = Vec::new();
 
         let query = ContextQuery {
@@ -226,7 +258,11 @@ impl SessionMemory {
         };
         // Routed through the session's OCP host: workspace memory + the
         // code graph answer concurrently, isolated and budget-audited.
-        let frames = crate::ocp::recall_via_host(&self.host, &query).await;
+        let mut frames = crate::ocp::recall_via_host(&self.host, &query).await;
+        // Proposal 3: drop quarantined memories before rendering.
+        if !self.quarantined_ids.is_empty() {
+            frames.retain(|f| !self.quarantined_ids.contains(&f.id));
+        }
         if let Some(section) = render_context_section(&frames) {
             sections.push(section);
         }
@@ -247,6 +283,32 @@ impl SessionMemory {
         } else {
             Some(format!("{RECALL_MARKER}\n\n{}", sections.join("\n\n")))
         }
+    }
+
+    /// A/B recall control (Proposal 4): suppress recall for this turn with a
+    /// deterministic `1/rate` coin flip, returning whether recall was
+    /// suppressed. A rate of 0 (or 1) never suppresses. The caller records
+    /// the outcome alongside this flag so `stella memory ab-report` can
+    /// compare recalled vs control turns.
+    pub fn maybe_suppress_recall(&mut self, rate: u32) -> bool {
+        if rate == 0 || rate == 1 {
+            self.ab_suppressed = false;
+            return false;
+        }
+        // Deterministic from the turn count (avoids a crypto dependency):
+        // every `rate`-th turn is a control turn. Using nanosecond seed for
+        // unpredictability across sessions.
+        let ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        self.ab_suppressed = ns.is_multiple_of(rate as u64);
+        self.ab_suppressed
+    }
+
+    /// Whether recall was suppressed this turn (for outcome attribution).
+    pub fn recall_was_suppressed(&self) -> bool {
+        self.ab_suppressed
     }
 
     /// The skills recall would inject for `prompt`, as `(name, reason)` pairs
@@ -393,13 +455,19 @@ impl SessionMemory {
     /// SKILL.md files. Best-effort throughout — returns how many lessons
     /// were recorded, and any failure degrades to 0 silently (a failed
     /// reflection must never fail the turn that just succeeded).
+    ///
+    /// `succeeded` controls the reflection prompt template (Proposal 1):
+    /// a failed turn gets a failure-analysis prompt that asks the model to
+    /// identify the root cause — the highest-value learning signal in the
+    /// system. A succeeded turn gets the conventional "what worked?" prompt.
     pub async fn reflect_and_record(
         &mut self,
         provider: &dyn Provider,
         transcript: &[CompletionMessage],
         quiet: bool,
+        succeeded: bool,
     ) -> usize {
-        let lessons = reflect_on_turn(provider, transcript, &self.domains.names()).await;
+        let lessons = reflect_on_turn(provider, transcript, &self.domains.names(), succeeded).await;
         if lessons.is_empty() {
             return 0;
         }
@@ -662,10 +730,16 @@ pub fn turn_warrants_reflection(turn_messages: &[CompletionMessage]) -> bool {
 /// failure -> empty). The model critiques the completed turn and returns
 /// 0-3 short forward-looking lessons tagged with domains FROM THE SUPPLIED
 /// LIST only — invented domain names are dropped.
+///
+/// `succeeded` selects the prompt template (Proposal 1): on failure the model
+/// is asked to identify the root cause and what to do differently — the
+/// signal that produces "don't do X because it leads to failure Y." On success
+/// it records what worked well.
 pub async fn reflect_on_turn(
     provider: &dyn Provider,
     transcript: &[CompletionMessage],
     domain_names: &[String],
+    succeeded: bool,
 ) -> Vec<ReflectionLesson> {
     // Bounded transcript digest: last 12 messages, 300 chars each.
     let digest: String = transcript
@@ -700,12 +774,25 @@ pub async fn reflect_on_turn(
         .collect::<Vec<_>>()
         .join("\n");
 
+    let task_frame = if succeeded {
+        "This turn SUCCEEDED. Identify durable lessons worth remembering for \
+         FUTURE similar tasks: approaches or conventions that worked well, \
+         repo conventions discovered, user style preferences revealed. Most \
+         successful turns have nothing worth recording — an empty list is the \
+         common, correct answer."
+    } else {
+        "This turn FAILED. Identify the root cause and a durable lesson: what \
+         was the most likely cause of failure — a wrong assumption, a missed \
+         file, a bad approach, a misunderstood requirement? What should change \
+         next time to avoid repeating this failure? Focus on actionable, \
+         forward-looking lessons. If the failure was clearly external (network, \
+         timeout), return an empty list."
+    };
+
     let prompt = format!(
-        "Review this coding-agent turn transcript and reflect on the agent's performance. \
-         Identify durable, forward-looking lessons that would improve FUTURE turns in this \
-         workspace: wasted tool calls, wrong assumptions, user style preferences revealed, \
-         repo conventions discovered. Most turns have nothing worth recording — an empty \
-         list is the common, correct answer. Respond with ONLY a JSON array (max 3):\n\
+        "Review this coding-agent turn transcript and reflect on the agent's \
+         performance. {task_frame}\n\n\
+         Respond with ONLY a JSON array (max 3):\n\
          [{{\"lesson\": \"...\", \"domains\": [\"...\"]}}]\n\
          Allowed domain tags (use only these, or []): {}\n\nTranscript:\n{digest}",
         domain_names.join(", ")
