@@ -17,7 +17,7 @@
 //! * [`svg`] — the [`SvgPipeline`]: validate → sanitize → optimize with a
 //!   bounded model-repair loop, treating LLM SVG as untrusted code (L-V2).
 //! * [`preview`] — the terminal preview ladder (kitty / iTerm2 / plain), pure
-//! string builders, no TTY writes.
+//!   string builders, no TTY writes.
 //! * [`cost_gate`] — the video confirmation gate:
 //!   deny-by-default headless, threshold-configurable.
 //! * [`jobs`] — persisted video-job state + live reconciliation so a

@@ -92,7 +92,11 @@ pub fn frame_plain(width: usize, tick: usize) -> Vec<String> {
     // The flight path: sprite enters from the left edge and exits right,
     // then loops. Two ticks per column keeps it stately, not frantic.
     if width >= MIN_FLIGHT_WIDTH {
-        let sprite = if tick % 2 == 0 { SPRITE_A } else { SPRITE_B };
+        let sprite = if tick.is_multiple_of(2) {
+            SPRITE_A
+        } else {
+            SPRITE_B
+        };
         let span = sprite[1].chars().count();
         let cycle = width + span;
         let x = (tick / 2 * 3) % cycle;
@@ -316,7 +320,7 @@ mod tests {
             for tick in 0..160 {
                 for row in frame_plain(width, tick) {
                     assert!(
-                        row.chars().count() <= width.max(0),
+                        row.chars().count() <= width,
                         "row overflows width {width} at tick {tick}: {row:?}"
                     );
                 }

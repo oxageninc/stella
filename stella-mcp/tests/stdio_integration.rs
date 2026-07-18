@@ -60,9 +60,13 @@ async fn tools_list_follows_pagination() {
 }
 
 #[tokio::test]
-async fn environment_is_scrubbed_but_configured_vars_pass_through() {
-    // The parent test process essentially always has PATH; that's the ambient
-    // credential-class variable we prove the child does NOT inherit.
+async fn environment_is_scrubbed_but_configured_vars_and_path_pass_through() {
+    // Cargo always sets CARGO_MANIFEST_DIR for the test process; it stands in
+    // for a credential-class ambient variable the child must NOT inherit.
+    assert!(
+        std::env::var("CARGO_MANIFEST_DIR").is_ok(),
+        "expected CARGO_MANIFEST_DIR in the test env"
+    );
     assert!(
         std::env::var("PATH").is_ok(),
         "expected PATH in the test env"
@@ -87,17 +91,35 @@ async fn environment_is_scrubbed_but_configured_vars_pass_through() {
         }
     );
 
-    // …but the ambient PATH does not — the environment was scrubbed.
+    // …an ambient credential-class variable does NOT — still scrubbed.
+    let manifest = client
+        .call_tool(
+            "env_probe",
+            serde_json::json!({ "var": "CARGO_MANIFEST_DIR" }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        manifest,
+        ToolOutput::Ok {
+            content: "unset".into()
+        },
+        "ambient non-PATH env must stay scrubbed"
+    );
+
+    // …but PATH IS inherited — it is the one non-secret exception, without
+    // which a bare runner command (npx/uvx/docker) could never resolve.
     let path = client
         .call_tool("env_probe", serde_json::json!({ "var": "PATH" }))
         .await
         .unwrap();
-    assert_eq!(
-        path,
-        ToolOutput::Ok {
-            content: "unset".into()
-        }
-    );
+    match path {
+        ToolOutput::Ok { content } => assert!(
+            content != "unset" && content.contains('/'),
+            "PATH must be inherited into the MCP child, got {content:?}"
+        ),
+        other => panic!("expected an env value, got {other:?}"),
+    }
 
     client.close().await.unwrap();
 }
