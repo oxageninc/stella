@@ -3612,7 +3612,7 @@ mod tests {
     fn a_paste_in_skills_search_types_into_the_query_not_the_composer() {
         // The SKILLS tab is keyboard-owning: a paste in its search pane must
         // build the query, exactly like typed characters do, never the composer.
-        let model = model_with(&["lead"]);
+        // (paste() is a direct DeckUi method, so no WorkspaceModel is needed.)
         let mut ui = ready_ui();
         ui.set_tab(DeckTab::Skills);
         ui.skills.focus = SkillsFocus::Search;
