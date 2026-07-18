@@ -2690,6 +2690,7 @@ mod tests {
                     content: "line one\nline two\nline three".into(),
                 },
                 duration_ms: 7,
+                speculated: false,
             },
         });
     }

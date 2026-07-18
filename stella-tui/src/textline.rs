@@ -846,6 +846,7 @@ mod tests {
                     content: "o".into(),
                 },
                 duration_ms: 1,
+                speculated: false,
             },
         ];
         for event in &structural {
