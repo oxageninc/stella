@@ -852,7 +852,7 @@ async fn run_raw_one_shot(
         CompletionMessage::system(
             with_session_hook_context(build_system_prompt(&cfg.workspace_root), cfg).await,
         ),
-        CompletionMessage::user(prompt),
+        crate::attachments::user_message(prompt),
     ];
 
     // The self-improvement loop (memory.rs): recall relevant memories +
@@ -1277,7 +1277,7 @@ pub async fn run_interactive(cfg: &Config, budget_limit: Option<f64>) -> Result<
         };
         let input = expanded.as_deref().unwrap_or(input);
 
-        messages.push(CompletionMessage::user(input));
+        messages.push(crate::attachments::user_message(input));
         println!();
 
         if let Some(m) = &mut memory {
