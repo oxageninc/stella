@@ -89,13 +89,13 @@ pub enum GoalOutcome {
 /// What the judge model must return, as strict JSON. `reasoning` explains
 /// the verdict; `feedback` (only meaningful when `met == false`) is
 /// actionable course-correction handed to the worker verbatim.
-#[derive(Debug, Deserialize)]
-struct JudgeVerdict {
-    met: bool,
+#[derive(Debug, Deserialize, Clone)]
+pub struct GoalJudgeVerdict {
+    pub met: bool,
     #[serde(default)]
-    reasoning: String,
+    pub reasoning: String,
     #[serde(default)]
-    feedback: String,
+    pub feedback: String,
 }
 
 const JUDGE_SYSTEM_PROMPT: &str = "You are an impartial judge assessing whether a coding agent \
@@ -128,8 +128,6 @@ impl Engine<'_> {
         events: &UnboundedSender<AgentEvent>,
         goal_config: &GoalConfig,
     ) -> GoalOutcome {
-        let mut total_cost_usd = 0.0f64;
-
         messages.push(CompletionMessage::user(format!(
             "GOAL: {goal}\n\nWork toward this goal. An independent judge will assess the \
              result after each working round from the transcript evidence; keep your work \
@@ -139,12 +137,12 @@ impl Engine<'_> {
         for round in 1..=goal_config.max_rounds {
             budget.begin_turn();
             match self.run_turn(messages, budget, events).await {
-                TurnOutcome::Completed { cost_usd, .. } => total_cost_usd += cost_usd,
+                TurnOutcome::Completed { .. } => {}
                 TurnOutcome::Aborted { reason } => {
                     return GoalOutcome::Unmet {
                         rounds: round,
                         reason: format!("working turn aborted: {reason}"),
-                        cost_usd: total_cost_usd,
+                        cost_usd: budget.session_spent_usd(),
                     };
                 }
             }
@@ -165,15 +163,15 @@ impl Engine<'_> {
                     return GoalOutcome::Unmet {
                         rounds: round,
                         reason: format!("judge unavailable: {reason}"),
-                        cost_usd: total_cost_usd,
+                        cost_usd: budget.session_spent_usd(),
                     };
                 }
             };
 
             // Judge spend was metered inside its own engine turn
-            // (StepUsage + BudgetTick already emitted); the verdict event
-            // carries the assessment's total for the goal-loop arc.
-            total_cost_usd += judge_cost;
+            // (StepUsage + BudgetTick already emitted; recorded against the
+            // shared budget guard). The verdict event carries this call's
+            // own cost.
             let _ = events.send(AgentEvent::GoalVerdict {
                 round,
                 met: verdict.met,
@@ -185,7 +183,7 @@ impl Engine<'_> {
                 return GoalOutcome::Met {
                     rounds: round,
                     verdict: verdict.reasoning,
-                    cost_usd: total_cost_usd,
+                    cost_usd: budget.session_spent_usd(),
                 };
             }
 
@@ -206,7 +204,7 @@ impl Engine<'_> {
                 "round cap ({}) reached without a passing verdict",
                 goal_config.max_rounds
             ),
-            cost_usd: total_cost_usd,
+            cost_usd: budget.session_spent_usd(),
         }
     }
 
@@ -217,7 +215,7 @@ impl Engine<'_> {
     /// to mutate the workspace it is judging. Spend flows through the same
     /// `budget` as worker turns. `Err` carries the abort reason (provider
     /// failure or budget) after retries were exhausted.
-    async fn assess(
+    pub async fn assess(
         &self,
         judge: &dyn Provider,
         goal: &str,
@@ -225,7 +223,7 @@ impl Engine<'_> {
         budget: &mut BudgetGuard,
         events: &UnboundedSender<AgentEvent>,
         goal_config: &GoalConfig,
-    ) -> Result<(JudgeVerdict, f64), String> {
+    ) -> Result<(GoalJudgeVerdict, f64), String> {
         let transcript = render_transcript_tail(messages, goal_config.judge_transcript_chars);
         let mut judge_messages = vec![
             CompletionMessage::system(JUDGE_SYSTEM_PROMPT),
@@ -260,7 +258,7 @@ impl Engine<'_> {
             .await
         {
             TurnOutcome::Completed { text, cost_usd } => {
-                let verdict = parse_verdict(&text).unwrap_or_else(|| JudgeVerdict {
+                let verdict = parse_verdict(&text).unwrap_or_else(|| GoalJudgeVerdict {
                     met: false,
                     reasoning: "judge response was not parseable JSON — treated as not met".into(),
                     feedback: format!(
@@ -278,7 +276,7 @@ impl Engine<'_> {
 
 /// Extract the verdict from judge output that may wrap its JSON in prose or
 /// a code fence: parse the outermost `{ … }` span.
-fn parse_verdict(text: &str) -> Option<JudgeVerdict> {
+fn parse_verdict(text: &str) -> Option<GoalJudgeVerdict> {
     let start = text.find('{')?;
     let end = text.rfind('}')?;
     if end <= start {
@@ -667,6 +665,58 @@ mod tests {
             }
             other => panic!("expected Unmet, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn an_aborted_turn_reports_the_spend_it_incurred_before_aborting() {
+        use stella_protocol::ToolCall;
+
+        // Round 1: the worker spends on a tool-calling step ($0.05, recorded
+        // into the budget guard), then its next model call errors → the turn
+        // aborts. The reported cost must reflect that $0.05, not $0 — the
+        // aborted turn's spend used to be dropped from GoalOutcome.cost_usd.
+        let tool_step = CompletionResult {
+            text: String::new(),
+            tool_calls: vec![ToolCall {
+                call_id: "c1".into(),
+                name: "noop".into(),
+                input: serde_json::json!({}),
+            }],
+            usage: CompletionUsage::default(),
+            model: "scripted".into(),
+            cost_usd: 0.05,
+            finish_reason: None,
+        };
+        let worker = ScriptedProvider::new(vec![
+            Ok(tool_step),
+            Err(ProviderError::Auth("expired".into())),
+        ]);
+        let judge = ScriptedProvider::new(vec![]);
+        let tools = NoTools;
+        let engine = Engine::with_sleeper(&worker, &tools, EngineConfig::default(), &NoSleep);
+        let mut messages = vec![CompletionMessage::system("sys")];
+        let mut budget = BudgetGuard::new(BudgetMode::Observed, None, None);
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        let outcome = engine
+            .run_goal(
+                &judge,
+                "goal",
+                &mut messages,
+                &mut budget,
+                &tx,
+                &GoalConfig::default(),
+            )
+            .await;
+
+        match outcome {
+            GoalOutcome::Unmet { cost_usd, .. } => assert!(
+                (cost_usd - 0.05).abs() < 1e-9,
+                "aborted-turn spend must be reported, got {cost_usd}"
+            ),
+            other => panic!("expected Unmet, got {other:?}"),
+        }
+        assert!((budget.session_spent_usd() - 0.05).abs() < 1e-9);
     }
 
     #[test]

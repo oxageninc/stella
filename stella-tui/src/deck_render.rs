@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
-use ratatui::layout::{Alignment, Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, StatefulWidget, Widget};
@@ -120,7 +120,7 @@ pub fn render_deck(model: &WorkspaceModel, ui: &mut DeckUi, frame: &mut Frame) {
     }
 
     if ui.help_open {
-        render_help(area, buf);
+        render_help(ui, area, buf);
     }
 }
 
@@ -486,7 +486,9 @@ fn render_status_bar(model: &WorkspaceModel, ui: &DeckUi, area: Rect, buf: &mut 
     // ── the cells, left → right (brand + ethos are pinned separately) ──────
     let cpu = f64::from(model.global_cpu_pct);
     let focused = model.agents.get(ui.focused);
-    let ctx_tokens = focused.map_or(0, |a| a.tokens_in);
+    // Current window occupancy = the latest call's prompt size, not the
+    // session's cumulative input (which dwarfs the window after a few turns).
+    let ctx_tokens = focused.map_or(0, |a| a.context_tokens);
     const CTX_WINDOW: u64 = 200_000;
     let ctx_frac = (ctx_tokens as f64 / CTX_WINDOW as f64).min(1.0);
 
@@ -746,10 +748,20 @@ fn fmt_tokens(n: u64) -> String {
     }
 }
 
-/// A centered help overlay listing the deck's keys.
-fn render_help(area: Rect, buf: &mut Buffer) {
-    let w = area.width.min(62);
-    let h = area.height.min(29);
+/// The help-overlay markdown body — one source of truth for both the `?` key
+/// and the `/help` command. Categorized (controls, tabs, per-tab, commands) so
+/// a new user can scan for what they need, and a returning user can jump to
+/// the section they forgot. Kept here, next to the renderer, so the two never
+/// drift.
+const HELP_BODY: &str = include_str!("help.md");
+
+/// A large, scrollable, categorized help overlay — the single reference for
+/// every deck key and command. Opened by `?` (empty composer) or `/help`;
+/// scroll with ↑/↓/PageUp/PageDown/Home/End, close with `Esc`/`q`/`?`.
+fn render_help(ui: &mut DeckUi, area: Rect, buf: &mut Buffer) {
+    // A large panel: most of the frame, capped so the border always fits.
+    let w = area.width.min(74);
+    let h = area.height.min(area.height.saturating_sub(2).max(20));
     let popup = Rect {
         x: area.x + (area.width.saturating_sub(w)) / 2,
         y: area.y + (area.height.saturating_sub(h)) / 2,
@@ -858,6 +870,35 @@ fn render_help(area: Rect, buf: &mut Buffer) {
                 .title(" ? "),
         )
         .render(popup, buf);
+
+    let title = " Command Deck — help · ↑/↓ scroll · esc close ";
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(theme::accent())
+        .title(title);
+    let inner = block.inner(popup);
+    block.render(popup, buf);
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+
+    // Render the markdown through Stella's own renderer so the overlay stays
+    // inside the ember palette (headings, bold, code spans, rules — the same
+    // styling the transcript uses).
+    let text = ratatui::text::Text::from(crate::markdown::render(HELP_BODY));
+    let total = text.height();
+    let height = inner.height as usize;
+
+    // Record viewport metrics for the pure key handler (`handle_help_key`).
+    ui.metrics.help_total = total;
+    ui.metrics.help_height = height;
+
+    let window = ui.help_scroll.window(total, height);
+    // `Paragraph::scroll` takes an absolute line offset; the window's start is
+    // exactly that (clamped by `ScrollState::window` to a valid range).
+    Paragraph::new(text)
+        .scroll((window.start as u16, 0))
+        .render(inner, buf);
 }
 
 #[cfg(test)]
