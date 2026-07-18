@@ -712,7 +712,10 @@ mod tests {
         for c in "atx".chars() {
             assert_eq!(handle_key(ch(c), &model, &mut ui), ShellAction::Handled);
         }
-        assert!(!ui.scope_answered, "no decision submitted while a prompt is typed");
+        assert!(
+            !ui.scope_answered,
+            "no decision submitted while a prompt is typed"
+        );
         assert_eq!(ui.composer.buffer(), "fatx");
 
         // From an empty composer the gate still decides on a single key.

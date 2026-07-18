@@ -1932,7 +1932,11 @@ mod tests {
         model.apply(&AgentEvent::Text {
             delta: " …and still more streamed text arriving token by token".into(),
         });
-        assert_eq!(model.transcript.len(), 1, "the delta coalesced, not appended");
+        assert_eq!(
+            model.transcript.len(),
+            1,
+            "the delta coalesced, not appended"
+        );
         ui.ensure_transcript_lines(&model, false, 40);
         assert_eq!(ui.transcript_lines(), transcript_lines(&model, false, 40));
         assert_ne!(

@@ -781,7 +781,10 @@ mod tests {
             .with_skill_registry(registry);
 
         let out = set
-            .execute("install_skill", &serde_json::json!({ "id": "acme/demo-skill" }))
+            .execute(
+                "install_skill",
+                &serde_json::json!({ "id": "acme/demo-skill" }),
+            )
             .await;
         assert!(!out.is_error(), "install should succeed, got {out:?}");
 

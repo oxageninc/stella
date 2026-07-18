@@ -444,7 +444,8 @@ impl DeckUi {
                 InstalledMode::Edit => self.installed.editor.paste(text),
                 InstalledMode::CreateDescribe => self.installed.create_desc.push_str(text),
                 // Scope / version pickers hold no text — swallow, never leak.
-                InstalledMode::CreateScope | InstalledMode::PickVersion | InstalledMode::Browse => {}
+                InstalledMode::CreateScope | InstalledMode::PickVersion | InstalledMode::Browse => {
+                }
             }
             return;
         }
