@@ -1,6 +1,5 @@
 //! Role → model resolver + per-provider circuit breaker
-//! ( Phase 2 item 2;
-//! roles, §2 provider adapters, §5 default role
+//! (roles, provider adapters, and default role
 //! assignments by scenario — the authoritative precedence this module
 //! implements).
 //!

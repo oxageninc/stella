@@ -1,18 +1,18 @@
 //! The OCP wire envelope and its framing.
 //!
-//! /§3.1 states OCP "rides MCP's transport and
+//! OCP rides MCP's transport and
 //! lifecycle conventions (JSON-RPC 2.0, stdio + streamable HTTP,
-//! initialize/capabilities handshake)". The spec leaves the concrete
+//! initialize/capabilities handshake). OCP leaves the concrete
 //! reference-host framing to the binding; this host frames every message as
 //! **newline-delimited JSON (NDJSON) — exactly one `serde_json` value per
 //! line** — because it is the simplest thing that is unambiguous over a pipe
-//! and trivially reimplementable in the TS/Python provider kits
-//!. The `type`-tagged variants below are the
-//! OCP method vocabulary the spec calls "the delta": `handshake` ↔
+//! and trivially reimplementable in the TS/Python provider kits.
+//! The `type`-tagged variants below are the
+//! OCP method vocabulary known as "the delta": `handshake` ↔
 //! `initialize`, `query` ↔ `context/query`, `frames` ↔ its response,
 //! `shutdown` ↔ lifecycle teardown. HTTP providers receive the
 //! same envelope as a JSON request body and reply with one as the response
-//! body (§3.2 "streamable HTTP").
+//! body.
 //!
 //! The envelope is **versioned**: the handshake exchange negotiates the
 //! protocol family up front, and a mismatch is a named error, never a

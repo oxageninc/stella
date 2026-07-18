@@ -1,6 +1,6 @@
 //! Vertex AI adapter — Google's enterprise surface for the same
-//! `generateContent` wire shape `gemini.rs` speaks (:
-//! "Vertex | ADC | generateContent | catalog-driven … Enterprise path;
+//! `generateContent` wire shape `gemini.rs` speaks
+//! ("Vertex | ADC | generateContent | catalog-driven … Enterprise path;
 //! casual Gemini use → direct adapter"). The request/response envelope,
 //! tool-call dialect (`gemini-functions`), and stream aggregation are all
 //! shared with `gemini.rs`; what differs is auth and addressing:

@@ -1,7 +1,6 @@
 //! The engine's one internal tool-call schema. Provider adapters translate
 //! to/from their own dialect (`anthropic-tools`, `openai-json`,
-//! `gemini-functions`) —
-//! §4. Nothing outside `stella-model` should ever construct a
+//! `gemini-functions`). Nothing outside `stella-model` should ever construct a
 //! provider-native tool-call shape directly.
 
 use serde::{Deserialize, Serialize};

@@ -6,7 +6,7 @@
 //! unconsented egress provider, enforces per-provider timeouts, and audits
 //! budget honesty — a provider that returns frames summing above the query
 //! budget lied about `token_cost`, so its frames are dropped with a loud
-//! named report rather than silently trusted (§3.3, task deliverable 3).
+//! named report rather than silently trusted (task deliverable 3).
 //! Per-provider isolation is total: one provider erroring, timing out, being
 //! dropped for a budget lie, or crashing mid-query never poisons the others
 //! (task deliverable 5).

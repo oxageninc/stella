@@ -525,7 +525,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    // ---- ApiKey::resolve precedence (per-provider-per-source, §4) --------
+    // ---- ApiKey::resolve precedence (per-provider-per-source) --------
     //
     // Each test below exercises the chain for a distinct provider id/env
     // var pair so tests can run in parallel without racing on shared env

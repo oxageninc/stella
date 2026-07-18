@@ -1,5 +1,5 @@
-//! Model catalog. Binding rule from
-//! : **a slug not present
+//! Model catalog. Binding rule:
+//! **a slug not present
 //! in the catalog is a hard, immediate, named error, never a silent
 //! fallback** (the TS-era phantom `glm-5.2-turbo` slug and gateway
 //! slug-drift lessons, L-M1/L-M2). The seed below covers every provider
@@ -13,8 +13,8 @@
 
 use stella_protocol::{CompletionUsage, ProviderError};
 
-/// Per-model list pricing in USD per million tokens (
-/// §6). Seed values below are day-0 offline approximations of each
+/// Per-model list pricing in USD per million tokens.
+/// Seed values below are day-0 offline approximations of each
 /// provider's published list price; `stella models refresh` (future work)
 /// overwrites them with live data. Cached input is billed at its own,
 /// cheaper rate — cached tokens are a *subset* of `input_tokens` in the

@@ -1,5 +1,4 @@
-//! The commit ledger ( "commit ledger (SQLite)", §6
-//! "`fleet.db` — SQLite: fleet commit ledger"). One embedded SQLite file
+//! The commit ledger — `fleet.db`, one embedded SQLite file
 //! (`rusqlite`, bundled — "one storage engine")
 //! recording, for every fleet run: its tasks, each dispatch attempt, the
 //! commits an attempt produced, the parent→child lineage, and per-task USD

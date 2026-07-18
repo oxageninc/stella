@@ -48,8 +48,8 @@ pub enum HostError {
     Provider { id: String, message: String },
 
     /// The provider declares `egress` and has no recorded consent, so the
-    /// host refuses to transmit a query to it (
-    /// §3.5 — a host MUST NOT auto-enable egress providers). The query
+    /// host refuses to transmit a query to it (a host MUST NOT
+    /// auto-enable egress providers). The query
     /// payload never left the host.
     #[error(
         "provider {id} declares egress and requires one-time consent naming what leaves before it can be queried"
