@@ -486,7 +486,9 @@ fn render_status_bar(model: &WorkspaceModel, ui: &DeckUi, area: Rect, buf: &mut 
     // ── the cells, left → right (brand + ethos are pinned separately) ──────
     let cpu = f64::from(model.global_cpu_pct);
     let focused = model.agents.get(ui.focused);
-    let ctx_tokens = focused.map_or(0, |a| a.tokens_in);
+    // Current window occupancy = the latest call's prompt size, not the
+    // session's cumulative input (which dwarfs the window after a few turns).
+    let ctx_tokens = focused.map_or(0, |a| a.context_tokens);
     const CTX_WINDOW: u64 = 200_000;
     let ctx_frac = (ctx_tokens as f64 / CTX_WINDOW as f64).min(1.0);
 
