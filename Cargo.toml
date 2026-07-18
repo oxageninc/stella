@@ -12,6 +12,7 @@ members = [
   "stella-mcp",
   "stella-media",
   "stella-fleet",
+  "stella-observatory",
   "stella-tui",
   "stella-cli",
 ]

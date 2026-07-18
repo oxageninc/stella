@@ -1,8 +1,8 @@
 //! Gemini direct adapter — Google's native `generativelanguage.googleapis.com`
-//! generateContent API (`gemini-functions` dialect, `07-model-matrix.md` §2/§4),
+//! generateContent API (`gemini-functions` dialect),
 //! replacing the OpenAI-compatibility shim `stella-cli` previously pointed
 //! `ZaiProvider` at. The shim works for plain chat but is not the wire shape
-//! the spec calls for and drops everything Gemini-specific: thinking level,
+//! Gemini needs, and drops everything Gemini-specific: thinking level,
 //! thought-signature round-trips (required for Gemini 3 function calling),
 //! cached-token accounting, and the native media endpoints (Imagen/Veo)
 //! that later phases hang off this same adapter family.
@@ -11,7 +11,7 @@
 //! `vertex.rs` — Vertex AI speaks the identical `generateContent` response
 //! shape behind different auth (OAuth bearer vs. API key) and a
 //! project/location-scoped URL, so the two adapters differ only in those
-//! seams (`07-model-matrix.md` §2: "casual Gemini use → direct adapter",
+//! seams ("casual Gemini use → direct adapter",
 //! Vertex is the enterprise path).
 
 use async_trait::async_trait;
@@ -262,7 +262,7 @@ pub(crate) struct GeminiInboundPart {
 /// assignment wins. `candidates_token_count` excludes thinking tokens; the
 /// engine's one `output_tokens` figure includes them (they are billed
 /// output), per the "normalization lives in the adapter" rule
-/// (`07-model-matrix.md` §6).
+///
 #[derive(Deserialize, Debug, Default)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct GeminiUsageMetadata {

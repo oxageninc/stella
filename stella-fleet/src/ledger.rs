@@ -1,6 +1,5 @@
-//! The commit ledger (`02-architecture.md` §2 "commit ledger (SQLite)", §6
-//! "`fleet.db` — SQLite: fleet commit ledger"). One embedded SQLite file
-//! (`rusqlite`, bundled — `02-architecture.md` §1.6 "one storage engine")
+//! The commit ledger — `fleet.db`, one embedded SQLite file
+//! (`rusqlite`, bundled — "one storage engine")
 //! recording, for every fleet run: its tasks, each dispatch attempt, the
 //! commits an attempt produced, the parent→child lineage, and per-task USD
 //! spend.
@@ -93,7 +92,7 @@ pub struct Ledger {
 
 impl Ledger {
     /// Open (creating if absent) the ledger at `path` — the CLI opens
-    /// `<workspace>/.stella/fleet.db` (`02-architecture.md` §6). Enables WAL
+    /// `<workspace>/.stella/fleet.db`. Enables WAL
     /// and foreign keys, then applies the schema.
     pub fn open(path: &Path) -> Result<Self, LedgerError> {
         let conn = Connection::open(path)?;

@@ -177,6 +177,15 @@ without a code change, and override built-in defaults, from a `settings.json`:
 Then: `stella --model together/meta-llama/Llama-3.3-70B-Instruct-Turbo run "…"`.
 Prefer `api_key_env` over a literal `api_key` — settings files get committed.
 
+> **Untrusted repos can't redirect your key.** A cloned repo's project-scope
+> `.stella/settings.json` is untrusted: its credential-routing fields
+> (`base_url`, `api_key`, `api_key_env`, and `mcp.registry_url`) are **ignored**
+> unless you opt in with `STELLA_TRUST_PROJECT=1`, so a hostile repo can't
+> silently point your real API key at its own server. Cosmetic fields
+> (`name`, `default_model`, `dialect`) still apply; the user and org-managed
+> scopes are always trusted. Project hooks are gated the same way, via
+> `STELLA_PROJECT_HOOKS`.
+
 ## Usage
 
 ### Interactive chat (default)
@@ -186,8 +195,8 @@ stella            # or: stella chat
 ```
 
 On a TTY this opens the **Command Deck** — a tabbed TUI (Session · Agents ·
-Traces · Graph · Files) with PR-style diffs and an editable prompt queue. `--plain`
-(or `STELLA_PLAIN=1`, or piped stdio) falls back to the line REPL.
+Traces · Graph · Files · Skills · MCP) with PR-style diffs and an editable prompt
+queue. `--plain` (or `STELLA_PLAIN=1`, or piped stdio) falls back to the line REPL.
 
 **In-chat commands:**
 
@@ -197,7 +206,7 @@ Traces · Graph · Files) with PR-style diffs and an editable prompt queue. `--p
 | `/files` | Show the Files-Touched panel — `[C·R·U·D] path` per file |
 | `/models` `/config` | List providers/models · show resolved configuration |
 | `/rename <name>` `/color <name>` | Rename the tab · switch accent color |
-| `/pipeline` | Toggle witness-verified staged turns (Command Deck; see `docs/pipeline.md`) |
+| `/pipeline` | Toggle witness-verified staged turns (Command Deck; see `docs/design/pipeline.md`) |
 | `/clear` `/help` | Clear history · show help |
 | `/exit` or `Ctrl-D` | Exit |
 
@@ -255,7 +264,7 @@ stella stats     # cost, tokens, and $/resolved task per provider/model
 uses the staged pipeline by default; `--no-pipeline` falls back to the raw
 step-loop. In pipeline mode, `--test-command <cmd>` arms deterministic
 verification with your own test; without it an independent witness author
-writes a failing test whose fail→pass flip proves the work (`docs/pipeline.md`).
+writes a failing test whose fail→pass flip proves the work (`docs/design/pipeline.md`).
 
 ## Built-in tools
 
@@ -401,7 +410,7 @@ recall routes through).
 | `stella-protocol` | Zero-logic, zero-I/O stability contract: shared serde types + the `Provider`/tool ports |
 | `stella-context` | The context plane: reflection-memory recall + embedding index, episodes, bi-temporal facts |
 | `stella-graph` | Tree-sitter symbol + import-edge indexer (Rust/TS/JS/Python/SQL) |
-| `stella-pipeline` | The orchestration plane above the engine — the default `stella run` path: triage → plan → scope review → witness → execute → verify → judge (`docs/pipeline.md`) |
+| `stella-pipeline` | The orchestration plane above the engine — the default `stella run` path: triage → plan → scope review → witness → execute → verify → judge (`docs/design/pipeline.md`) |
 | `stella-fleet` | The multi-agent fleet behind `stella fleet`: DAG planner + wave scheduling, git-worktree isolation per task |
 | `stella-media` | Multimodal generation behind one `MediaProvider` port — image generation wired as the `generate_image` tool (registered when a media-capable key is set); SVG/video library-complete but not yet exposed as tools |
 | `stella-tui` | The Command Deck — a pure event-fold core + thin crossterm shell |
