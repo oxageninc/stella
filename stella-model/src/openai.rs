@@ -309,6 +309,14 @@ fn map_reasoning_effort(effort: ReasoningEffort) -> &'static str {
     }
 }
 
+/// Whether `model` is an OpenAI reasoning model (gpt-5 family or the
+/// o-series). Their Responses API rejects the `temperature` sampling
+/// parameter with HTTP 400; the caller omits it for these models.
+fn is_reasoning_model(model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    m.starts_with("gpt-5") || m.starts_with("o1") || m.starts_with("o3") || m.starts_with("o4")
+}
+
 fn to_openai_input(messages: &[CompletionMessage]) -> (Option<String>, Vec<OpenAiInputItem>) {
     let mut instructions: Vec<String> = Vec::new();
     let mut out = Vec::new();
@@ -391,7 +399,15 @@ impl Provider for OpenAiProvider {
             instructions: instructions.as_deref(),
             stream: true,
             max_output_tokens: req.max_output_tokens,
-            temperature: req.temperature,
+            // gpt-5 family and the o-series are reasoning models whose
+            // Responses API rejects `temperature` with HTTP 400. The engine's
+            // default temperature (Some(0.0)) would otherwise fail every real
+            // OpenAI turn Terminal, so omit it for those models.
+            temperature: if is_reasoning_model(&self.model) {
+                None
+            } else {
+                req.temperature
+            },
             tools: to_openai_tools(&req.tools),
             reasoning: req.effort.map(|effort| OpenAiReasoning {
                 effort: map_reasoning_effort(effort),
@@ -581,6 +597,57 @@ mod tests {
         provider.complete(req()).await.expect("second turn");
         // The same provider instance keys both turns identically — routing
         // them to the same cache shard is the whole point.
+    }
+
+    #[test]
+    fn reasoning_models_are_classified_by_family() {
+        assert!(is_reasoning_model("gpt-5.5"));
+        assert!(is_reasoning_model("gpt-5"));
+        assert!(is_reasoning_model("o3-mini"));
+        assert!(is_reasoning_model("o1"));
+        assert!(!is_reasoning_model("gpt-4o"));
+        assert!(!is_reasoning_model("gpt-4.1"));
+    }
+
+    /// The gpt-5 Responses API rejects `temperature` with HTTP 400. The engine
+    /// defaults temperature to `Some(0.0)`, so the adapter MUST drop it for a
+    /// reasoning model or every real OpenAI turn fails. Witness: even with a
+    /// caller-set temperature, the wire body for gpt-5.5 carries no
+    /// `temperature` key.
+    #[tokio::test]
+    async fn temperature_is_omitted_for_a_gpt5_reasoning_model() {
+        let server = MockServer::start().await;
+        let sse_body = concat!(
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n",
+        );
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse_body, "text/event-stream"))
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiProvider::new(ApiKey::new("sk-test-openai"), "gpt-5.5")
+            .with_base_url(server.uri());
+        provider
+            .complete(CompletionRequest {
+                messages: vec![CompletionMessage::user("hi")],
+                max_output_tokens: None,
+                temperature: Some(0.0), // the engine default that used to 400
+                effort: None,
+                tools: vec![],
+            })
+            .await
+            .expect("turn");
+
+        let requests = server.received_requests().await.expect("recorded requests");
+        let body = String::from_utf8_lossy(&requests[0].body);
+        assert!(
+            !body.contains("\"temperature\""),
+            "gpt-5.5 request must not carry temperature, got: {body}"
+        );
     }
 
     #[test]

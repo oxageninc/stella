@@ -436,15 +436,70 @@ impl DeckUi {
         }
     }
 
-    /// Route a bracketed paste to whichever editing surface owns the
-    /// keyboard: the agent-definition editor while it is open, the global
-    /// composer otherwise. Keeps [`crate::deck_shell`] a dumb wire.
+    /// Route a bracketed paste to whichever surface owns the keyboard, in the
+    /// SAME precedence [`handle_deck_key`] routes keystrokes — so a paste lands
+    /// in the focused input, never the global composer behind it.
+    ///
+    /// This is a security boundary as much as a UX one: the most important case
+    /// is the MCP credential **value** step, where a pasted secret would
+    /// otherwise land — in plaintext — in the composer and could be sent as a
+    /// prompt or shown in the transcript. A modal text input always wins; only
+    /// when nothing modal owns the keyboard does the composer receive the paste.
+    /// Keeps [`crate::deck_shell`] a dumb wire.
     pub fn paste(&mut self, text: &str) {
-        if self.installed.mode == InstalledMode::Edit {
-            self.installed.editor.paste(text);
-        } else {
-            self.composer.paste(text);
+        // 1. Installed-agents sub-modes are modal while open.
+        if self.installed.mode != InstalledMode::Browse {
+            match self.installed.mode {
+                InstalledMode::Edit => self.installed.editor.paste(text),
+                InstalledMode::CreateDescribe => self.installed.create_desc.push_str(text),
+                // Scope / version pickers hold no text — swallow, never leak.
+                InstalledMode::CreateScope | InstalledMode::PickVersion | InstalledMode::Browse => {
+                }
+            }
+            return;
         }
+
+        // 2. The Graph tab's modal file-filter input.
+        if self.graph_picker_open {
+            push_single_line(&mut self.graph_picker_query, text);
+            return;
+        }
+
+        // 3. The SKILLS tab is keyboard-owning: its overlays and search query
+        //    claim keys ahead of the composer, so a paste must too.
+        if self.tab == DeckTab::Skills {
+            match &mut self.skills.prompt {
+                Some(SkillPrompt::CreateDescription { buffer })
+                | Some(SkillPrompt::Edit { buffer, .. }) => buffer.push_str(text),
+                // Scope / pin pickers hold no text.
+                Some(SkillPrompt::Scope { .. } | SkillPrompt::Pin { .. }) => {}
+                None if self.skills.focus == SkillsFocus::Search => {
+                    push_single_line(&mut self.skills.query, text);
+                }
+                // Installed-list navigation owns no text input: fall through to
+                // the composer, matching its printable-char fallthrough.
+                None => self.composer.paste(text),
+            }
+            return;
+        }
+
+        // 4. The MCP tab's modal search and credential inputs.
+        if self.tab == DeckTab::Mcp {
+            match self.mcp.mode {
+                McpMode::Search => push_single_line(&mut self.mcp.query, text),
+                McpMode::Auth => match self.mcp.auth.step {
+                    AuthStep::Field => push_single_line(&mut self.mcp.auth.field, text),
+                    // The secret value: NEVER the composer.
+                    AuthStep::Value => push_single_line(&mut self.mcp.auth.value, text),
+                },
+                // Browse list owns no text input — start a prompt like any tab.
+                McpMode::Browse => self.composer.paste(text),
+            }
+            return;
+        }
+
+        // 5. Default: the global composer.
+        self.composer.paste(text);
     }
 
     /// Point the deck at agent `idx`. A session-message selection indexes the
@@ -666,6 +721,14 @@ fn clamp(model: &WorkspaceModel, ui: &mut DeckUi) {
 /// the global composer, so a stop must leave a typed draft untouched. A
 /// pending ask-user gate never reaches them either — it folds the agent to
 /// [`AgentStatus::WaitingInput`], which fails rule 9's `Running` check.
+/// Append a paste into a single-line input, dropping newlines so a multi-line
+/// clipboard blob cannot smuggle extra "lines" into a one-line field (a search
+/// query, a credential field, a secret value). Multi-line surfaces (the agent
+/// editor, a skill body) take the raw text instead.
+fn push_single_line(buf: &mut String, text: &str) {
+    buf.extend(text.chars().filter(|&c| c != '\n' && c != '\r'));
+}
+
 pub fn handle_deck_key(key: KeyEvent, model: &WorkspaceModel, ui: &mut DeckUi) -> DeckAction {
     if key.kind == KeyEventKind::Release {
         return DeckAction::Ignored;
@@ -775,11 +838,14 @@ pub fn handle_deck_key(key: KeyEvent, model: &WorkspaceModel, ui: &mut DeckUi) -
 
     // The SKILLS tab is a keyboard-owning manager: it claims the keys for its
     // list, search query, and overlays *ahead* of tab-nav and the global
-    // composer, so a search term (or a manage hotkey like space) is never
-    // swallowed as prompt text. Keys it declines (`None`) fall through — Tab
-    // still leaves the tab, `?` still opens help from the installed pane.
+    // composer. But its bare-letter/space manage hotkeys (space/e/p/n) honor
+    // the deck-wide "hotkeys only from an empty composer" contract — while a
+    // prompt is being typed they fall through so the letters build the prompt,
+    // never trigger an edit/pin/create. Search-query typing and the modal
+    // overlays are genuine text inputs and always claim. Keys it declines
+    // (`None`) fall through — Tab still leaves the tab, `?` still opens help.
     if ui.tab == DeckTab::Skills
-        && let Some(action) = handle_skills_key(key, ui)
+        && let Some(action) = handle_skills_key(key, ui, composer_empty)
     {
         return action;
     }
@@ -1270,7 +1336,7 @@ fn handle_pick_version_key(key: KeyEvent, ui: &mut DeckUi) -> DeckAction {
 /// composer (nav, manage hotkeys, the search query, overlays), `None` for keys
 /// that should fall through to the deck-global handlers — Tab still leaves the
 /// tab and `?` still opens help from the installed pane.
-fn handle_skills_key(key: KeyEvent, ui: &mut DeckUi) -> Option<DeckAction> {
+fn handle_skills_key(key: KeyEvent, ui: &mut DeckUi, composer_empty: bool) -> Option<DeckAction> {
     // The ctrl+o preview overlay is fully modal (scroll + esc close) and sits
     // ahead of every pane and the other prompts.
     if ui.skills.preview.is_some() {
@@ -1282,7 +1348,7 @@ fn handle_skills_key(key: KeyEvent, ui: &mut DeckUi) -> Option<DeckAction> {
     }
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     match ui.skills.focus {
-        SkillsFocus::Installed => handle_skills_installed_key(key, ui, ctrl),
+        SkillsFocus::Installed => handle_skills_installed_key(key, ui, ctrl, composer_empty),
         SkillsFocus::Search => handle_skills_search_key(key, ui),
     }
 }
@@ -1371,7 +1437,12 @@ fn handle_skills_preview_key(key: KeyEvent, ui: &mut DeckUi) -> DeckAction {
 
 /// The installed-skills (manage) pane: navigate, toggle enabled (space),
 /// uninstall (ctrl+x twice), edit (e), pin (p), create (n), cross to search (→).
-fn handle_skills_installed_key(key: KeyEvent, ui: &mut DeckUi, ctrl: bool) -> Option<DeckAction> {
+fn handle_skills_installed_key(
+    key: KeyEvent,
+    ui: &mut DeckUi,
+    ctrl: bool,
+    composer_empty: bool,
+) -> Option<DeckAction> {
     let count = ui.skills.view.rows.len();
     // Any key other than a fresh ctrl+x disarms the two-press uninstall.
     let was_armed = ui.skills.uninstall_armed;
@@ -1395,7 +1466,9 @@ fn handle_skills_installed_key(key: KeyEvent, ui: &mut DeckUi, ctrl: bool) -> Op
             }
             Some(DeckAction::Handled)
         }
-        KeyCode::Char(' ') => {
+        // space toggles enabled — but only from an empty composer, so a space
+        // typed mid-prompt builds the prompt instead of flipping a skill.
+        KeyCode::Char(' ') if composer_empty => {
             let Some(row) = ui.skills.view.rows.get(ui.skills.sel) else {
                 return Some(DeckAction::Handled);
             };
@@ -1450,7 +1523,7 @@ fn handle_skills_installed_key(key: KeyEvent, ui: &mut DeckUi, ctrl: bool) -> Op
         // Preview the selected skill's rendered SKILL.md (scrollable, esc closes).
         KeyCode::Char('o') if ctrl => open_installed_preview(ui),
         // Edit the selected skill's body (saving makes a new pinned version).
-        KeyCode::Char('e') if !ctrl => {
+        KeyCode::Char('e') if !ctrl && composer_empty => {
             if let Some(row) = ui.skills.view.rows.get(ui.skills.sel) {
                 ui.skills.prompt = Some(SkillPrompt::Edit {
                     scope: row.scope,
@@ -1461,7 +1534,7 @@ fn handle_skills_installed_key(key: KeyEvent, ui: &mut DeckUi, ctrl: bool) -> Op
             Some(DeckAction::Handled)
         }
         // Pin a specific version (no edit, no version bump).
-        KeyCode::Char('p') if !ctrl => {
+        KeyCode::Char('p') if !ctrl && composer_empty => {
             if let Some(row) = ui.skills.view.rows.get(ui.skills.sel) {
                 if row.latest <= 1 {
                     ui.skills.status = Some(format!("{} has only one version", row.name));
@@ -1477,7 +1550,7 @@ fn handle_skills_installed_key(key: KeyEvent, ui: &mut DeckUi, ctrl: bool) -> Op
             Some(DeckAction::Handled)
         }
         // Create a new skill with LLM assistance from a short description.
-        KeyCode::Char('n') if !ctrl => {
+        KeyCode::Char('n') if !ctrl && composer_empty => {
             ui.skills.prompt = Some(SkillPrompt::CreateDescription {
                 buffer: String::new(),
             });
@@ -3564,6 +3637,65 @@ mod tests {
     }
 
     #[test]
+    fn a_pasted_secret_lands_in_the_credential_value_never_the_composer() {
+        // THE paste-routing security P1: a bracketed paste while the MCP auth
+        // VALUE step is focused used to fall through to the global composer, so
+        // a pasted API token landed — in plaintext — in the prompt buffer (and
+        // could be sent, or shown in the transcript). It must route to the
+        // credential value input instead.
+        let model = model_with(&["lead"]);
+        let mut ui = ready_ui();
+        ui.set_tab(DeckTab::Mcp);
+        ui.mcp.servers = vec![crate::envelope::McpServerInfo {
+            name: "github".into(),
+            kind: "http".into(),
+            enabled: true,
+            connected: true,
+            health: Some("live".into()),
+            tool_count: 1,
+            auth_fields: vec![],
+            calls: 0,
+        }];
+        handle_deck_key(ch('a'), &model, &mut ui); // enter auth
+        for c in "TOKEN".chars() {
+            handle_deck_key(ch(c), &model, &mut ui);
+        }
+        handle_deck_key(key(KeyCode::Enter), &model, &mut ui); // → Value step
+        assert_eq!(ui.mcp.auth.step, crate::views::mcp::AuthStep::Value);
+
+        // Paste a multi-line secret blob.
+        ui.paste("sk-pasted-token\nextra");
+
+        // It went into the credential value (newlines dropped — a one-line
+        // field), and did NOT leak into the global composer.
+        assert_eq!(ui.mcp.auth.value, "sk-pasted-tokenextra");
+        assert!(
+            ui.composer.buffer().is_empty(),
+            "a pasted secret must never reach the composer: {:?}",
+            ui.composer.buffer()
+        );
+    }
+
+    #[test]
+    fn a_paste_in_skills_search_types_into_the_query_not_the_composer() {
+        // The SKILLS tab is keyboard-owning: a paste in its search pane must
+        // build the query, exactly like typed characters do, never the composer.
+        // (paste() is a direct DeckUi method, so no WorkspaceModel is needed.)
+        let mut ui = ready_ui();
+        ui.set_tab(DeckTab::Skills);
+        ui.skills.focus = SkillsFocus::Search;
+
+        ui.paste("postgres\nmigrations");
+
+        assert_eq!(ui.skills.query, "postgresmigrations");
+        assert!(
+            ui.composer.buffer().is_empty(),
+            "a skills-tab paste must not reach the composer: {:?}",
+            ui.composer.buffer()
+        );
+    }
+
+    #[test]
     fn slash_diff_switches_to_files_and_opens_the_diff() {
         let model = model_with(&["lead"]);
         let mut ui = ready_ui();
@@ -4258,6 +4390,49 @@ mod tests {
                 body: "old body +more".into(),
             }))
         );
+    }
+
+    #[test]
+    fn skills_manage_hotkeys_yield_to_a_nonempty_composer() {
+        // THE skills-key P1: the installed-pane manage hotkeys (space/e/p/n)
+        // were claimed unconditionally, so typing a prompt on the SKILLS tab was
+        // hijacked — 'n' opened the create flow, 'e' the edit overlay, space
+        // toggled a skill. They must honor the deck-wide "hotkeys only from an
+        // empty composer" contract and, mid-prompt, build the prompt instead.
+        let model = WorkspaceModel::new();
+        let mut ui = skills_ui();
+        let r = a_row("sql-style", SkillScope::Project, true);
+        ui.skills.view = SkillsView {
+            rows: vec![r],
+            status: None,
+            busy: false,
+        };
+
+        // 'r' is not a hotkey → it falls through to the composer, so the
+        // composer is now non-empty.
+        handle_deck_key(ch('r'), &model, &mut ui);
+        assert_eq!(ui.composer.buffer(), "r");
+
+        // Now the manage-hotkey characters type into the composer, not fire.
+        for c in "enp e".chars() {
+            handle_deck_key(ch(c), &model, &mut ui);
+        }
+        assert!(
+            ui.skills.prompt.is_none(),
+            "no manage overlay may open while a prompt is being typed"
+        );
+        assert!(
+            ui.skills.view.rows[0].enabled,
+            "space must not toggle the skill mid-prompt"
+        );
+        assert_eq!(ui.composer.buffer(), "renp e");
+
+        // From an EMPTY composer, 'e' still opens the edit overlay as designed —
+        // the gate only defers to a prompt in progress, it doesn't disable the
+        // hotkeys.
+        ui.composer.clear();
+        handle_deck_key(ch('e'), &model, &mut ui);
+        assert!(matches!(ui.skills.prompt, Some(SkillPrompt::Edit { .. })));
     }
 
     #[test]
