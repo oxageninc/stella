@@ -1123,4 +1123,63 @@ mod tests {
         // An empty turn slice (nothing happened) is trivially skippable.
         assert!(!turn_warrants_reflection(&[]));
     }
+
+    /// End-to-end proof that the self-improvement write path works: a
+    /// reflection model call returning lessons must land them in BOTH the
+    /// mining log (`.stella/reflections.jsonl`) and the recallable context
+    /// store. Uses a stub provider so the assertion is deterministic (the
+    /// live model legitimately returns `[]` for trivial turns).
+    #[tokio::test]
+    async fn reflect_and_record_writes_lessons_to_log_and_store() {
+        use async_trait::async_trait;
+        use stella_protocol::{
+            CompletionRequest, CompletionResult, CompletionUsage, Provider, ProviderError,
+        };
+
+        struct StubProvider;
+        #[async_trait]
+        impl Provider for StubProvider {
+            fn id(&self) -> &str {
+                "stub"
+            }
+            async fn complete(
+                &self,
+                _req: CompletionRequest,
+            ) -> Result<CompletionResult, ProviderError> {
+                Ok(CompletionResult {
+                    text: r#"[{"lesson": "prefer withTenantDb over raw db()", "domains": []}]"#
+                        .into(),
+                    tool_calls: vec![],
+                    usage: CompletionUsage::default(),
+                    model: "stub".into(),
+                    cost_usd: 0.0,
+                    finish_reason: None,
+                })
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".stella")).unwrap();
+        let mut memory =
+            SessionMemory::open(dir.path(), false).expect("open session memory in temp workspace");
+
+        let transcript = vec![
+            msg(MessageRole::User, "fix the tenancy leak"),
+            msg(MessageRole::Assistant, "swapped db() for withTenantDb"),
+        ];
+        let report = memory
+            .reflect_and_record(&StubProvider, &transcript, true, true)
+            .await;
+
+        assert_eq!(report.recorded, 1, "the lesson was stored");
+        assert!(report.model_error.is_none());
+
+        // The mining log now carries the lesson, one JSON object per line.
+        let log = std::fs::read_to_string(dir.path().join(".stella/reflections.jsonl"))
+            .expect("reflections.jsonl was written");
+        assert!(
+            log.contains("withTenantDb"),
+            "the lesson reached the mining log: {log}"
+        );
+    }
 }
