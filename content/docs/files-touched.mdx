@@ -29,8 +29,8 @@ out-of-workspace path never produces a ledger entry.
 ### The `reason` field
 
 Each of `read_file`, `write_file`, `edit_file`, and `delete_file` accepts an optional
-`reason` string. It is stored verbatim in the audit log so the ledger reads like a
-changelog rather than a list of paths. When omitted, Stella fills in a per-operation
+`reason` string. It is stored (trimmed of surrounding whitespace) in the audit log so the
+ledger reads like a changelog rather than a list of paths. When omitted, Stella fills in a per-operation
 default (`"file updated (no reason given)"`, etc.).
 
 ```jsonc
@@ -135,7 +135,7 @@ stella --output-format json run "$TASK" \
 
 <Callout type="info">
   Want a program to react to touches *as they happen* rather than reading the summary at the
-  end? The [extension hooks](/docs/extensions) event bus emits `file.created`,
+  end? The [extension hooks](/docs/extensions) event bus emits `file.read`, `file.created`,
   `file.updated`, `file.deleted`, and `files_touched.updated` events with the same
-  per-touch data.
+  per-touch data — reads are first-class touches and emit a `file.read` fact too.
 </Callout>

@@ -17,17 +17,22 @@ Where `stella run` executes a single one-shot prompt, `stella goal` runs
 **judged rounds**. Each round the worker agent makes progress using the normal
 [agent step loop](/docs/agent-engine), and then a separate judge model reviews
 the evidence and decides whether the objective has been satisfied. The loop ends
-only when the judge confirms.
+when the judge confirms — or when a backstop trips: a hard round cap (default
+**8** rounds), the `--budget` limit, or a worker-turn abort. Reaching a backstop
+ends the run reporting the goal as **not met**, with a named reason.
 
 ## How judged rounds work
 
 1. **The worker works a round.** The worker model runs the step loop —
    proposing tool calls, executing them, and feeding results back — to make
    progress toward the objective.
-2. **The judge assesses from evidence.** A judge model examines the evidence
-   produced that round and decides whether the goal has been met.
-3. **Repeat or finish.** If the judge is not satisfied, another round begins. If
-   the judge confirms the goal is met, the run ends.
+2. **The judge assesses from evidence.** The judge is not a passive transcript
+   reader — it runs as its own bounded engine turn with read-only access to the
+   same tools the worker used (`read_file`, `grep`, `ci_status`, and so on),
+   actively inspecting the changed files, tests, and CI, and rejecting
+   claimed-but-unproven success.
+3. **Repeat or finish.** If the judge is not satisfied, another round begins —
+   until the judge confirms or a backstop (round cap, budget, abort) ends the run.
 
 Because the judge assesses **from evidence** rather than from the worker's
 narration, "I think I'm done" is never enough on its own — the goal is only
@@ -79,9 +84,8 @@ You can combine goal mode with global flags, for example pinning a specific
 worker model or capping spend:
 
 ```bash
-stella goal "Migrate the config loader to the new settings schema and keep all tests green" \
-  --model anthropic/claude-fable-5 \
-  --budget 5.00
+stella --model anthropic/claude-fable-5 --budget 5.00 \
+  goal "Migrate the config loader to the new settings schema and keep all tests green"
 ```
 
 See [Configuration](/docs/configuration) and [Telemetry](/docs/telemetry) for
