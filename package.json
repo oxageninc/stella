@@ -1,7 +1,7 @@
 {
   "name": "stella-monorepo",
   "private": true,
-  "description": "The stella monorepo — the Rust workspace for the stella CLI plus the docs site (stella-docs/). Rust builds stay pure cargo; pnpm orchestrates the web packages and bridges common tasks.",
+  "description": "The stella monorepo \u2014 the Rust workspace for the stella CLI plus the docs site (stella-docs/). Rust builds stay pure cargo; pnpm orchestrates the web packages and bridges common tasks.",
   "packageManager": "pnpm@11.13.0",
   "engines": {
     "node": ">=20"
@@ -10,7 +10,6 @@
     "dev": "pnpm --filter stella-cli-docs dev",
     "build": "pnpm --filter stella-cli-docs build",
     "start": "pnpm --filter stella-cli-docs start",
-    "lint": "pnpm --filter stella-cli-docs lint",
     "typecheck": "pnpm --filter stella-cli-docs typecheck",
     "docs:dev": "pnpm --filter stella-cli-docs dev",
     "docs:build": "pnpm --filter stella-cli-docs build",

@@ -7,6 +7,7 @@ import {
   DocsTitle,
 } from "fumadocs-ui/page";
 import { getMDXComponents } from "@/mdx-components";
+import { PageFooter } from "@/components/page-footer";
 import { source } from "@/lib/source";
 
 // Page-tree node type, inferred from the loader output so it stays in sync with
@@ -55,6 +56,7 @@ export default async function Page(props: {
       <DocsDescription>{page.data.description}</DocsDescription>
       <DocsBody>
         <MDX components={getMDXComponents()} />
+        <PageFooter path={page.url} title={page.data.title} />
       </DocsBody>
     </DocsPage>
   );

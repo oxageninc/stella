@@ -1,0 +1,77 @@
+---
+title: Engineering Principles
+description: The design invariants behind Stella — determinism preferred over intelligence, evidence over opinion, a zero-I/O engine, prompt-cache-native memory, and budgets enforced at safe boundaries.
+---
+
+# Engineering Principles
+
+Stella's repository ships two research papers alongside the code — a
+[capstone analysis of seven architectural invariants](https://github.com/macanderson/stella/blob/main/docs/papers/stella-defensible-position.md)
+and a focused study of
+[the deterministic engine](https://github.com/macanderson/stella/blob/main/docs/papers/deterministic-engine.md).
+This page is the distilled version: the principles, and why they were chosen.
+Every claim is grounded in the shipping implementation.
+
+## The master rule: given a choice, prefer determinism over intelligence
+
+Wherever Stella can decide something with a deterministic mechanism *or* a
+model's judgment, it chooses the mechanism — and reserves the model for the
+places only intelligence can fill. [The full argument](/docs/principles/determinism)
+has the research grounding; the shape of it:
+
+- A deterministic check is **reproducible** — it gives the same verdict on
+  the same inputs tomorrow, in CI, and on a colleague's machine. A model
+  opinion is a sample.
+- A deterministic check is **auditable** — when it fails, you can read
+  exactly why. A model verdict must itself be verified.
+- A deterministic check is **free** — no tokens, no latency, no rate limit.
+
+You can see the rule everywhere in the product:
+
+| Decision | The deterministic mechanism | The model, only as fallback |
+| --- | --- | --- |
+| Is the work done? | The [flip oracle](/docs/inference-pipeline): the same test fails before, passes after — plus the zero-diff guard and diff budget | The judge is consulted only when deterministic evidence is inconclusive |
+| What proves the change? | `verify_done` replays the witness test on a shadow worktree at `git HEAD` | A merely-green suite is *weak* evidence, never proof |
+| Which model serves a role? | Explicit pins and typed absence (`Option::None`) — never an `"auto"` magic string | `auto_mode` picks from *your* allowed list, by stated rules |
+| What goes in the prompt? | A byte-stable prefix + one fixed-position recall block | — |
+| When does a run stop? | The budget guard, between steps — never mid-tool | — |
+| What happened? | An append-only event stream and local SQLite ledgers | — |
+
+## The seven invariants, briefly
+
+1. **Ports, not concretions.** Every provider and tool sits behind a trait;
+   adding a vendor is an adapter, never a rewrite. Nine providers plus any
+   local server, one engine.
+2. **No I/O in the engine.** `stella-core` performs zero I/O — routing,
+   retry, compaction, loop detection, and budget are synchronous functions
+   over owned data, property-testable with no network and no filesystem.
+3. **The witness-test contract.** An agent must *prove* its change is the
+   change that fixed the problem: fail on `HEAD`, pass on the diff,
+   tamper-excluded. "The suite is green" is not a proof.
+4. **BYOK + no phone-home.** Your keys call your provider directly; the only
+   unconditional network traffic a run produces goes to the model you chose.
+   Telemetry is local SQLite, forever.
+5. **Prompt-cache-native memory.** Durable knowledge loads once into a
+   byte-stable prefix and rides the cache at ~0.1× — see
+   ["invalidation doesn't happen"](/docs/context-engine#invalidation-doesnt-happen--and-why-that-matters).
+6. **Budgets enforced at safe boundaries.** `--budget` is a hard cap checked
+   between steps — an abort is always clean, never a half-applied edit.
+7. **An open retrieval standard.** Context recall speaks the
+   [Open Context Protocol](/docs/context-engine#the-open-context-protocol) —
+   versioned wire types, machine-checked conformance, a trust architecture.
+
+No single one is the moat; the **combination** is. Each constrains the
+others: you can't retrofit cache-native memory onto per-turn injection, or
+witness verification onto an engine that can't replay deterministically.
+
+## What this buys you, concretely
+
+- **Trust:** "done" means *witnessed*, not *asserted*.
+- **Reasoning:** one single-threaded loop you can read top to bottom — no
+  coordinator, no hidden control plane, no swarm state to desynchronize.
+- **Cost:** the cache discipline and the evidence ladder mean you pay for
+  intelligence only where intelligence is the only tool that works.
+- **Sovereignty:** local-first state, BYOK credentials, permissive dual
+  license — nothing about your work leaves your machine or your control.
+
+Continue: [Why single-thread beats the swarm →](/docs/principles/determinism)

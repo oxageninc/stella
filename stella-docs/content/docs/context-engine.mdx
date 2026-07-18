@@ -52,6 +52,64 @@ Recall fans out through the **Open Context Protocol (OCP)** host to
 in-process providers — the workspace memory store and the code graph — fused
 by score under one token budget.
 
+<RecallLoopDiagram />
+
+## Invalidation doesn't happen — and why that matters
+
+Most agents treat memory as dynamic injection: retrieve per turn, splice
+into the prompt. It maximizes relevance and **destroys prompt-cache
+locality** — every turn's prompt is different, the cache misses every call,
+and the whole system prompt re-bills at full input price, forever.
+
+Stella is built so invalidation *structurally cannot happen*, at two layers:
+
+- **The cache layer.** The prefix is byte-stable by discipline — same
+  memories, same order, same bytes, every call of the session — and the
+  volatile recall block lives in its own message *after* the prefix,
+  refreshed in place. Nothing ever rewrites the cached bytes, so the cache
+  entry is never invalidated mid-session. That is the difference between
+  paying ~0.1× (cache-read) and 1.0× (cache-miss) on every call — a
+  **10× structural cost gap that compounds across a session**. It is also
+  why a freshly saved memory waits for the next session: hot-injecting it
+  would convert every subsequent cache hit into a miss.
+- **The knowledge layer.** The context store is bi-temporal: new facts
+  **supersede** old ones with validity windows — they never overwrite or
+  delete them. Re-initializing a workspace doesn't invalidate what Stella
+  believed before; it records what changed and when. History stays
+  queryable, provenance stays intact, and a recalled fact can always say
+  *when* it was true.
+
+The practical significance: Stella's memory gets **cheaper and richer** as a
+session runs and as a workspace ages — where per-turn-injection designs get
+more expensive with every memory they add. Cost architecture, not a cache
+trick.
+
+## The Open Context Protocol
+
+The recall seam isn't private plumbing — it is a versioned, open wire
+protocol: the **[Open Context Protocol](https://github.com/macanderson/opencontextprotocol)**
+(`ocp/1.0-draft`), now its own project, with Stella as its reference host.
+
+- **Zero-dependency wire types.** The protocol's types depend on nothing but
+  a JSON codec — a context provider can be written in any language without
+  importing a line of Stella.
+- **Machine-checked conformance.** "OCP conformant" isn't marketing — it's
+  green on the public conformance suite. A conforming provider works with
+  any OCP host, checked at CI time rather than discovered at integration
+  time.
+- **A trust architecture**, not just a transport: provenance (every frame
+  says where it came from), budget honesty (providers respect the token
+  budget they're given), consent, citation guarantees, version stability,
+  and temporal validity — the bi-temporal "invalidation doesn't happen"
+  property, standardized.
+
+The consequence for you: the context engine is **extensible without forks**.
+Your company wiki, your issue tracker, your vector store — anything that
+speaks OCP can feed Stella's recall block under the same budget, scoring,
+and citation rules as the built-in providers. The full analysis lives in
+[the OCP advantages paper](https://github.com/macanderson/opencontextprotocol/blob/main/docs/protocol-advantages.md).
+
+
 ## The citation loop: memories that earn their place
 
 Memory in Stella is not write-only. It is a feedback loop:

@@ -1,0 +1,77 @@
+---
+title: Local
+description: Point Stella at any OpenAI-compatible server — Ollama, vLLM, LM Studio, llama.cpp — with no API key, no auto-detection, and zero token cost.
+---
+
+# Local
+
+<ProviderMark id="local" size={30} />
+
+The `local` pseudo-provider points Stella at any **OpenAI-compatible** endpoint you run
+yourself — Ollama, vLLM, LM Studio, or a llama.cpp server. No API key, no cloud, no
+per-token bill; your tokens never leave the machine. It is never auto-detected: local
+inference is always an explicit choice.
+
+## Setup
+
+There is nothing to export — no key is required (an optional `LOCAL_API_KEY` is sent as a
+bearer token if your server enforces one). What **is** required is the endpoint:
+`--base-url` (or its env form `STELLA_BASE_URL`) must accompany `--model local/…`,
+every time.
+
+```bash
+stella --model local/llama3.3 --base-url http://localhost:11434/v1 chat
+```
+
+That is the Ollama default port; vLLM conventionally serves on `:8000/v1`, LM Studio on
+`:1234/v1`, llama.cpp's server on whatever you gave `--port` — any of them work, as long
+as the endpoint speaks the OpenAI-compatible dialect. The model slug after `local/` must
+be a model the server actually has loaded (for Ollama, a pulled model name).
+
+```bash
+export STELLA_BASE_URL=http://localhost:11434/v1
+stella --model local/llama3.3 chat        # no --base-url needed now
+```
+
+## Skip the retyping: a custom provider id
+
+The id `local` is **reserved** — it cannot be redefined in `settings.json`, which is why
+`--base-url` is always required with it. To bake the endpoint into config instead, define
+your own provider under a non-reserved id with a `base_url`; the `dialect` defaults to
+`openai-compatible`, so one field is usually enough:
+
+```json title="~/.config/stella/settings.json"
+{
+  "providers": {
+    "ollama": {
+      "base_url": "http://localhost:11434/v1"
+    }
+  }
+}
+```
+
+```bash
+stella --model ollama/llama3.3 chat
+```
+
+See [settings.json](/docs/configuration/settings) for the full `providers` schema —
+custom providers get the same treatment as built-ins, including a `default_model` and an
+`api_key_env` if your server sits behind auth.
+
+## In the pipeline
+
+Local models carry **zero dollar cost**, which rewrites the role calculus: triage on a
+local model is free classification, and a local worker is unlimited iteration on tasks it
+can handle. Quality depends entirely on the model you serve — a 70B coder is a credible
+budget worker; a 7B model is a triage-and-drafts tool. Judge duty is where local models
+most often fall short; keep a frontier judge from the
+[Model guide](/docs/api-providers/models) over any local worker. Mix local and cloud per
+agent with [`agent_engine_config`](/docs/configuration/agent-engine-config), and see
+[Examples](/docs/examples) for hybrid profiles.
+
+## Pricing
+
+Catalog prices do not apply — there are none. Runs on `local/…` record **$0** in the
+[Observatory](/docs/telemetry/dashboard); your costs are hardware and electricity. Token
+and latency telemetry are still recorded in full, so you can compare a local model's
+resolve rate head-to-head against paid ones.

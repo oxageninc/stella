@@ -1,0 +1,79 @@
+---
+title: API Providers
+description: Every provider Stella speaks to — the full matrix, the auto-detection order, and the credential chain. Bring your own key; Stella talks each provider's native dialect.
+---
+
+Stella is **BYOK** — bring your own key — and vendor-agnostic by construction. There is no
+proxy in the middle and no markup on your tokens: Stella speaks each provider's native wire
+dialect directly — Anthropic Messages, OpenAI Responses, Gemini generateContent, Bedrock
+Converse, and the OpenAI-compatible dialect the rest of the field converged on. Switching
+vendors is a `--model` flag, not a migration.
+
+## The provider matrix
+
+| Provider | id | Primary env var | Default model | Dialect |
+| --- | --- | --- | --- | --- |
+| <ProviderMark id="anthropic" /> [Anthropic](/docs/api-providers/anthropic) | `anthropic` | `ANTHROPIC_API_KEY` | `claude-fable-5` | Anthropic Messages |
+| <ProviderMark id="openai" /> [OpenAI](/docs/api-providers/openai) | `openai` | `OPENAI_API_KEY` | `gpt-5.5` | OpenAI Responses |
+| <ProviderMark id="gemini" /> [Google Gemini](/docs/api-providers/gemini) | `gemini` | `GEMINI_API_KEY` (alias `GOOGLE_API_KEY`) | `gemini-3-pro` | Gemini generateContent |
+| <ProviderMark id="vertex" /> [Google Vertex AI](/docs/api-providers/vertex) | `vertex` | `VERTEX_ACCESS_TOKEN` | `gemini-3-pro` | Gemini via Vertex |
+| <ProviderMark id="bedrock" /> [Amazon Bedrock](/docs/api-providers/bedrock) | `bedrock` | `AWS_ACCESS_KEY_ID` | `us.anthropic.claude-sonnet-4-5-20250929-v1:0` | Bedrock Converse |
+| <ProviderMark id="xai" /> [xAI](/docs/api-providers/xai) | `xai` | `XAI_API_KEY` | `grok-4` | OpenAI-compatible |
+| <ProviderMark id="deepseek" /> [DeepSeek](/docs/api-providers/deepseek) | `deepseek` | `DEEPSEEK_API_KEY` | `deepseek-chat` | OpenAI-compatible |
+| <ProviderMark id="zai" /> [Z.ai](/docs/api-providers/zai) | `zai` | `ZAI_API_KEY` | `glm-5.2` | OpenAI-compatible |
+| <ProviderMark id="openrouter" /> [OpenRouter](/docs/api-providers/openrouter) | `openrouter` | `OPENROUTER_API_KEY` | `openrouter/auto` | OpenAI-compatible |
+| <ProviderMark id="local" /> [Local](/docs/api-providers/local) | `local` | none (optional `LOCAL_API_KEY`) | you choose | OpenAI-compatible |
+
+Each provider name links to its dedicated page — setup, model selection,
+provider-specific configuration, and catalog pricing. For a quick first-run walkthrough,
+see [Providers &amp; models](/docs/getting-started/providers).
+
+## Auto-detection
+
+With no `--model` flag and no configured default, Stella selects the first provider that
+has a resolvable credential, in this preference order:
+
+1. `zai`
+2. `anthropic`
+3. `openai`
+4. `xai`
+5. `deepseek`
+6. `gemini`
+7. `openrouter`
+8. `vertex` and `bedrock` — **last, deliberately**
+
+<Callout type="info">
+  Vertex and Bedrock sit last on purpose: they key off generic cloud credentials
+  (`VERTEX_ACCESS_TOKEN`, `AWS_ACCESS_KEY_ID`) that are often present in a shell for
+  entirely unrelated reasons. Generic cloud credentials must not hijack detection — pin
+  these providers explicitly with `--model vertex/…` or `--model bedrock/…` when you want
+  them. The `local` pseudo-provider is never auto-detected at all.
+</Callout>
+
+## The credential chain
+
+For the selected provider, Stella resolves the API key in this order — **first hit wins**:
+
+1. The `--api-key` flag (requires an explicit `--model provider/...`)
+2. The provider's env var, plus aliases — e.g. `GOOGLE_API_KEY` for Gemini
+3. [`settings.json`](/docs/configuration/settings) `providers.<id>.api_key`
+4. `~/.config/stella/credentials.toml`
+5. An interactive prompt (on a TTY) — the entered key is saved to `credentials.toml`, so
+   you are only prompted once
+
+See [Credentials](/docs/configuration/credentials) for the file format and the fine print.
+
+<Callout type="warn">
+  Prefer an env var, `settings.json`, or `credentials.toml` over `--api-key` for anything
+  long-lived — a flag value is visible in shell history and in `ps` output.
+</Callout>
+
+## Where to go next
+
+- **Choosing a model** — the [Model guide](/docs/api-providers/models) is the master
+  catalog: context windows, list prices, and which model fits which role.
+- **Tuning profiles** — [Examples](/docs/examples) has ready-made lineups from max-quality
+  to dirt-cheap.
+- **Per-agent routing** — [Agent engine config](/docs/configuration/agent-engine-config)
+  gives each engine agent (worker, judge, triage) its own model, provider, and effort —
+  including a different gateway per agent.
