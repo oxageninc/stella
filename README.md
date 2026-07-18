@@ -486,6 +486,12 @@ recall routes through).
 | `stella-tui` | The Command Deck — a pure event-fold core + thin crossterm shell |
 | Open Context Protocol | Its own project now: [macanderson/opencontextprotocol](https://github.com/macanderson/opencontextprotocol) — wire types, host runtime, and the public conformance suite. Stella is its reference host and depends on it via git. |
 
+The repo is a **monorepo**: alongside the Rust workspace, the documentation
+site ([stella.oxagen.sh](https://stella.oxagen.sh)) lives at `stella-docs/`
+(Next.js + Fumadocs), orchestrated by a pnpm workspace at the root. Rust
+crates are deliberately *not* pnpm packages — cargo remains their build
+system; the root `package.json` only bridges convenience scripts.
+
 ## Development
 
 ```bash
@@ -494,6 +500,17 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo run -p stella-cli -- models
 ```
+
+### The docs site
+
+```bash
+pnpm install     # once (Node ≥ 20, pnpm 11)
+pnpm dev         # serve the docs at http://localhost:3400
+pnpm build       # production build (what docs.yml CI runs)
+```
+
+Docs content is MDX under `stella-docs/content/docs/`. Docs-only changes run
+the fast `docs` workflow in CI instead of the Rust gate.
 
 To try your working copy against real projects before a release, install it as
 `stella-dev` — it lives side by side with the released `stella`:
