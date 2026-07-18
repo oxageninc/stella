@@ -14,29 +14,46 @@ Drop a `<name>.toml` manifest file into one of these directories:
 
 If the same tool name is defined in both locations, the **workspace** manifest wins on collision. This lets a project override a personal default while keeping your global tools available everywhere else.
 
-Run `stella tools` at any time to see which custom tools were discovered, alongside the built-ins and any manifest diagnostics.
+Run `stella tools` at any time to see which custom tools were discovered, alongside the built-ins.
 
 ## Manifest shape
 
-<Callout type="info">
-The manifest below is an **illustrative example** to show the general shape of a script-tool manifest — a name, a description, the command to run, and input parameters. Treat the exact field names and layout as a plausible illustration rather than an exhaustive schema reference.
-</Callout>
+A manifest declares the tool's `name`, `description`, the `command` to run, and an `input_schema`:
 
 ```toml
-# .stella/tools/wordcount.toml — illustrative example
+# .stella/tools/wordcount.toml
 
 name = "wordcount"
 description = "Count the words in a file and print the total."
 
-# The command Stella runs when the agent calls this tool.
-command = "scripts/wordcount.sh"
+# The command Stella runs when the agent calls this tool. It is an argv array,
+# spawned directly with no shell; command[0] resolves against the workspace root.
+command = ["scripts/wordcount.sh"]
 
-# Input parameters the agent must supply when calling the tool.
-[parameters.path]
+# Tool inputs are a JSON Schema, written as TOML under [input_schema].
+[input_schema]
+type = "object"
+required = ["path"]
+
+[input_schema.properties.path]
 type = "string"
 description = "Path to the file whose words should be counted."
-required = true
 ```
+
+<Callout type="warn">
+`command` must be an **argv array** (`["scripts/wordcount.sh"]`), not a bare string — a string fails to parse and the tool never loads. Inputs go under `[input_schema]` (a JSON Schema), not `[parameters]`; an unknown table like `[parameters]` is silently ignored, leaving the tool with an empty schema.
+</Callout>
+
+## Validating manifests
+
+Before a run, check every manifest with the strict pre-flight validator:
+
+```bash
+stella tools --validate            # scans .stella/tools/ and ~/.config/stella/tools/
+stella tools --validate ./mytools  # or an explicit directory
+```
+
+It parses each `<name>.toml` and reports **errors** (bad TOML, missing/invalid/reserved name, empty description or command, a non-table `input_schema`), **warnings** (e.g. a `timeout_ms` over the 10-minute cap is clamped, a name that shadows a built-in or another manifest), and info. It exits non-zero if any manifest has errors — handy in CI.
 
 ## How custom tools appear
 
