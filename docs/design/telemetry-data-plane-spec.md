@@ -128,7 +128,7 @@ Four SQLite files can appear under `.stella/` today:
 
 The concrete bug is **the code-graph tables exist in two files**:
 `codegraph.db` (207 files, live) **and** `context.db` (156 files, stale/orphaned).
-`stella-graph/src/store.rs` documents the *intended* design — "`02-architecture.md`
+`stella-graph/src/store.rs` documents the *intended* design — "`
 §6 mandates **one** `context.db` file … every table prefixed `code_graph_`" — but
 production `graph_db_path()` points at a **separate** `codegraph.db`
 (`stella-tools/src/graph.rs:31`). So the graph was split out to its own file, the
@@ -178,7 +178,7 @@ Stella already captures most of what the dashboard needs. The gaps are
 4. **Privacy by tier.** Prompts and code content stay project-local by default.
    The user tier stores **metadata and rollups**, not source code, unless the
    developer opts in.
-5. **Honor `02-architecture.md` §6.** Collapse the project tier toward one
+5. **Honor `
    durable file; keep only a deliberate, documented exception for the
    rebuildable index.
 
@@ -202,7 +202,7 @@ Consolidate four files → **two**, by the durable/rebuildable split:
 - **`codegraph.db` — the rebuildable code index.** Kept as a **separate file on
   purpose**: it is a derived tree-sitter index, high-churn (bulk re-index + live
   watcher), and must be `rm`-able without touching durable history. Document
-  this exception in `02-architecture.md` §6 and in `stella-graph/src/store.rs`
+  this exception in `
   (whose doc comment currently lies by saying `context.db`).
 
 > If strict single-file is preferred, `codegraph.db`'s `code_graph_*` tables can

@@ -38,7 +38,7 @@ transition *is* the evidence. When you don't hand it a test, the staged pipeline
 (`stella run`, on by default) spawns an independent **witness author** that
 writes the failing test, tamper-excluded from the code under change, so the flip
 cannot be gamed. Deterministic definition of done, enforced by construction —
-see [`pipeline.md`](pipeline.md).
+see [`pipeline.md`](design/pipeline.md).
 
 ## An engine you can actually reason about
 
@@ -72,8 +72,8 @@ at ~0.1× input cost · a **fleet mode** that fans a task DAG out to
 git-worktree-isolated workers, wave-scheduled by dependency · **lifecycle
 hooks** and an **MCP client** that merges external tools into the registry · and
 the **Command Deck** TUI with PR-style diffs and an editable prompt queue. Deep
-dives: [`hooks.md`](hooks.md), [`file-touch-telemetry.md`](file-touch-telemetry.md),
-[`memory-citations.md`](memory-citations.md).
+dives: [`hooks.md`](design/hooks.md), [`file-touch-telemetry.md`](design/file-touch-telemetry.md),
+[`memory-citations.md`](design/memory-citations.md).
 
 ## What it optimizes for
 
