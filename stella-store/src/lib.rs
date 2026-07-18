@@ -1575,6 +1575,7 @@ impl Store {
                     call_id,
                     output,
                     duration_ms,
+                    ..
                 } => {
                     let (ok, error, bytes) = match output {
                         ToolOutput::Ok { content } => (true, String::new(), content.len() as i64),
@@ -2753,6 +2754,7 @@ mod tests {
                         content: "hit\n".into(),
                     },
                     duration_ms: 12,
+                    speculated: false,
                 },
             )
             .unwrap();
@@ -2779,6 +2781,7 @@ mod tests {
                         message: "not found".into(),
                     },
                     duration_ms: 3,
+                    speculated: false,
                 },
             )
             .unwrap();

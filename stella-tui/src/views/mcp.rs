@@ -339,7 +339,7 @@ fn footer(mode: McpMode) -> Line<'static> {
         McpMode::Browse => &[
             ("↑↓", "select"),
             ("e/␣", "enable/disable"),
-            ("/", "search"),
+            ("s", "search registry (also /mcp-search)"),
             ("a", "auth"),
             ("o", "oauth login"),
             ("x", "remove"),

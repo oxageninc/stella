@@ -295,6 +295,24 @@ pub struct NotificationInfo {
     pub source: String,
     pub created_ms: u64,
     pub read: bool,
+    /// A launch-cinematic cue (see [`SplashCue`]): the driver replays the
+    /// splash held open over a running init (session startup, `/init`) and
+    /// releases it when init finishes. Out-of-band view state, applied
+    /// straight to `DeckUi::splash` by [`crate::deck_ui::ingest_inbound`],
+    /// ignored by the model fold — like [`Inbound::ShowHelp`].
+    Splash(SplashCue),
+}
+
+/// Driver → deck cues for the launch cinematic ([`crate::splash`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SplashCue {
+    /// Restart the splash **held** open over a running init: the battle
+    /// scene loops until `Release`. Ignored on `--no-anim` sessions (a
+    /// static frame is their contract).
+    Replay,
+    /// Init finished — let the timeline advance to the wordmark reveal and
+    /// fade out. A no-op if no held splash is playing.
+    Release,
 }
 
 /// Which config level an installed agent definition lives at.
