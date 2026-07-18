@@ -41,7 +41,7 @@ const FEATURES = [
   {
     icon: Gauge,
     title: "Local telemetry",
-    body: "Token usage, cost, and step metering land in a local DuckDB store on your disk — inspect every run, share nothing.",
+    body: "Token usage, cost, and step metering land in a local SQLite store on your disk — inspect every run, share nothing.",
   },
 ];
 
@@ -64,14 +64,22 @@ export default function HomePage() {
       {/* Hero */}
       <section className="relative overflow-hidden border-b border-fd-border">
         <div className="lp-hero-grid pointer-events-none absolute inset-0" aria-hidden />
+        <div className="lp-hero-glow pointer-events-none absolute inset-0" aria-hidden />
         <div className="relative mx-auto flex max-w-5xl flex-col items-center px-4 py-24 text-center sm:py-32">
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img
+            src="/brand/mark.svg"
+            alt=""
+            aria-hidden
+            className="mb-8 h-14 w-auto drop-shadow-[0_0_28px_rgba(245,179,60,0.35)]"
+          />
           <span className="mb-6 inline-flex items-center gap-2 rounded-full border border-fd-border bg-fd-card px-3 py-1 text-xs font-medium text-fd-muted-foreground">
-            <Terminal className="size-3.5" aria-hidden />
+            <Terminal className="size-3.5 text-[var(--stella-gold)]" aria-hidden />
             A terminal coding agent
           </span>
           <h1 className="max-w-3xl text-balance text-4xl font-semibold tracking-tight sm:text-6xl">
             Ship code from your terminal with{" "}
-            <span className="font-mono">stella</span>
+            <span className="lp-gold-text font-mono">stella</span>
           </h1>
           <p className="mt-6 max-w-2xl text-balance text-lg text-fd-muted-foreground">
             A fast, bring-your-own-key, model-agnostic coding agent. Point it at any
@@ -86,7 +94,7 @@ export default function HomePage() {
           <div className="mt-8 flex flex-wrap items-center justify-center gap-3">
             <Link
               href="/docs"
-              className="inline-flex items-center gap-2 rounded-lg bg-fd-primary px-5 py-2.5 text-sm font-semibold text-fd-primary-foreground transition-opacity hover:opacity-90"
+              className="lp-cta inline-flex items-center gap-2 rounded-lg px-5 py-2.5 text-sm font-semibold transition-[filter]"
             >
               Read the docs
               <ArrowRight className="size-4" aria-hidden />
@@ -107,7 +115,7 @@ export default function HomePage() {
           {FEATURES.map(({ icon: Icon, title, body }) => (
             <div key={title} className="bg-fd-background p-6">
               <div className="mb-4 inline-flex size-10 items-center justify-center rounded-lg border border-fd-border bg-fd-card">
-                <Icon className="size-5 text-fd-foreground" aria-hidden />
+                <Icon className="size-5 text-[var(--stella-gold)]" aria-hidden />
               </div>
               <h3 className="text-base font-semibold">{title}</h3>
               <p className="mt-2 text-sm leading-relaxed text-fd-muted-foreground">
@@ -173,13 +181,17 @@ export default function HomePage() {
 
       <footer className="border-t border-fd-border">
         <div className="mx-auto flex w-full max-w-6xl flex-col items-center justify-between gap-4 px-4 py-8 text-sm text-fd-muted-foreground sm:flex-row">
-          <span className="font-mono">stella</span>
+          <span className="inline-flex items-center gap-2">
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img src="/brand/mark-flat.svg" alt="" aria-hidden className="h-4 w-auto opacity-80" />
+            <span className="font-mono">stella</span>
+          </span>
           <div className="flex items-center gap-5">
             <Link href="/docs" className="hover:text-fd-foreground">
               Docs
             </Link>
             <a
-              href="https://github.com/oxageninc/stella"
+              href="https://github.com/macanderson/stella"
               className="hover:text-fd-foreground"
             >
               GitHub
@@ -202,11 +214,11 @@ function TerminalCard() {
       </div>
       <div className="lp-terminal space-y-1 px-4 py-4 text-sm">
         <p>
-          <span className="text-fd-muted-foreground">$ </span>
+          <span className="lp-prompt">$ </span>
           <span className="text-fd-foreground">export ANTHROPIC_API_KEY=…</span>
         </p>
         <p>
-          <span className="text-fd-muted-foreground">$ </span>
+          <span className="lp-prompt">$ </span>
           <span className="text-fd-foreground">
             stella run &quot;fix the failing test&quot;
           </span>
@@ -233,7 +245,7 @@ function SplitCard({
   return (
     <div className="flex flex-col rounded-xl border border-fd-border bg-fd-card p-6">
       <div className="mb-4 inline-flex size-10 items-center justify-center rounded-lg border border-fd-border bg-fd-background">
-        <Icon className="size-5" aria-hidden />
+        <Icon className="size-5 text-[var(--stella-gold)]" aria-hidden />
       </div>
       <h3 className="text-lg font-semibold">{title}</h3>
       <p className="mt-2 flex-1 text-sm leading-relaxed text-fd-muted-foreground">
