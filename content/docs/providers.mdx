@@ -86,9 +86,12 @@ Studio, or a llama.cpp server. It is never auto-detected and needs no API key:
 stella --model local/llama3.3 --base-url http://localhost:11434/v1 chat
 ```
 
-You can also pin the base URL (and an optional key) in
-[`settings.json`](/docs/configuration/settings) under `providers.local` so you don't pass
-`--base-url` every time.
+The id `local` is reserved and **cannot** be redefined in `settings.json` — `--base-url`
+(or its env form `STELLA_BASE_URL`) is always required with `--model local/<model>`. To
+avoid retyping the endpoint, either export `STELLA_BASE_URL`, or define your own custom
+provider under a non-reserved id in [`settings.json`](/docs/configuration/settings) — e.g.
+`providers.myollama` with a `base_url` (its `dialect` defaults to `openai-compatible`) — and
+select it with `--model myollama/<model>`.
 
 ## Overriding a provider's defaults
 

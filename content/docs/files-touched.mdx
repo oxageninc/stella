@@ -29,8 +29,8 @@ out-of-workspace path never produces a ledger entry.
 ### The `reason` field
 
 Each of `read_file`, `write_file`, `edit_file`, and `delete_file` accepts an optional
-`reason` string. It is stored verbatim in the audit log so the ledger reads like a
-changelog rather than a list of paths. When omitted, Stella fills in a per-operation
+`reason` string. It is stored (trimmed of surrounding whitespace) in the audit log so the
+ledger reads like a changelog rather than a list of paths. When omitted, Stella fills in a per-operation
 default (`"file updated (no reason given)"`, etc.).
 
 ```jsonc
@@ -95,11 +95,11 @@ showing each path with its compact CRUD string (e.g. `src/router.rs  RU`).
 
 ### In JSON output
 
-`stella run --output-format json` includes the full telemetry payload under `files_touched`, so a
+`stella --output-format json run` includes the full telemetry payload under `files_touched`, so a
 script can assert on exactly what a run changed:
 
 ```bash
-stella run --output-format json "add a --health flag and wire the readiness probe" \
+stella --output-format json run "add a --health flag and wire the readiness probe" \
   | jq '.files_touched[] | {path, crud_events, lines_added, lines_removed}'
 ```
 
@@ -120,14 +120,14 @@ it stays entirely on your machine.
 **Fail CI when a run edits files outside a directory.**
 
 ```bash
-touched=$(stella run --output-format json "$TASK" | jq -r '.files_touched[].path')
+touched=$(stella --output-format json run "$TASK" | jq -r '.files_touched[].path')
 echo "$touched" | grep -qv '^src/' && { echo "run touched files outside src/"; exit 1; }
 ```
 
 **Get a one-line change summary of a run.**
 
 ```bash
-stella run --output-format json "$TASK" \
+stella --output-format json run "$TASK" \
   | jq -r '.files_touched[] | "\(.crud_events|join("")) \(.path) (+\(.lines_added) -\(.lines_removed))"'
 # CU src/router.rs (+18 -4)
 # C  src/health.rs (+22 -0)
@@ -135,7 +135,7 @@ stella run --output-format json "$TASK" \
 
 <Callout type="info">
   Want a program to react to touches *as they happen* rather than reading the summary at the
-  end? The [extension hooks](/docs/extensions) event bus emits `file.created`,
+  end? The [extension hooks](/docs/extensions) event bus emits `file.read`, `file.created`,
   `file.updated`, `file.deleted`, and `files_touched.updated` events with the same
-  per-touch data.
+  per-touch data — reads are first-class touches and emit a `file.read` fact too.
 </Callout>

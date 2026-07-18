@@ -45,7 +45,7 @@ Each hook may set a `timeoutMs`, the maximum time the command is allowed to run:
 
 ## Example
 
-The following `settings.json` runs `./scripts/guard.sh` before every `bash` tool call, with a 5-second timeout. Because it is a `PreToolUse` hook, a non-zero exit from the script blocks the `bash` call.
+The following `settings.json` runs `./scripts/guard.sh` before every `bash` tool call, with a 5-second timeout. Because it is a `PreToolUse` hook, a non-zero exit from the script blocks the `bash` call. Each hook runs as `bash -c <command>` with its working directory set to the workspace root, so a relative path like `./scripts/guard.sh` resolves from the repository root.
 
 ```json
 {
@@ -66,6 +66,10 @@ The following `settings.json` runs `./scripts/guard.sh` before every `bash` tool
 }
 ```
 
+<Callout type="warn">
+**Project-scope hooks are a trust boundary.** Hooks declared in a repository's project-scope file (`<workspace>/.stella/settings.json`) do **not** load unless you set `STELLA_PROJECT_HOOKS=1` — otherwise the merged hook set is rebuilt from the user and org-managed scopes alone, and a stderr notice names what was skipped. This stops a cloned repo from running arbitrary commands on your machine. Hooks in the user scope (`~/.config/stella/settings.json`) always load.
+</Callout>
+
 <Callout type="info">
-Hooks live in the same `settings.json` that carries your provider configuration. See the settings documentation for how the file is resolved and merged across scopes.
+Hooks live in the same `settings.json` that carries your provider configuration. See the [settings documentation](/docs/configuration/settings) for how the file is resolved and merged across scopes.
 </Callout>

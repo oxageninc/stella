@@ -17,29 +17,54 @@ This reflects the live session: it accounts for custom tools discovered in `.ste
 
 ## The built-in catalog
 
-Each built-in tool is either **read-only** (it only observes your workspace and environment) or **mutating** (it changes files, runs commands, or performs side effects). Read-only tools are marked `read_only: true` in the tool's permission model.
+Each tool is either **read-only** (it only observes your workspace and environment) or **mutating** (it changes files, runs commands, or performs side effects). The read-only marker is the schema's `read_only: true` flag; anything else is treated as capable of side effects.
+
+Tool names are their exact identifiers — the agent dispatches by name, and these are the names `stella tools` prints.
+
+### Always available
 
 | Tool | Description | Access |
 | --- | --- | --- |
-| `read` | Read the contents of a file. | Read-only |
-| `write` | Create a file or overwrite an existing one. | Mutating |
-| `edit` | Apply an in-place edit to an existing file. | Mutating |
-| `glob` | Find files by glob pattern. | Read-only |
+| `read_file` | Read the contents of a file. | Read-only |
 | `grep` | Search file contents for a pattern. | Read-only |
+| `glob` | Find files by glob pattern. | Read-only |
+| `explorations` | List saved codebase explorations. | Read-only |
+| `write_file` | Create a file or overwrite an existing one. | Mutating |
+| `edit_file` | Apply an in-place edit to an existing file. | Mutating |
+| `delete_file` | Delete a file. | Mutating |
 | `bash` | Run a shell command. | Mutating |
-| `exec` | Execute a program or command. | Mutating |
-| `delete` | Delete a file. | Mutating |
-| `ci` | Inspect CI status and logs for a branch or pull request. | Read-only |
-| `issues` | Read and manage issues (Linear if `LINEAR_API_KEY` is set, otherwise GitHub). | Mutating |
-| `project` | Project setup and introspection. | Mutating |
-| `screenshot` | Capture a screenshot. | Read-only |
-| `verify` | Run the definition-of-done check for the current work. | Read-only |
-| `memory` | Save and recall workspace memories. | Mutating |
-| `exploration` | Structured exploration of the codebase. | Read-only |
-| `registry` | List and inspect the tool registry. | Read-only |
+| `save_exploration` | Save a structured exploration of the codebase. | Mutating |
+| `save_memory` | Save a durable workspace memory. | Mutating |
+| `cite_memory` | Cite a memory that informed the turn (feeds the citation loop). | Mutating |
+| `build_project` | Build the project. | Mutating |
+| `run_tests` | Run the project's tests. | Mutating |
+| `verify_done` | Run the definition-of-done check for the current work. | Mutating |
+| `ci_status` | Inspect CI status and logs for a branch or pull request. | Read-only |
+| `screenshot` | Capture a screenshot (writes a PNG into `.stella/screenshots/`). | Mutating |
+| `generate_svg` | Generate an SVG asset. | Mutating |
 
 <Callout type="info">
-The `issues` tool automatically targets **Linear** when the `LINEAR_API_KEY` environment variable is set, and falls back to **GitHub** otherwise. No configuration change is needed to switch — it is driven entirely by the presence of `LINEAR_API_KEY`.
+`verify_done` and `screenshot` are **mutating** in the permission model (`read_only: false`) even though `verify_done` never edits your working tree and `screenshot` only writes into `.stella/`. The read-only partition is exactly: `read_file`, `grep`, `glob`, `explorations`, `ci_status`, `search_issues`, and (when present) `graph_query`.
+</Callout>
+
+### Conditionally registered
+
+These appear only when their prerequisite is met:
+
+| Tool | Description | Access | Appears when |
+| --- | --- | --- | --- |
+| `graph_query` | Query the code graph. | Read-only | `stella init` has built `.stella/codegraph.db`. |
+| `generate_image` | Generate an image. | Mutating | A media-capable provider key is configured. |
+| `generate_video` | Generate a video. | Mutating | A media-capable provider key is configured. |
+| `poll_video` | Poll a video-generation job. | Mutating | A media-capable provider key is configured. |
+| `create_issue` | Create an issue. | Mutating | An issue backend is configured (see below). |
+| `update_issue` | Update an issue. | Mutating | An issue backend is configured. |
+| `close_issue` | Close an issue. | Mutating | An issue backend is configured. |
+| `search_issues` | Search issues. | Read-only | An issue backend is configured. |
+| `start_work_on_issue` | Start work on an issue. | Mutating | An issue backend is configured. |
+
+<Callout type="info">
+The issue tools target **Linear** when `LINEAR_API_KEY` is set; otherwise **GitHub**, but only if the `gh` CLI is installed and authenticated. If neither is available, no issue tools are registered at all.
 </Callout>
 
 ## Where to go next

@@ -40,9 +40,14 @@ sorts by it. The timestamp is fixed-width, so lexicographic order equals time or
 
 ### Observers — watch everything, change nothing
 
-Observers subscribe with `on` and are notified via `emit`. They **cannot** block, delay, or
-corrupt the primary operation — an observer that returns an error (or panics) is logged,
-surfaced as an `extension.error` event, and skipped; the operation continues regardless.
+Observers subscribe with `on` and are notified via `emit`. They **cannot** veto, fail, or
+corrupt the primary operation — an observer that returns an `Err` is logged, surfaced as an
+`extension.error` event, and skipped; the operation continues regardless. Observers do run
+**inline on the emitting thread**, though, so a slow handler *delays* the operation — move
+expensive work off-thread (e.g. `forward_to`) rather than blocking in the handler. Returning
+`Err` is the supported failure signal: a panic is only contained in unwinding (debug/test)
+builds, and under the release profile's `panic = "abort"` a panicking observer aborts the
+whole process.
 
 ```rust
 // exact name, namespace wildcard, or "*" for everything
@@ -76,7 +81,10 @@ type HookDecision =
 
 The chain folds every `modify` into the payload (the next handler sees the modified version)
 and **stops at the first `deny` or `require_approval`**. A chain that only ever allows or
-modifies ends in `allow`. A policy handler that panics **fails closed** — it denies.
+modifies ends in `allow`. A policy handler that panics fails closed **only in unwinding
+(debug/test) builds**; the release profile compiles with `panic = "abort"`, where a panic
+aborts the whole process instead of denying — so signal refusal by returning `deny`, never
+by panicking.
 
 ```rust
 // Require a human for production deploys.

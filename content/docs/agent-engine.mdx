@@ -1,6 +1,6 @@
 ---
 title: Agent Engine
-description: How Stella's agent step loop works — the model proposes tool calls, tools execute, results feed back, and the run repeats until a deterministic definition-of-done check passes.
+description: How Stella's agent step loop works — the model proposes tool calls, tools execute, results feed back, and the loop repeats until the model stops proposing actions, with verify_done as the evidence-based doneness check.
 ---
 
 # Agent Engine
@@ -35,23 +35,22 @@ assumptions, the agent can correct course as it learns more about the workspace.
 The model acts on the world exclusively through tools. Stella ships with a set
 of built-in tools that are always available, including:
 
-- `read`, `write`, `edit`, `delete` — file operations.
+- `read_file`, `write_file`, `edit_file`, `delete_file` — file operations.
 - `glob`, `grep` — find files and search their contents.
-- `bash`, `exec` — run shell commands.
-- `ci` — inspect CI status and logs.
-- `issues` — read and manage issues (Linear when `LINEAR_API_KEY` is set,
-  otherwise GitHub).
-- `memory` — save and recall workspace memories.
-- `project` — project setup and introspection.
-- `screenshot` — capture screenshots.
-- `exploration` — structured codebase exploration.
-- `verify` — run the definition-of-done check (see below).
-- `registry` — list the tools registered for the session.
+- `bash` — run shell commands.
+- `ci_status` — inspect CI status and logs.
+- `save_memory`, `cite_memory` — record and cite workspace memories.
+- `build_project`, `run_tests` — build the project and run its tests.
+- `explorations`, `save_exploration` — structured codebase exploration.
+- `screenshot`, `generate_svg` — capture a screenshot, generate an SVG.
+- `verify_done` — run the definition-of-done check (see below).
 
-Developers can extend this set with custom tools (a `<name>.toml` manifest in
-`.stella/tools/` or `~/.config/stella/tools/`) and with MCP servers configured
-in `.stella/mcp.toml`. Run `stella tools` to list every tool available to the
-agent in the current session.
+Other tools register conditionally — `graph_query` after `stella init`, the five
+issue tools with a Linear/GitHub backend, and the media tools with a media-capable
+provider key. See the full [Built-in Tools](/docs/tools) catalog. Developers can
+extend the set with custom tools (a `<name>.toml` manifest in `.stella/tools/` or
+`~/.config/stella/tools/`) and with MCP servers configured in `.stella/mcp.toml`.
+Run `stella tools` to list every tool available to the agent in the current session.
 
 <Callout type="info">
 Each tool carries a per-tool permission model. Read-only tools are marked
@@ -66,20 +65,23 @@ Knowing *when to stop* is as important as knowing what to do next. Stella uses
 the work actually satisfies the requirement rather than relying on the model to
 declare itself finished.
 
-Being deterministic, `verify_done` produces a consistent, evidence-based
-verdict for the same state — it is not a matter of the model's opinion. The
-agent can trigger this check through the built-in `verify` tool, which runs the
-definition-of-done check as part of the step loop.
+`verify_done` produces an evidence-based verdict for the current state rather
+than relying on the model to declare itself finished. It is a tool the agent
+invokes (named `verify_done`), not an automatic gate.
 
-This gives the loop a concrete stopping condition: the agent keeps proposing and
-executing steps, and the run is considered complete only once the
-definition-of-done check confirms it.
+In the raw step loop, the run ends when the model stops proposing actions — it
+emits no further tool calls. `verify_done` is the evidence-based check the agent
+uses to prove doneness before it stops (and the [staged pipeline](/docs/commands/run)'s
+verify stage enforces the same check between stages).
 
 ## Where the loop is used
 
-The step loop is the common foundation across Stella's commands. Some commands
-add structure on top of it:
+The step loop is the common foundation across Stella's commands. Most add
+structure on top of it:
 
+- [`stella run`](/docs/commands/run) **defaults** to the staged pipeline —
+  triage, plan, execute, verify, judge — over the raw loop; `--no-pipeline`
+  selects the bare step loop described above.
 - [Goal mode](/docs/goal-mode) wraps the loop in **judged rounds**, where a
   separate judge model assesses from evidence whether the objective has been met
   before the run ends.

@@ -1,11 +1,12 @@
 # Stella CLI Docs
 
-The documentation site for the [Stella CLI](https://github.com/oxageninc/stella) —
+The documentation site for the [Stella CLI](https://github.com/macanderson/stella) —
 destined for **stella.oxagen.sh**.
 
 Built with [Next.js](https://nextjs.org) (App Router) + [Fumadocs](https://fumadocs.dev)
-(`fumadocs-core` / `fumadocs-ui` / `fumadocs-mdx`) + Tailwind CSS v4. Branding is generic
-shadcn-neutral for now.
+(`fumadocs-core` / `fumadocs-ui` / `fumadocs-mdx`) + Tailwind CSS v4. Branded with the
+Stella identity — the gold chevron+cells mark on a warm Night/Paper palette (see
+`src/app/global.css` for the tokens and `public/brand/` for the logo lockups).
 
 ## Develop
 
@@ -36,7 +37,7 @@ content/docs/            # all documentation (MDX + meta.json ordering)
   agent-engine.mdx       # the step loop + verify_done
   goal-mode.mdx          # judged rounds + cross-family judge
   memory.mdx             # memories, reflections, skills, code graph
-  telemetry.mdx          # local DuckDB metering + budget
+  telemetry.mdx          # local SQLite metering + budget
   scripting.mdx          # headless JSON output for CI
 
 src/app/                 # Next.js App Router
