@@ -2798,6 +2798,7 @@ dependencies = [
 name = "stella-store"
 version = "0.3.0"
 dependencies = [
+ "base64",
  "rusqlite",
  "serde",
  "serde_json",

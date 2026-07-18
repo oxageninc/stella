@@ -68,6 +68,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+use base64::Engine as _;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use stella_protocol::{AgentEvent, ToolOutput};
@@ -2073,7 +2074,10 @@ impl Store {
             for r in rows {
                 arr.push(r?);
             }
-            out.push(("executions", serde_json::to_string(&arr).unwrap_or_default()));
+            out.push((
+                "executions",
+                serde_json::to_string(&arr).unwrap_or_default(),
+            ));
         }
 
         // Telemetry — per-model-call token/cost/duration rows.
@@ -2144,11 +2148,7 @@ impl Store {
     fn query_to_json(&self, conn: &Connection, sql: &str) -> Result<String> {
         let mut stmt = conn.prepare(sql)?;
         let col_count = stmt.column_count();
-        let col_names: Vec<String> = stmt
-            .column_names()
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let col_names: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
         let rows = stmt.query_map([], |row| {
             let mut obj = serde_json::Map::with_capacity(col_count);
             for (i, name) in col_names.iter().enumerate() {
@@ -2165,9 +2165,9 @@ impl Store {
                     ValueRef::Text(bytes) => {
                         serde_json::Value::String(String::from_utf8_lossy(bytes).into_owned())
                     }
-                    ValueRef::Blob(bytes) => {
-                        serde_json::Value::String(base64_encode(bytes))
-                    }
+                    ValueRef::Blob(bytes) => serde_json::Value::String(
+                        base64::engine::general_purpose::STANDARD.encode(bytes),
+                    ),
                 };
                 obj.insert(name.clone(), val);
             }
@@ -2195,8 +2195,7 @@ impl Store {
         ];
         let mut latest: Option<String> = None;
         for sql in candidates {
-            let row: rusqlite::Result<Option<String>> =
-                conn.query_row(sql, [], |row| row.get(0));
+            let row: rusqlite::Result<Option<String>> = conn.query_row(sql, [], |row| row.get(0));
             if let Ok(Some(ts)) = row
                 && !ts.is_empty()
             {
@@ -2208,34 +2207,6 @@ impl Store {
         }
         Ok(latest)
     }
-}
-
-/// RFC 4648 base64 encode without pulling a crate — only used for blob columns
-/// in the export dump (a rare case for this store).
-fn base64_encode(bytes: &[u8]) -> String {
-    const TABLE: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
-    for chunk in bytes.chunks(3) {
-        let b = [
-            chunk[0],
-            *chunk.get(1).unwrap_or(&0),
-            *chunk.get(2).unwrap_or(&0),
-        ];
-        out.push(TABLE[(b[0] >> 2) as usize] as char);
-        out.push(TABLE[(((b[0] & 0x03) << 4) | (b[1] >> 4)) as usize] as char);
-        if chunk.len() > 1 {
-            out.push(TABLE[(((b[1] & 0x0f) << 2) | (b[2] >> 6)) as usize] as char);
-        } else {
-            out.push('=');
-        }
-        if chunk.len() > 2 {
-            out.push(TABLE[(b[2] & 0x3f) as usize] as char);
-        } else {
-            out.push('=');
-        }
-    }
-    out
 }
 
 /// Fold chronologically-ordered MCP usage rows into per-(server, tool)
