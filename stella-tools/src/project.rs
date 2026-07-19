@@ -1,86 +1,30 @@
 //! `build_project` and `run_tests` — toolchain-aware build/test execution.
 //!
-//! Both detect the workspace's toolchain (Cargo, package.json + its
-//! package manager, Go, Make) and run its canonical command, or accept an
-//! explicit `command` override for anything exotic. `run_tests` supports
-//! `kind` (unit / e2e / all) and a `filter` mapped to the runner's native
-//! filtering flag — module, package, file, or test-name granularity is the
-//! runner's own semantics.
+//! Both are thin verb shortcuts over the project scripts index
+//! (`crate::scripts`, spec: `docs/design/scripts-index.md`): detection is
+//! the index's one code path, `build_project` runs the `build` verb
+//! binding, and `run_tests` layers its `kind` (unit / e2e / all) and
+//! `filter` semantics on top — mapped to the runner's native filtering
+//! flag, or to the project's own `test:unit`/`test:e2e` scripts. An
+//! explicit `command` override still bypasses detection for anything
+//! exotic.
 
 use async_trait::async_trait;
 use serde_json::Value;
 use stella_protocol::tool::{ToolOutput, ToolSchema};
 
-use crate::exec;
+use crate::exec::run_and_report;
 use crate::registry::Tool;
+use crate::scripts::ScriptIndex;
 
 const DEFAULT_TIMEOUT_SECS: u64 = 600;
 
-/// What toolchain drives this workspace.
-enum Toolchain {
-    Cargo,
-    Node {
-        pm: &'static str,
-        scripts: serde_json::Map<String, Value>,
-    },
-    Go,
-    Make,
-}
-
-/// Async so the marker-file stats and the `package.json` read never block a
-/// runtime worker thread (#64) — this runs inside the tools' async
-/// `execute()` methods.
-async fn detect(root: &std::path::Path) -> Option<Toolchain> {
-    let exists = |name: &'static str| async move {
-        tokio::fs::try_exists(root.join(name))
-            .await
-            .unwrap_or(false)
-    };
-    if exists("Cargo.toml").await {
-        return Some(Toolchain::Cargo);
-    }
-    if exists("package.json").await {
-        let pm = if exists("pnpm-lock.yaml").await {
-            "pnpm"
-        } else if exists("yarn.lock").await {
-            "yarn"
-        } else {
-            "npm"
-        };
-        let scripts = tokio::fs::read_to_string(root.join("package.json"))
-            .await
-            .ok()
-            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-            .and_then(|pkg| pkg.get("scripts").and_then(|s| s.as_object()).cloned())
-            .unwrap_or_default();
-        return Some(Toolchain::Node { pm, scripts });
-    }
-    if exists("go.mod").await {
-        return Some(Toolchain::Go);
-    }
-    if exists("Makefile").await {
-        return Some(Toolchain::Make);
-    }
-    None
-}
-
 fn no_toolchain_error() -> ToolOutput {
     ToolOutput::Error {
-        message: "no recognized toolchain (looked for Cargo.toml, package.json, go.mod, \
-                  Makefile) — pass `command` explicitly"
+        message: "no recognized toolchain (looked for Cargo.toml, package.json, deno.json, \
+                  pyproject.toml, go.mod, Makefile, justfile, Taskfile.yml, composer.json) — \
+                  pass `command` explicitly"
             .into(),
-    }
-}
-
-async fn run_and_report(command: &str, root: &std::path::Path, timeout_secs: u64) -> ToolOutput {
-    match exec::run(command, root, timeout_secs).await {
-        Ok((0, output)) => ToolOutput::Ok {
-            content: format!("`{command}` PASSED (exit 0)\n{output}"),
-        },
-        Ok((code, output)) => ToolOutput::Error {
-            message: format!("`{command}` FAILED (exit {code})\n{output}"),
-        },
-        Err(e) => ToolOutput::Error { message: e },
     }
 }
 
@@ -91,8 +35,8 @@ impl Tool for BuildProject {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "build_project".into(),
-            description: "Build the workspace with its own toolchain (cargo/npm/go/make), or a \
-                          custom command."
+            description: "Build the workspace with its own toolchain (cargo/npm/go/make/…), or \
+                          a custom command."
                 .into(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -113,22 +57,18 @@ impl Tool for BuildProject {
         if let Some(command) = input.get("command").and_then(|v| v.as_str()) {
             return run_and_report(command, root, timeout_secs).await;
         }
-        let command = match detect(root).await {
-            Some(Toolchain::Cargo) => "cargo build --workspace".to_string(),
-            Some(Toolchain::Node { pm, scripts }) => {
-                if scripts.contains_key("build") {
-                    format!("{pm} run build")
-                } else {
-                    return ToolOutput::Error {
-                        message: "package.json has no `build` script — pass `command`".into(),
-                    };
-                }
-            }
-            Some(Toolchain::Go) => "go build ./...".to_string(),
-            Some(Toolchain::Make) => "make build".to_string(),
-            None => return no_toolchain_error(),
-        };
-        run_and_report(&command, root, timeout_secs).await
+        let index = ScriptIndex::detect(root).await;
+        if index.is_empty() {
+            return no_toolchain_error();
+        }
+        match index.verb_entry("build") {
+            Some(entry) => run_and_report(&entry.command, root, timeout_secs).await,
+            None => ToolOutput::Error {
+                message: "no `build` script detected in this workspace (see list_scripts) — \
+                          pass `command`"
+                    .into(),
+            },
+        }
     }
 }
 
@@ -166,8 +106,12 @@ impl Tool for RunTests {
         let kind = input.get("kind").and_then(|v| v.as_str()).unwrap_or("all");
         let filter = input.get("filter").and_then(|v| v.as_str()).unwrap_or("");
 
-        let command = match detect(root).await {
-            Some(Toolchain::Cargo) => match kind {
+        let index = ScriptIndex::detect(root).await;
+        let Some(primary) = index.primary_runner() else {
+            return no_toolchain_error();
+        };
+        let command = match primary {
+            "cargo" => match kind {
                 // Unit tests live beside the code; e2e = the integration
                 // test targets under tests/.
                 "unit" => format!("cargo test --workspace --lib --bins {filter}"),
@@ -180,14 +124,15 @@ impl Tool for RunTests {
                 }
                 _ => format!("cargo test --workspace {filter}"),
             },
-            Some(Toolchain::Node { pm, scripts }) => {
+            pm @ ("npm" | "pnpm" | "yarn" | "bun") => {
+                let scripts = index.root_script_names(pm);
                 let script = match kind {
-                    "unit" if scripts.contains_key("test:unit") => "test:unit",
-                    "e2e" if scripts.contains_key("test:e2e") => "test:e2e",
-                    "e2e" if scripts.contains_key("e2e") => "e2e",
+                    "unit" if scripts.contains("test:unit") => "test:unit",
+                    "e2e" if scripts.contains("test:e2e") => "test:e2e",
+                    "e2e" if scripts.contains("e2e") => "e2e",
                     // NO generic-`test` fallback for e2e: running unit tests
                     // while reporting "e2e passed" is a lie.
-                    "unit" | "all" if scripts.contains_key("test") => "test",
+                    "unit" | "all" if scripts.contains("test") => "test",
                     _ => {
                         return ToolOutput::Error {
                             message: format!(
@@ -203,15 +148,50 @@ impl Tool for RunTests {
                     format!("{pm} run {script} -- {filter}")
                 }
             }
-            Some(Toolchain::Go) => {
+            "go" => {
                 if filter.is_empty() {
                     "go test ./...".to_string()
                 } else {
                     format!("go test ./... -run {filter}")
                 }
             }
-            Some(Toolchain::Make) => "make test".to_string(),
-            None => return no_toolchain_error(),
+            runner => {
+                // uv/poetry/make/just/task/composer/deno: the project's own
+                // e2e script or nothing (same no-lying rule as above); unit
+                // and all ride the index's `test` verb binding. pytest takes
+                // the filter as a positional; the task runners have no
+                // native filter flag, so a filter there is ignored.
+                let scripts = index.root_script_names(runner);
+                if kind == "e2e" {
+                    let script = ["test:e2e", "e2e"]
+                        .into_iter()
+                        .find(|s| scripts.contains(s));
+                    match script.and_then(|s| index.resolve(s, Some(".")).ok()) {
+                        Some(entry) => entry.command.clone(),
+                        None => {
+                            return ToolOutput::Error {
+                                message: "no e2e test script detected for kind `e2e` — pass \
+                                          `command`"
+                                    .into(),
+                            };
+                        }
+                    }
+                } else {
+                    match index.verb_entry("test") {
+                        Some(entry) if matches!(runner, "uv" | "poetry") && !filter.is_empty() => {
+                            format!("{} {filter}", entry.command)
+                        }
+                        Some(entry) => entry.command.clone(),
+                        None => {
+                            return ToolOutput::Error {
+                                message: "no test script detected in this workspace (see \
+                                          list_scripts) — pass `command`"
+                                    .into(),
+                            };
+                        }
+                    }
+                }
+            }
         };
         run_and_report(&command, root, timeout_secs).await
     }
@@ -221,51 +201,46 @@ impl Tool for RunTests {
 mod tests {
     use super::*;
 
-    fn temp_root(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("stella_project_{tag}_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
     #[tokio::test]
     async fn no_toolchain_is_a_named_error_and_command_overrides() {
-        let root = temp_root("none");
-        let out = BuildProject.execute(&serde_json::json!({}), &root).await;
+        let root = tempfile::tempdir().unwrap();
+        let out = BuildProject
+            .execute(&serde_json::json!({}), root.path())
+            .await;
         assert!(out.is_error());
 
         let out = BuildProject
             .execute(
                 &serde_json::json!({"command": "echo built && exit 0"}),
-                &root,
+                root.path(),
             )
             .await;
         assert!(!out.is_error(), "{out:?}");
 
         let out = RunTests
-            .execute(&serde_json::json!({"command": "exit 1"}), &root)
+            .execute(&serde_json::json!({"command": "exit 1"}), root.path())
             .await;
         match &out {
             ToolOutput::Error { message } => assert!(message.contains("FAILED"), "{message}"),
             other => panic!("{other:?}"),
         }
-        std::fs::remove_dir_all(&root).ok();
     }
 
     #[tokio::test]
     async fn node_detection_uses_scripts_and_pm_lockfile() {
-        let root = temp_root("node");
+        let root = tempfile::tempdir().unwrap();
         std::fs::write(
-            root.join("package.json"),
+            root.path().join("package.json"),
             r#"{"scripts": {"test": "echo node-tests-ran", "build": "echo node-build-ran"}}"#,
         )
         .unwrap();
-        std::fs::write(root.join("pnpm-lock.yaml"), "").unwrap();
+        std::fs::write(root.path().join("pnpm-lock.yaml"), "").unwrap();
 
         // pnpm may not exist in the test environment — we only assert the
         // detection path constructs the right command shape, visible in the
         // success/error text either way.
         let out = RunTests
-            .execute(&serde_json::json!({"kind": "all"}), &root)
+            .execute(&serde_json::json!({"kind": "all"}), root.path())
             .await;
         let text = match &out {
             ToolOutput::Ok { content } => content.clone(),
@@ -274,9 +249,41 @@ mod tests {
         assert!(text.contains("pnpm run test"), "{text}");
 
         let out = RunTests
-            .execute(&serde_json::json!({"kind": "e2e"}), &root)
+            .execute(&serde_json::json!({"kind": "e2e"}), root.path())
             .await;
         assert!(out.is_error(), "no e2e script → named error: {out:?}");
-        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn make_targets_drive_build_and_tests_via_the_index() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("Makefile"),
+            "build:\n\t@echo make-build-ran\ntest:\n\t@echo make-test-ran\n",
+        )
+        .unwrap();
+
+        let out = BuildProject
+            .execute(&serde_json::json!({}), root.path())
+            .await;
+        match &out {
+            ToolOutput::Ok { content } => assert!(content.contains("make-build-ran"), "{content}"),
+            other => panic!("{other:?}"),
+        }
+
+        let out = RunTests
+            .execute(&serde_json::json!({"kind": "all"}), root.path())
+            .await;
+        match &out {
+            ToolOutput::Ok { content } => assert!(content.contains("make-test-ran"), "{content}"),
+            other => panic!("{other:?}"),
+        }
+
+        // A bare `test` target must NOT pass itself off as e2e — the same
+        // no-lying rule the npm-family mapping enforces.
+        let out = RunTests
+            .execute(&serde_json::json!({"kind": "e2e"}), root.path())
+            .await;
+        assert!(out.is_error(), "no e2e target → named error: {out:?}");
     }
 }
