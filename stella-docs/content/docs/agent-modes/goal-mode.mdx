@@ -12,23 +12,44 @@ stella goal "<objective>"
 ```
 
 Where `stella run` executes a single one-shot prompt, `stella goal` runs
-**judged rounds**. Each round the worker agent makes progress using the normal
-[agent step loop](/docs/inference-pipeline), and then a separate judge model reviews
-the evidence and decides whether the objective has been satisfied. The loop ends
-when the judge confirms — or when a backstop trips: a hard round cap (default
-**8** rounds), the `--budget` limit, or a worker-turn abort. Reaching a backstop
+**judged rounds**. Each round is a full
+[staged pipeline](/docs/inference-pipeline) run by default — triage → recall
+→ plan → scope review → witness → execute → verify → judge, with a bounded
+revise loop — and then a separate **goal judge** reviews the evidence and
+decides whether the objective has been satisfied. That's double
+verification: the pipeline's own judge checks each round's *work*, and the
+outer goal judge checks the *objective*. The loop ends when the goal judge
+confirms — or when a backstop trips: a hard round cap (default **8**
+rounds), the `--budget` limit, or a worker-turn abort. Reaching a backstop
 ends the run reporting the goal as **not met**, with a named reason.
+
+Double verification is rigor you pay for. `--no-pipeline` drops the inner
+pipeline and makes each round a raw step-loop turn, with only the goal judge
+standing between the worker and "done":
+
+```bash
+stella goal --no-pipeline "every TODO in src/cli/ is resolved or filed as an issue"
+```
 
 ## How judged rounds work
 
-1. **The worker works a round.** The worker model runs the step loop —
-   proposing tool calls, executing them, and feeding results back — to make
-   progress toward the objective.
+1. **The worker works a round.** By default the round is a full staged
+   pipeline run — triage → recall → plan → scope review → witness → execute
+   → verify → judge, with a bounded revise loop — so the work inside a round
+   is already verified before the goal judge ever sees it. With
+   `--no-pipeline` the round is a raw step-loop turn instead: the worker
+   model proposes tool calls, executes them, and feeds results back until it
+   stops.
 2. **The judge assesses from evidence.** The judge is not a passive transcript
-   reader — it runs as its own bounded engine turn with read-only access to the
-   same tools the worker used (`read_file`, `grep`, `ci_status`, and so on),
-   actively inspecting the changed files, tests, and CI, and rejecting
-   claimed-but-unproven success.
+   reader — it runs as its own bounded engine turn (at most 8 steps,
+   temperature 0) over a **read-only view** of the same tool stack the worker
+   used: `read_file`, `grep`, `glob`, `explorations`, `ci_status`, and
+   `search_issues` — actively inspecting the changed files, tests, and CI,
+   and rejecting claimed-but-unproven success. The strongest evidence it can
+   see is a `verify_done` result reading **WITNESS CONFIRMED** — the change's
+   test fails on the previous code and passes on the new — because a merely
+   green suite can't distinguish real work from vacuous tests or unwired
+   code.
 3. **Repeat or finish.** If the judge is not satisfied, another round begins —
    until the judge confirms or a backstop (round cap, budget, abort) ends the run.
 

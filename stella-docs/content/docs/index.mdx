@@ -53,23 +53,48 @@ ends on a verified outcome rather than the worker's own say-so.
 
 ## The documentation
 
+**Start here**
+
 - **[Getting Started](/docs/getting-started)** — install, initialize a repo, configure
   provider keys.
-- **[Inference Pipeline](/docs/inference-pipeline)** — triage → plan → witness → execute →
-  verify → judge: how work gets *proven*, not just done.
-- **[Context Engine](/docs/context-engine)** — memories, the tree-sitter code graph,
-  reflections, and the prompt-cache-native recall that makes them cheap.
-- **[Agent Modes](/docs/agent-modes)** — Command Deck chat, one-shot runs, judged goal
-  mode, CI monitoring.
-- **[Agent Fleets](/docs/agent-fleets)** — parallel workers in isolated git worktrees.
-- **[Agent Tools](/docs/agent-tools)** — the built-in toolbelt, skills, MCP servers,
-  custom commands, hooks, and permissions.
+
+**Providers &amp; configuration**
+
+- **[API Providers](/docs/api-providers)** — per-provider setup, the model catalog, and
+  cross-provider pricing.
 - **[Configuration &amp; Settings](/docs/configuration)** — `settings.json`, per-agent
   engine config, credentials, and the scope hierarchy.
+- **[Examples &amp; Recipes](/docs/examples)** — complete config files organized by use
+  case: coding-plan subscriptions, single-key setups, gateways, local/air-gapped,
+  enterprise cloud, team-shared settings, and the three cost-tier profiles.
+
+**Using the agent**
+
+- **[Agent Modes](/docs/agent-modes)** — Command Deck chat, one-shot runs, judged goal
+  mode, CI monitoring.
+- **[Agent Fleets](/docs/agent-fleets)** — many workers over one task list: a shared
+  tree with cooperative claims, or per-task worktree isolation on demand.
+- **[Agent Tools](/docs/agent-tools)** — the built-in toolbelt, skills, MCP servers,
+  custom commands, hooks, and permissions.
 - **[Telemetry &amp; Usage Analytics](/docs/telemetry)** — local-only metering, the
   dashboard, budgets, and the files-touched ledger.
-- **[Donate](/docs/donate)** — keep independent, local-first tooling alive.
+
+**How it works**
+
+- **[Inference Pipeline](/docs/inference-pipeline)** — triage → recall → plan → scope
+  review → witness → execute → verify → judge: how work gets *proven*, not just done.
+- **[Context Engine](/docs/context-engine)** — memories, the tree-sitter code graph,
+  reflections, and the prompt-cache-native recall that makes them cheap.
+- **[Agent Engine Paths](/docs/agent-engine-paths)** — every entry point into the
+  engine, mapped.
+- **[Principles](/docs/principles)** — the convictions the codebase is built around.
+
+**Reference**
+
 - **[Commands](/docs/commands)** — the full command and flag reference.
+- **[Extensions](/docs/extensions)** &amp; **[Scripting](/docs/scripting)** — the event
+  bus for embedders, and headless/CI usage.
+- **[Donate](/docs/donate)** — keep independent, local-first tooling alive.
 
 <Callout type="info">
   Stella is BYOK — it never proxies your traffic through a hosted service. Your keys call
