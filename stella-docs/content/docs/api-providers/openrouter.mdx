@@ -1,9 +1,10 @@
 ---
 title: OpenRouter
 description: One key, every vendor — vendor/model slugs pass through the gateway verbatim, per-call cost comes from the gateway's own usage accounting, and any agent can route through it independently.
+icon: openrouter
 ---
 
-<ProviderMark id="openrouter" size={30} />
+<ProviderLogo id="openrouter" />
 
 OpenRouter is a gateway: one API key that fronts effectively every commercial model. If
 you want to try a vendor without opening an account, mix families without juggling five
@@ -18,8 +19,9 @@ export OPENROUTER_API_KEY="sk-or-..."
 
 OpenRouter sits seventh in [auto-detection](/docs/api-providers#auto-detection) — behind
 every direct-vendor key, ahead only of the cloud providers. Alternatively, store the key
-in [`~/.config/stella/credentials.toml`](/docs/configuration/credentials), or reference
-an env var from [`settings.json`](/docs/configuration/settings).
+in [`~/.config/stella/credentials.toml`](/docs/configuration/credentials), or rename the
+env var Stella reads with `providers.openrouter.api_key_env` — see
+[overriding the key source](/docs/api-providers#overriding-the-key-source).
 
 ## Selecting models
 
