@@ -3058,6 +3058,7 @@ dependencies = [
  "serde",
  "serde_json",
  "stella-protocol",
+ "tempfile",
 ]
 
 [[package]]
