@@ -185,6 +185,7 @@ fn append_exploration_index(prompt: &mut String, workspace_root: &std::path::Pat
     {
         prompt.push('\n');
         prompt.push_str(&index);
+    }
 /// The project-scripts section of [`assemble_system_prompt`]: the scripts
 /// index's canonical verb → command bindings, rendered once at session
 /// start right after the base instructions (project ground truth before
@@ -4247,4 +4248,5 @@ mod tests {
             "a judge adapter that fails to build must fall back to the worker provider"
         );
     }
+}
 }
