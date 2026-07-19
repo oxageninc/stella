@@ -2,8 +2,20 @@ name: ci
 
 on:
   pull_request:
+    # Docs-site-only changes are covered by docs.yml — don't spend an hour
+    # of Rust CI on them.
+    paths-ignore:
+      - "stella-docs/**"
+      - "package.json"
+      - "pnpm-workspace.yaml"
+      - "pnpm-lock.yaml"
   push:
     branches: [main]
+    paths-ignore:
+      - "stella-docs/**"
+      - "package.json"
+      - "pnpm-workspace.yaml"
+      - "pnpm-lock.yaml"
   workflow_dispatch:
 
 concurrency:

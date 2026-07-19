@@ -1,0 +1,80 @@
+---
+title: Anthropic
+description: Claude over the native Anthropic Messages API — extended thinking mapped from Stella's effort tiers, first-class prompt caching, and claude-fable-5 as the default model.
+---
+
+# Anthropic
+
+<ProviderMark id="anthropic" size={30} />
+
+Anthropic is the home of the Claude family, and `claude-fable-5` — the first of the
+Claude 5 line — is the strongest coding and agentic model in Stella's catalog. If you want
+the best worker money currently buys, or a top-shelf judge over a cheaper worker, this is
+the provider. Stella speaks the **Anthropic Messages** dialect natively against
+`https://api.anthropic.com`.
+
+## Setup
+
+```bash
+export ANTHROPIC_API_KEY="sk-ant-..."
+```
+
+That is the whole setup — Anthropic sits second in
+[auto-detection](/docs/api-providers#auto-detection), so with the key exported Stella
+picks it up on its own (only a `ZAI_API_KEY` outranks it). Alternatively, store the key in
+[`~/.config/stella/credentials.toml`](/docs/configuration/credentials), or reference an
+env var of your choosing from [`settings.json`](/docs/configuration/settings):
+
+```json title=".stella/settings.json"
+{
+  "providers": {
+    "anthropic": {
+      "api_key_env": "MY_TEAM_ANTHROPIC_KEY"
+    }
+  }
+}
+```
+
+## Selecting models
+
+The provider id is `anthropic`; the default model is `claude-fable-5`.
+
+```bash
+stella --model anthropic/claude-fable-5 run "refactor the session store"
+export STELLA_MODEL=anthropic/claude-fable-5   # pin for the whole shell
+```
+
+## Reasoning and sampling
+
+Stella's reasoning setting maps to Anthropic **extended thinking**, with a thinking-token
+budget tiered by [effort](/docs/configuration/agent-engine-config) — a higher effort buys
+a larger budget. One API rule to know: while thinking is enabled, `temperature` is
+**omitted** from the request — the Messages API does not accept both, and Stella complies
+rather than erroring. Set `reasoning: "off"` for an agent if you need temperature control
+back.
+
+## Prompt caching
+
+Prompt caching is first-class on this provider: Stella meters **both cache reads and cache
+writes**, so the telemetry you see in the
+[Observatory](/docs/telemetry/dashboard) reflects the true bill. Cached input is billed at
+$0.30/Mtok against a $3.00 list input price — a 10x discount on the byte-stable prefix the
+[context engine](/docs/context-engine) maintains — which is why long `claude-fable-5` runs
+cost far less than the headline price implies.
+
+## In the pipeline
+
+`claude-fable-5` is the reference worker for hard multi-file changes and a superb judge —
+the [max-quality profile](/docs/examples/max-quality) uses it as the worker under a
+`gpt-5.5` judge, while the [balanced profile](/docs/examples/balanced) flips it into the
+judge seat over a `glm-5.2` worker. Route it per agent with
+[`agent_engine_config`](/docs/configuration/agent-engine-config).
+
+## Catalog pricing
+
+| Model | Context | In $/Mtok | Out $/Mtok | Cached-in $/Mtok |
+| --- | --- | --- | --- | --- |
+| `claude-fable-5` | 200k | 3.00 | 15.00 | 0.30 |
+
+List prices from Stella's seed catalog (v0.3.0) — verify with Anthropic; see the
+[Model guide](/docs/api-providers/models) for the full cross-provider table.

@@ -1,0 +1,22 @@
+{
+  "title": "Documentation",
+  "pages": [
+    "index",
+    "getting-started",
+    "api-providers",
+    "inference-pipeline",
+    "context-engine",
+    "agent-modes",
+    "agent-fleets",
+    "agent-tools",
+    "configuration",
+    "examples",
+    "telemetry",
+    "principles",
+    "donate",
+    "---Reference---",
+    "commands",
+    "extensions",
+    "scripting"
+  ]
+}

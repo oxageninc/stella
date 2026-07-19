@@ -1,0 +1,103 @@
+---
+title: Maximum quality
+description: Every dial to the right — the strongest worker, a flagship cross-family judge, high effort and reasoning everywhere it pays. For work where being right is worth dollars.
+---
+
+# Maximum quality
+
+The brief: **accuracy over everything**. The strongest coding model works,
+an equally serious model from a *different family* judges, effort and
+thinking run high, and you pay list price for the privilege. Use this for
+gnarly multi-file changes, unfamiliar codebases, and anything you'd rather
+pay $2 for once than $0.20 for three times.
+
+## The config
+
+```jsonc title="~/.config/stella/settings.json"
+{
+  "agent_engine_config": {
+    "pipeline_worker_model": "anthropic/claude-fable-5",
+    "pipeline_judge_model": "openai/gpt-5.5",
+    "pipeline_triage_model": "deepseek/deepseek-chat",
+    "default_model": "anthropic/claude-fable-5",
+
+    "allowed_models": [
+      "anthropic/claude-fable-5",
+      "openai/gpt-5.5",
+      "gemini/gemini-3-pro",
+      "deepseek/deepseek-chat"
+    ],
+
+    "auto_mode": "off",
+    "effort_auto": "off",
+    "reasoning_auto": "off",
+
+    "agents": {
+      "worker": {
+        "effort": "xhigh",
+        "reasoning": "on"
+      },
+      "judge": {
+        "effort": "high",
+        "reasoning": "on",
+        "prompt": "You are a strict, evidence-first code judge. Claimed success without deterministic evidence is a FAIL.",
+        "params": { "service_tier": "priority" }
+      },
+      "triage": { "effort": "low", "reasoning": "off" }
+    }
+  }
+}
+```
+
+Why these choices:
+
+- **Fable 5 as worker.** The strongest coding/agentic model in the
+  [catalog](/docs/api-providers/models) — worth its $15/Mtok output on work
+  where a wrong change costs more than the tokens. `xhigh` effort +
+  thinking on: let it deliberate.
+- **GPT-5.5 as judge — not another Claude.** Cross-family judging is the
+  point: a different family shares fewer blind spots with the worker. High
+  effort, thinking on, and a stricter custom prompt. `service_tier:
+  "priority"` buys faster verdicts on providers that support tiers.
+- **DeepSeek triage.** Even a maximal setup shouldn't pay flagship rates
+  for a one-token classification. This is the one dial that *never* needs
+  to be expensive.
+- **Autos off.** In a hand-tuned profile, explicit settings beat automatic
+  ones.
+
+## Run it hard
+
+```bash
+# Arm the deterministic oracle and give it room to work.
+stella --budget 8.00 run \
+  "port the auth middleware to the new session store; all tests must pass" \
+  --test-command "cargo test -p auth"
+
+# Outcome-driven, judged rounds, capped.
+stella --budget 15.00 goal "the payments integration test suite passes on CI"
+```
+
+## What it costs
+
+Estimates at list prices, medium task, caching healthy (see the
+[cost anatomy](/docs/examples)):
+
+| Task shape | Ballpark |
+| --- | --- |
+| Focused single-file fix | $0.15 – $0.60 |
+| Medium multi-file change, one revision | **$0.40 – $2.50** |
+| Hard refactor / long session | $2 – $8+ |
+| Goal mode, several rounds | multiply by rounds — cap with `--budget` |
+
+The judge adds only cents per verification; the worker's output tokens are
+~80–90% of the bill. If this profile stings, the
+[balanced profile](/docs/examples/balanced) keeps a flagship *judge* while
+cutting the worker bill 5–7×.
+
+<Callout type="info">
+  Two upgrades that cost nothing: always pass `--test-command` (a
+  deterministic fail→pass flip can skip the judge call entirely and is the
+  strongest evidence there is), and check the Observatory's **$/resolved**
+  after a week — if Fable 5 resolves in one attempt what cheaper models
+  need three for, this profile can be the *cheap* one per outcome.
+</Callout>

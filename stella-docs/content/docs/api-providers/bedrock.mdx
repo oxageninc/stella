@@ -1,0 +1,70 @@
+---
+title: Amazon Bedrock
+description: Claude under AWS governance — SigV4-signed Bedrock Converse, cross-region inference profiles, and why this provider is deliberately last in auto-detection.
+---
+
+# Amazon Bedrock
+
+<ProviderMark id="bedrock" size={30} />
+
+Bedrock is Claude for organizations that must keep inference **inside their AWS
+account** — billed to AWS, governed by IAM, logged in CloudTrail, contained by your VPC
+story. Stella speaks the **Bedrock Converse** dialect with standard SigV4 request
+signing; there is no separate API key, just AWS credentials.
+
+## Setup
+
+```bash
+export AWS_ACCESS_KEY_ID="AKIA..."
+export AWS_SECRET_ACCESS_KEY="..."
+export AWS_SESSION_TOKEN="..."          # optional — for STS / SSO sessions
+export AWS_REGION="us-east-1"           # or AWS_DEFAULT_REGION; us-east-1 is the default
+```
+
+`AWS_REGION` wins over `AWS_DEFAULT_REGION` when both are set; with neither, Stella uses
+`us-east-1`. Short-lived STS or SSO credentials work as long as `AWS_SESSION_TOKEN`
+accompanies them. Your IAM principal needs Bedrock invoke permissions for the models you
+call, and the models must be enabled in your account's Bedrock console.
+
+## Selecting models
+
+The provider id is `bedrock`; the default model is the **cross-region inference profile**
+`us.anthropic.claude-sonnet-4-5-20250929-v1:0`.
+
+```bash
+stella --model bedrock/us.anthropic.claude-sonnet-4-5-20250929-v1:0 run "harden the S3 policy module"
+```
+
+<Callout type="info">
+  The `us.` prefix is not decoration — it names an inference profile. Bedrock **rejects
+  on-demand invocation of newer Anthropic models without a profile**, so the bare
+  `anthropic.claude-…` model id fails where the profile succeeds. Stella defaults to the
+  profile for exactly this reason; use the profile form for any newer Claude model you
+  pin.
+</Callout>
+
+## Last in auto-detection — on purpose
+
+Bedrock sits **last** in [auto-detection](/docs/api-providers#auto-detection) (alongside
+Vertex), deliberately: `AWS_ACCESS_KEY_ID` is present in effectively every AWS
+practitioner's shell, almost always for reasons unrelated to LLM inference. A generic
+cloud credential must never hijack provider selection — if you want Bedrock, pin it with
+`--model bedrock/…` or set it as a default in
+[`settings.json`](/docs/configuration/settings).
+
+## In the pipeline
+
+Bedrock's Claude is a strong worker or judge wherever a compliance boundary rules the
+direct Anthropic API out — same family strengths, AWS wrapping. It slots into any of the
+[example profiles](/docs/examples) as the worker or judge seat; route it per agent with
+[`agent_engine_config`](/docs/configuration/agent-engine-config).
+
+## Catalog pricing
+
+| Model | Context | In $/Mtok | Out $/Mtok | Cached-in $/Mtok |
+| --- | --- | --- | --- | --- |
+| `us.anthropic.claude-sonnet-4-5-20250929-v1:0` | 200k | 3.00 | 15.00 | 0.30 |
+
+List prices from Stella's seed catalog (v0.3.0) — actual Bedrock billing is set by AWS
+and your agreements; verify in the AWS console. See the
+[Model guide](/docs/api-providers/models) for the full cross-provider table.

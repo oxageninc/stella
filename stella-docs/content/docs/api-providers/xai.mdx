@@ -1,0 +1,68 @@
+---
+title: xAI
+description: Grok over an OpenAI-compatible API — a distinct model family with strong reasoning, useful as an alternate judge, with grok-4 as the default model.
+---
+
+# xAI
+
+<ProviderMark id="xai" size={30} />
+
+xAI serves the Grok family — strong reasoning models from a lineage independent of the
+Claude, GPT, and Gemini lines. That independence is the point: in a pipeline built on
+cross-family judging, a third or fourth distinct family is genuinely useful. Stella
+speaks the **OpenAI-compatible** dialect against `https://api.x.ai/v1`.
+
+## Setup
+
+```bash
+export XAI_API_KEY="xai-..."
+```
+
+xAI sits fourth in [auto-detection](/docs/api-providers#auto-detection), so the key alone
+is enough. Alternatively, store the key in
+[`~/.config/stella/credentials.toml`](/docs/configuration/credentials), or reference an
+env var from [`settings.json`](/docs/configuration/settings):
+
+```json title=".stella/settings.json"
+{
+  "providers": {
+    "xai": {
+      "api_key_env": "MY_TEAM_XAI_KEY"
+    }
+  }
+}
+```
+
+## Selecting models
+
+The provider id is `xai`; the default model is `grok-4`.
+
+```bash
+stella --model xai/grok-4 run "review the retry logic for races"
+export STELLA_MODEL=xai/grok-4
+```
+
+## Configuration
+
+Being OpenAI-compatible, xAI takes the standard sampling parameters — `temperature`,
+`top_p`, `max_tokens`, and friends — configured per agent under
+[`agent_engine_config`](/docs/configuration/agent-engine-config). The
+[settings.json `providers` map](/docs/configuration/settings) can override the base URL
+or default model like any other provider.
+
+## In the pipeline
+
+`grok-4`'s sweet spot is the **alternate judge**: when your worker and primary judge are
+already Claude and GPT, Grok gives you a third family for tie-breaking or for goal-mode
+round judging without same-model bias. It holds its own as a worker on reasoning-heavy
+tasks too. See [Examples](/docs/examples) for profile patterns and
+[Agent engine config](/docs/configuration/agent-engine-config) for the per-agent wiring.
+
+## Catalog pricing
+
+| Model | Context | In $/Mtok | Out $/Mtok | Cached-in $/Mtok |
+| --- | --- | --- | --- | --- |
+| `grok-4` | 256k | 3.00 | 15.00 | 0.75 |
+
+List prices from Stella's seed catalog (v0.3.0) — verify with xAI; see the
+[Model guide](/docs/api-providers/models) for the full cross-provider table.

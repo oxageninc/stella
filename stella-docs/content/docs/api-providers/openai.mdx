@@ -1,0 +1,79 @@
+---
+title: OpenAI
+description: GPT over the OpenAI Responses API — reasoning effort, verbosity, and service tiers mapped natively, with gpt-5.5 as the default model.
+---
+
+# OpenAI
+
+<ProviderMark id="openai" size={30} />
+
+OpenAI's `gpt-5.5` pairs top-tier reasoning with a 400k context window at a mid-tier
+price — which makes it both a strong worker and the catalog's best cross-family judge over
+a Claude or GLM worker. Stella speaks the **OpenAI Responses** dialect (not the legacy
+chat-completions shape) against `https://api.openai.com/v1`.
+
+## Setup
+
+```bash
+export OPENAI_API_KEY="sk-..."
+```
+
+OpenAI sits third in [auto-detection](/docs/api-providers#auto-detection), so the key
+alone is enough. Alternatively, store the key in
+[`~/.config/stella/credentials.toml`](/docs/configuration/credentials), or point
+[`settings.json`](/docs/configuration/settings) at an env var of your choosing:
+
+```json title=".stella/settings.json"
+{
+  "providers": {
+    "openai": {
+      "api_key_env": "MY_TEAM_OPENAI_KEY"
+    }
+  }
+}
+```
+
+## Selecting models
+
+The provider id is `openai`; the default model is `gpt-5.5`.
+
+```bash
+stella --model openai/gpt-5.5 run "add integration tests for the exporter"
+export STELLA_MODEL=openai/gpt-5.5
+```
+
+## Reasoning-model parameter rules
+
+The Responses API has a hard rule for reasoning models, and Stella honors it: for the
+gpt-5 and o-series families, `temperature` and `top_p` are **omitted** from the request —
+the API rejects them outright, and Stella drops them rather than letting your run die on a
+400. What you control instead:
+
+| Stella setting | Wire field |
+| --- | --- |
+| `effort` (low → max) | `reasoning.effort` |
+| `verbosity` (low / medium / high) | `text.verbosity` |
+| `service_tier` | `service_tier` — `auto`, `default`, `flex`, or `priority` |
+
+`service_tier: "flex"` trades latency for a cheaper rate on tolerant workloads;
+`"priority"` does the reverse. Set any of these per agent in
+[`agent_engine_config`](/docs/configuration/agent-engine-config).
+
+## In the pipeline
+
+`gpt-5.5` is the judge of choice when your worker is a Claude or GLM model — a different
+family judging at high effort resists same-model bias. It appears as the judge in the
+[max-quality profile](/docs/examples/max-quality) and as an alternate judge in the
+[balanced profile](/docs/examples/balanced); its 400k window and mid price also make it a
+first-rate worker in its own right. Wire it per agent with
+[`agent_engine_config`](/docs/configuration/agent-engine-config).
+
+## Catalog pricing
+
+| Model | Context | In $/Mtok | Out $/Mtok | Cached-in $/Mtok |
+| --- | --- | --- | --- | --- |
+| `gpt-5.5` | 400k | 1.25 | 10.00 | 0.125 |
+
+List prices from Stella's seed catalog (v0.3.0) — verify with OpenAI; the cached-input
+rate is what most worker input costs mid-run (see the
+[Model guide](/docs/api-providers/models)).

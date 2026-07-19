@@ -1,0 +1,77 @@
+---
+title: DeepSeek
+description: The price/performance outlier — deepseek-chat at $0.27/$1.10 per Mtok, the natural triage model for every lineup and a very capable budget worker.
+---
+
+# DeepSeek
+
+<ProviderMark id="deepseek" size={30} />
+
+DeepSeek is the catalog's price/performance outlier: `deepseek-chat` costs **$0.27/Mtok
+in, $1.10/Mtok out, $0.07/Mtok cached** — roughly a tenth of flagship rates — while
+remaining a genuinely capable coding model. Stella speaks the **OpenAI-compatible**
+dialect against `https://api.deepseek.com/v1`.
+
+## Setup
+
+```bash
+export DEEPSEEK_API_KEY="sk-..."
+```
+
+DeepSeek sits fifth in [auto-detection](/docs/api-providers#auto-detection).
+Alternatively, store the key in
+[`~/.config/stella/credentials.toml`](/docs/configuration/credentials), or reference an
+env var from [`settings.json`](/docs/configuration/settings):
+
+```json title=".stella/settings.json"
+{
+  "providers": {
+    "deepseek": {
+      "api_key_env": "MY_TEAM_DEEPSEEK_KEY"
+    }
+  }
+}
+```
+
+## Selecting models
+
+The provider id is `deepseek`; the default model is `deepseek-chat` (the V3 line, revised
+through 2025).
+
+```bash
+stella --model deepseek/deepseek-chat run "fix the flaky date test"
+export STELLA_MODEL=deepseek/deepseek-chat
+```
+
+## The triage model
+
+Stella's pipeline triage agent emits **one token under a 10-second ceiling** — it
+classifies the task and nothing more. Paying flagship prices for that token buys nothing,
+which is why every named lineup in the [Model guide](/docs/api-providers/models) — from
+[max quality](/docs/examples/max-quality) down to
+[dirt cheap](/docs/examples/dirt-cheap) — puts `deepseek-chat` in the triage seat:
+
+```jsonc title="settings.json"
+{
+  "agent_engine_config": {
+    "pipeline_triage_model": "deepseek/deepseek-chat"
+  }
+}
+```
+
+## In the pipeline
+
+Beyond triage, `deepseek-chat` is the worker of the
+[dirt-cheap profile](/docs/examples/dirt-cheap) — a very capable budget worker for
+routine, well-scoped tasks where a flagship would be overkill. Its 128k window is the one
+constraint to respect: point it at focused changes, not whole-repo sweeps. Wire the roles
+with [`agent_engine_config`](/docs/configuration/agent-engine-config).
+
+## Catalog pricing
+
+| Model | Context | In $/Mtok | Out $/Mtok | Cached-in $/Mtok |
+| --- | --- | --- | --- | --- |
+| `deepseek-chat` | 128k | 0.27 | 1.10 | 0.07 |
+
+List prices from Stella's seed catalog (v0.3.0) — verify with DeepSeek; see the
+[Model guide](/docs/api-providers/models) for the full cross-provider table.

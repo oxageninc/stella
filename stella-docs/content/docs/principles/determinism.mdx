@@ -1,0 +1,88 @@
+---
+title: Determinism over intelligence
+description: Why Stella is a deterministic single-thread engine instead of a multi-agent swarm — the MAST failure taxonomy, the Agentless result, and the case for spending intelligence only where mechanisms can't reach.
+---
+
+# Determinism over intelligence
+
+The dominant trend in agent architecture is the swarm: a navigator agent, a
+coder agent, a reviewer agent, a tester agent, and a coordinator conducting
+them. Stella deliberately went the other way — **one deterministic,
+single-threaded step loop** — and treats that as a feature, not a
+limitation. This page distills
+[the full research note](https://github.com/macanderson/stella/blob/main/docs/papers/deterministic-engine.md).
+
+## What the research found
+
+The first comprehensive empirical study of multi-agent LLM failures — the
+**MAST** taxonomy (Cemri et al., UC Berkeley, NeurIPS 2025) — identified
+three dominant failure classes across AutoGen, MetaGPT, ChatDev, and peers:
+
+1. **Inter-agent misalignment** — agents disagree about the task state and
+   each other's outputs: contradictory actions, re-explored territory,
+   cascading errors through the coordinator.
+2. **Verification difficulty** — no single thread of execution to replay or
+   audit; diagnosing *which* agent went wrong means archaeology over
+   message logs.
+3. **Information degradation** — every agent-to-agent handoff summarizes,
+   and every summary loses information. The navigator's rich understanding
+   reaches the coder as a vague directive.
+
+And the cost dimension: Kapoor et al. (Princeton, TMLR 2025) show agent
+systems must be judged on cost as well as accuracy — swarms are
+systematically more expensive per task, usually without commensurate gains.
+
+Meanwhile, two of the strongest SWE-bench systems — **Agentless** (Xia et
+al., FSE 2025) and **SWE-agent** — are explicitly single-agent: a
+well-designed localize → repair → verify pipeline beats orchestration
+complexity.
+
+## Stella's answer, by construction
+
+- **One loop.** Plan, fan tool calls out in parallel, observe, compact if
+  noisy, repeat. No coordinator to go stale, no peer to disagree with, no
+  handoff to degrade — the "swarm failure modes" are not mitigated, they
+  are *unrepresentable*.
+- **One transcript.** Every decision is a step in a single, ordered event
+  stream you can replay and audit — feeding the local
+  [telemetry](/docs/telemetry) ledgers step by step.
+- **A pure decision core.** The engine performs no I/O; its logic is
+  synchronous functions over owned data, which is what makes it
+  property-testable — and what makes its behavior *reproducible* at all.
+
+Where parallelism genuinely pays, Stella provides it **without shared
+mutable state**: [fleets](/docs/agent-fleets) run N independent
+single-thread engines in N isolated git worktrees with cooperative file
+claims — parallel work, no swarm coordination, no inter-agent messages to
+degrade.
+
+## The principle generalized
+
+"Prefer determinism over intelligence" is not anti-model — Stella exists to
+put frontier models to work. It is a statement about **where to spend
+them**:
+
+- Verification prefers the [flip oracle](/docs/inference-pipeline) — a
+  test that fails before and passes after — and escalates to a model judge
+  only when deterministic evidence is inconclusive. Evidence first, opinion
+  as fallback.
+- When a model *is* asked to judge, the setup is engineered like a
+  mechanism: a different family than the worker (bias resistance), a
+  strict output contract, read-only tools, a heuristic fallback if the
+  call fails.
+- Routing, budgets, compaction, retries, memory injection — all
+  deterministic, all boring, all auditable. The model's tokens go to the
+  two things only intelligence can do: **writing the change** and
+  **judging what mechanisms can't measure**.
+
+The payoff compounds: deterministic mechanisms cost nothing per run, never
+rate-limit, never hallucinate, and give the *same answer twice* — which is
+exactly what you want from the parts of an agent that decide whether to
+trust it.
+
+<Callout type="info">
+  Read the full papers in the repo:
+  [the deterministic engine](https://github.com/macanderson/stella/blob/main/docs/papers/deterministic-engine.md)
+  and
+  [the seven defensible properties](https://github.com/macanderson/stella/blob/main/docs/papers/stella-defensible-position.md).
+</Callout>
