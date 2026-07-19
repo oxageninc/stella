@@ -17,9 +17,10 @@ impl Tool for Glob {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "glob".into(),
-            description:
-                "Find files matching a glob pattern. Returns relative paths from workspace root."
-                    .into(),
+            description: "Find files matching a glob pattern. Returns relative paths from \
+                          workspace root. When the code-graph index exists, results carry a \
+                          code-map footer (matched files' symbols and import edges)."
+                .into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -84,7 +85,9 @@ impl Tool for Glob {
                     .map(|l| relativize(l, canon_root.as_deref()))
                     .collect::<Vec<_>>()
                     .join("\n");
-                ToolOutput::Ok { content }
+                ToolOutput::Ok {
+                    content: with_code_map(content, root),
+                }
             }
             Err(_) => {
                 // fd not installed — fall back to find (same pinned dir).
@@ -109,7 +112,9 @@ impl Tool for Glob {
                                 .map(|l| relativize(l, canon_root.as_deref()))
                                 .collect::<Vec<_>>()
                                 .join("\n");
-                            ToolOutput::Ok { content }
+                            ToolOutput::Ok {
+                                content: with_code_map(content, root),
+                            }
                         }
                     }
                     Err(e) => ToolOutput::Error {
@@ -119,6 +124,17 @@ impl Tool for Glob {
             }
         }
     }
+}
+
+/// Append the code-map footer for these matched paths, when the graph has
+/// one to give (see [`crate::code_map`]). Bound separately from the `if let`
+/// so the `content.lines()` borrow ends before `content` is mutated.
+fn with_code_map(mut content: String, root: &std::path::Path) -> String {
+    let map = crate::code_map::for_files(root, content.lines());
+    if let Some(map) = map {
+        content.push_str(&map);
+    }
+    content
 }
 
 /// Render an absolute match path relative to the workspace root, honoring the
@@ -169,6 +185,32 @@ mod tests {
             ToolOutput::Error { message } => panic!("expected ok, got: {message}"),
         }
         let _ = tokio::fs::remove_dir_all(dir.join(&subdir)).await;
+    }
+
+    #[tokio::test]
+    async fn results_carry_a_code_map_footer_when_an_index_exists() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("lib.rs"), "pub fn greet() {}\n").expect("write");
+        let db = crate::graph::graph_db_path(dir.path());
+        std::fs::create_dir_all(db.parent().expect("parent")).expect("mkdir");
+        let graph = stella_graph::CodeGraph::open(dir.path(), &db).expect("open graph");
+        graph.index_all().expect("index");
+        graph.shutdown();
+
+        let result = Glob
+            .execute(&serde_json::json!({"pattern": "*.rs"}), dir.path())
+            .await;
+        match result {
+            ToolOutput::Ok { content } => {
+                assert!(content.contains("lib.rs"), "the file list stays: {content}");
+                assert!(content.contains("code map"), "footer attached: {content}");
+                assert!(
+                    content.contains("function greet:1"),
+                    "maps the listed file's symbols: {content}"
+                );
+            }
+            ToolOutput::Error { message } => panic!("expected files, got: {message}"),
+        }
     }
 
     #[tokio::test]
