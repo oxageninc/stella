@@ -64,7 +64,10 @@ You have these tools available:
 - run_tests: Run the workspace's test suite
 - verify_done: The definition of done — replays a new test against the previous code in a shadow worktree; it must fail there and pass on your change (WITNESS CONFIRMED). Use it to prove a change actually works, not just that the suite is green.
 - ask_user: Ask the user a multiple-choice question when a decision is genuinely theirs to make (2-6 options; the UI always adds a free-text option automatically — never add an "Other" option yourself)
-- search_skills: Search the public skills registry for reusable skills you don't have locally
+- tool_search: Search every tool available this session (built-ins, MCP server tools, custom tools) ranked by fit — use it when you need a capability you don't see advertised, before concluding it doesn't exist
+- skill_search: Search the skills installed in this workspace ranked by fit; pass include_body: true to get the best match's full instructions when you intend to apply it
+- mcp_search: Find MCP servers and their tools — the workspace's configured servers (default) or the public MCP registry (scope: "registry") for servers worth installing
+- search_skills: Search the public skills registry for reusable skills you don't have locally (skill_search first — it covers what IS installed)
 - install_skill: Install a registry skill into the project (always requires the user's confirmation)
 
 Some tools have prerequisites: issue tracking (create_issue/update_issue/close_issue/search_issues/get_issue/list_labels/list_members/start_work_on_issue) appears only when a tracker is configured (`stella connect github|linear`, LINEAR_API_KEY, or gh auth) — search labels/members with list_labels/list_members before guessing names; ci_status requires the gh CLI. Use them when present.
@@ -96,7 +99,10 @@ You have these tools available:
 - run_tests: Run the workspace's test suite
 - verify_done: The definition of done, replays a new test against the previous code in a shadow worktree; it must fail there and pass on your change (WITNESS CONFIRMED). Use it to prove a change actually works, not just that the suite is green.
 - ask_user: Ask the user a multiple-choice question when a decision is genuinely theirs to make (2-6 options; the UI always adds a free-text option automatically, never add an "Other" option yourself)
-- search_skills: Search the public skills registry for reusable skills you don't have locally
+- tool_search: Search every tool available this session (built-ins, MCP server tools, custom tools) ranked by fit — use it when you need a capability you don't see advertised, before concluding it doesn't exist
+- skill_search: Search the skills installed in this workspace ranked by fit; pass include_body: true to get the best match's full instructions when you intend to apply it
+- mcp_search: Find MCP servers and their tools — the workspace's configured servers (default) or the public MCP registry (scope: "registry") for servers worth installing
+- search_skills: Search the public skills registry for reusable skills you don't have locally (skill_search first — it covers what IS installed)
 - install_skill: Install a registry skill into the project (always requires the user's confirmation)
 
 Some tools have prerequisites: issue tracking (create_issue/update_issue/close_issue/search_issues/get_issue/list_labels/list_members/start_work_on_issue) appears only when a tracker is configured (`stella connect github|linear`, LINEAR_API_KEY, or gh auth) — search labels/members with list_labels/list_members before guessing names; ci_status requires the gh CLI. Use them when present.
@@ -413,12 +419,16 @@ async fn run_pipeline_one_shot(
 
     let result = {
         let customs = CustomToolSet::new(base_tools, custom_tools, cfg.workspace_root.clone());
-        let tools = InteractiveToolSet::new(
+        let interactive = InteractiveToolSet::new(
             &customs,
             tx.clone(),
             default_ask_io(format == OutputFormat::Text),
         )
         .with_skill_registry(SkillRegistry::from_env(cfg.workspace_root.clone()));
+        // Outermost: the discovery layer (tool_search/skill_search/mcp_search)
+        // must see the complete advertised catalog below it.
+        let tools =
+            crate::discovery::DiscoveryToolSet::new(&interactive, cfg.workspace_root.clone());
 
         let repo_structure = GitRepoStructure {
             root: cfg.workspace_root.clone(),
@@ -1114,6 +1124,7 @@ async fn run_raw_one_shot(
         "run",
         prompt,
         Some(presence.id()),
+        &crate::discovery::new_activation(),
     )
     .await;
     // Episodic memory first (works even for a failed turn — failures are
@@ -1383,6 +1394,11 @@ pub async fn run_interactive(cfg: &Config, budget_limit: Option<f64>) -> Result<
     // from their journals. No inbox notifications — the user is right here.
     let mut presence = SessionPresence::announce(cfg, "interactive session");
 
+    // Session-scoped lean-mode activation state: the tool stack is rebuilt
+    // every turn, but a tool the model surfaced via tool_search must stay
+    // advertised for the rest of the session (see crate::discovery).
+    let repl_activation = crate::discovery::new_activation();
+
     loop {
         print!("{} ", ">".bright_cyan().bold());
         std::io::stdout().flush().map_err(|e| e.to_string())?;
@@ -1589,6 +1605,7 @@ pub async fn run_interactive(cfg: &Config, budget_limit: Option<f64>) -> Result<
             "chat",
             input,
             Some(presence.id()),
+            &repl_activation,
         )
         .await;
         presence.needs_input();
@@ -2290,6 +2307,18 @@ pub fn run_tools_listing() -> Result<(), String> {
             "ask_user",
             "ask the user a multiple-choice question (TTY only)",
         ),
+        (
+            "tool_search",
+            "search every session tool (built-in/MCP/custom) by keyword",
+        ),
+        (
+            "skill_search",
+            "search the skills installed in this workspace",
+        ),
+        (
+            "mcp_search",
+            "find MCP servers — configured (.stella/mcp.toml) or the public registry",
+        ),
         ("search_skills", "search the public skills registry"),
         ("install_skill", "install a registry skill (asks first)"),
     ] {
@@ -2611,6 +2640,7 @@ async fn run_turn(
     kind: &str,
     prompt: &str,
     session: Option<&str>,
+    activated: &crate::discovery::ActivatedTools,
 ) -> Result<(), String> {
     budget.begin_turn();
     let turn_start = Instant::now();
@@ -2634,12 +2664,17 @@ async fn run_turn(
             custom_tools.to_vec(),
             cfg.workspace_root.clone(),
         );
-        let tools = InteractiveToolSet::new(
+        let interactive = InteractiveToolSet::new(
             &customs,
             tx.clone(),
             default_ask_io(format == OutputFormat::Text),
         )
         .with_skill_registry(SkillRegistry::from_env(cfg.workspace_root.clone()));
+        // Outermost discovery layer; the session-scoped `activated` handle
+        // keeps lean-mode activations across the per-turn stack rebuild.
+        let tools =
+            crate::discovery::DiscoveryToolSet::new(&interactive, cfg.workspace_root.clone())
+                .with_activation(activated.clone());
         let hook_runner = ShellHookRunner;
         let mut engine =
             Engine::with_sleeper(provider, &tools, engine_config_for(cfg), &TokioSleeper)
@@ -3040,8 +3075,10 @@ async fn run_goal_turn(
             custom_tools.to_vec(),
             cfg.workspace_root.clone(),
         );
-        let tools = InteractiveToolSet::new(&customs, tx.clone(), default_ask_io(true))
+        let interactive = InteractiveToolSet::new(&customs, tx.clone(), default_ask_io(true))
             .with_skill_registry(SkillRegistry::from_env(cfg.workspace_root.clone()));
+        let tools =
+            crate::discovery::DiscoveryToolSet::new(&interactive, cfg.workspace_root.clone());
         let hook_runner = ShellHookRunner;
         let mut engine =
             Engine::with_sleeper(provider, &tools, engine_config_for(cfg), &TokioSleeper)
@@ -3195,8 +3232,10 @@ async fn run_goal_pipeline_turn(
             custom_tools.to_vec(),
             cfg.workspace_root.clone(),
         );
-        let tools = InteractiveToolSet::new(&customs, tx.clone(), default_ask_io(true))
+        let interactive = InteractiveToolSet::new(&customs, tx.clone(), default_ask_io(true))
             .with_skill_registry(SkillRegistry::from_env(cfg.workspace_root.clone()));
+        let tools =
+            crate::discovery::DiscoveryToolSet::new(&interactive, cfg.workspace_root.clone());
 
         let breaker = CircuitBreaker::new(Box::new(SystemClock::new()));
         let router = Router::new(wiring.pins.clone(), wiring.profiles.clone(), breaker);

@@ -561,6 +561,10 @@ pub async fn run_deck_session(
     // Whether the "still connecting" note has been narrated (once, on the
     // first turn that dispatches before the slot fills).
     let mut mcp_pending_noted = false;
+    // Session-scoped lean-mode activation state (crate::discovery): the tool
+    // stack is rebuilt per turn, but a tool the model surfaced via
+    // tool_search stays advertised for the rest of the deck session.
+    let discovery_activation = crate::discovery::new_activation();
 
     // The registry record and hygiene ran during assembly (the durable
     // session identity block). Claim-on-first-write identity for the lead's
@@ -1128,6 +1132,7 @@ pub async fn run_deck_session(
                         &ask_io,
                         &sup_tx,
                         &lead_holder,
+                        &discovery_activation,
                     )
                     .await
                 } else {
@@ -1145,6 +1150,7 @@ pub async fn run_deck_session(
                         &ask_io,
                         &sup_tx,
                         &lead_holder,
+                        &discovery_activation,
                     )
                     .await
                 }
@@ -3873,6 +3879,7 @@ async fn run_lead_turn(
     ask_io: &DeckAskUserIo,
     sup_tx: &UnboundedSender<SupervisorMsg>,
     claim_holder: &str,
+    activated: &crate::discovery::ActivatedTools,
 ) -> Result<(), String> {
     budget.begin_turn();
 
@@ -3904,8 +3911,13 @@ async fn run_lead_turn(
         // card (it must — `install_skill` confirms through the io without any
         // event), so the tool set's own emission would double the card.
         let (stub_tx, _) = mpsc::unbounded_channel();
-        let tools = InteractiveToolSet::new(&customs, stub_tx, Box::new(ask_io.clone()))
+        let interactive = InteractiveToolSet::new(&customs, stub_tx, Box::new(ask_io.clone()))
             .with_skill_registry(SkillRegistry::from_env(cfg.workspace_root.clone()));
+        // Discovery layer above the interactive set (it must see the full
+        // catalog), below the taps (searches are read-only; taps watch writes).
+        let tools =
+            crate::discovery::DiscoveryToolSet::new(&interactive, cfg.workspace_root.clone())
+                .with_activation(activated.clone());
         let tapped = FileChangeTap {
             inner: &tools,
             events: tx.clone(),
@@ -4003,6 +4015,7 @@ async fn run_lead_pipeline_turn(
     ask_io: &DeckAskUserIo,
     sup_tx: &UnboundedSender<SupervisorMsg>,
     claim_holder: &str,
+    activated: &crate::discovery::ActivatedTools,
 ) -> Result<(), String> {
     budget.begin_turn();
 
@@ -4027,8 +4040,11 @@ async fn run_lead_pipeline_turn(
         let customs =
             CustomToolSet::new(&claims, custom_tools.to_vec(), cfg.workspace_root.clone());
         let (stub_tx, _) = mpsc::unbounded_channel();
-        let tools = InteractiveToolSet::new(&customs, stub_tx, Box::new(ask_io.clone()))
+        let interactive = InteractiveToolSet::new(&customs, stub_tx, Box::new(ask_io.clone()))
             .with_skill_registry(SkillRegistry::from_env(cfg.workspace_root.clone()));
+        let tools =
+            crate::discovery::DiscoveryToolSet::new(&interactive, cfg.workspace_root.clone())
+                .with_activation(activated.clone());
         let tapped = FileChangeTap {
             inner: &tools,
             events: tx.clone(),
