@@ -22,6 +22,7 @@ mod agents_installed;
 mod attachments;
 mod command_deck;
 mod config;
+mod connect_cmd;
 mod domains;
 mod engine_config;
 mod export;
@@ -294,6 +295,15 @@ enum Command {
     Mcp {
         #[command(subcommand)]
         cmd: McpCmd,
+    },
+
+    /// Connect an issue tracker (GitHub/Linear) via OAuth or a pasted key —
+    /// enables the issue tools (search_issues, create_issue, list_labels, …)
+    /// and the deck's Issues tab. Credentials land owner-only in
+    /// ~/.config/stella/integrations.json; needs no model API key.
+    Connect {
+        #[command(subcommand)]
+        cmd: ConnectCmd,
     },
 
     /// Show current configuration
@@ -585,6 +595,11 @@ fn run(cli: Cli) -> Result<(), String> {
             // HTTP — no provider or API key required.
             return mcp_cmd::run(cmd);
         }
+        Some(Command::Connect { cmd }) => {
+            // Tracker OAuth talks only to the tracker the user is connecting
+            // — no provider or API key required.
+            return connect_cmd::run(cmd);
+        }
         Some(Command::Observe { port, open }) => {
             // Loopback-only dashboard over local telemetry — no provider or
             // API key required; the stores are opened strictly read-only.
@@ -701,6 +716,7 @@ fn run(cli: Cli) -> Result<(), String> {
         | Command::Stats { .. }
         | Command::Memory { .. }
         | Command::Mcp { .. }
+        | Command::Connect { .. }
         | Command::Observe { .. }
         | Command::Models { .. }
         | Command::Version => {

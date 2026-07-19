@@ -6,7 +6,7 @@
   </picture>
 </p>
 
-<p align="center"><strong>Open Source - Tree Sitter Parsed Code Graph - Bi-temporal Memory - Self-Improvement Measured & Benched</strong></p>
+<p align="center"><strong>Open Source. No Phone Home. BYOK. RUST. and Damn Good.</strong></p>
 <p align="center">
   <a href="https://github.com/macanderson/stella/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/macanderson/stella/ci.yml?branch=main&style=flat-square&logo=github&label=ci" alt="CI status"></a>
   <a href="https://github.com/macanderson/stella/actions/workflows/release.yml"><img src="https://img.shields.io/github/actions/workflow/status/macanderson/stella/release.yml?style=flat-square&logo=github&label=release" alt="Release status"></a>
@@ -351,7 +351,7 @@ writes a failing test whose fail→pass flip proves the work (`docs/design/pipel
 | `ci_status` | CI runs + failure logs via `gh` |
 | `screenshot` | Capture the screen as verification evidence |
 | `generate_image` | Text-to-image via your provider key, saved under `.stella/artifacts/` — registered only when a media-capable key is set |
-| `create_issue` · `update_issue` · `close_issue` · `search_issues` · `start_work_on_issue` | Issue tracking — registered only when configured |
+| `create_issue` · `update_issue` · `close_issue` · `search_issues` · `get_issue` · `list_labels` · `list_members` · `start_work_on_issue` | Issue tracking (GitHub/Linear) — registered only when a tracker is connected (`stella connect github\|linear`, `LINEAR_API_KEY`, or `gh` auth) |
 
 All file tools are workspace-root-pinned, and every read/write/edit/delete is
 recorded in the Files-Touched ledger (shown per turn as `[C·R·U·D] path`, also
