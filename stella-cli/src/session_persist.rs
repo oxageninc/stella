@@ -28,6 +28,14 @@ use stella_store::{SessionRecord, SessionRegistry, SessionStatus};
 use stella_tui::{AgentMeta, AgentStatus, Inbound};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
+/// The lane-id prefix of read-only session replays
+/// ([`stella_tui::WorkspaceInput::SessionOpen`] → a `replay:<id>` lane).
+/// Those envelopes ride the same inbound channel as live work but are
+/// HISTORY, not history in the making — [`journal_record`] filters them so
+/// opening an old session can never copy its past into THIS session's
+/// journal.
+pub const REPLAY_LANE_PREFIX: &str = "replay:";
+
 /// What `stella resume` was asked to reopen.
 #[derive(Debug, Clone)]
 pub enum ResumeRequest {
@@ -42,8 +50,13 @@ pub enum ResumeRequest {
 /// (graph, skills, MCP, sessions, notifications, issues…) are regenerated at
 /// startup, and `PromptRequeued` is deliberately excluded: the pending
 /// backlog is restored from `queue.json` and re-seeded, so journaling
-/// requeues would double-display those prompts after a resume.
+/// requeues would double-display those prompts after a resume. Also `None`
+/// for every envelope on a [`REPLAY_LANE_PREFIX`] lane: a read-only replay
+/// of another session must never be journaled as this session's history.
 pub fn journal_record(inbound: &Inbound) -> Option<JournalRecord> {
+    if lane(inbound).is_some_and(|l| l.starts_with(REPLAY_LANE_PREFIX)) {
+        return None;
+    }
     match inbound {
         Inbound::Register(meta) => Some(JournalRecord::Register {
             agent: meta.id.clone(),
@@ -67,6 +80,20 @@ pub fn journal_record(inbound: &Inbound) -> Option<JournalRecord> {
             agent: agent.clone(),
         }),
         Inbound::Pipeline(on) => Some(JournalRecord::Pipeline { on: *on }),
+        _ => None,
+    }
+}
+
+/// The lane (agent id) an envelope belongs to, when it has one.
+/// `Pipeline` (and the out-of-band snapshots) are laneless.
+fn lane(inbound: &Inbound) -> Option<&str> {
+    match inbound {
+        Inbound::Register(meta) => Some(&meta.id),
+        Inbound::Event { agent, .. }
+        | Inbound::Status { agent, .. }
+        | Inbound::PromptStarted { agent, .. }
+        | Inbound::PromptRequeued { agent, .. }
+        | Inbound::SessionReset { agent } => Some(agent),
         _ => None,
     }
 }
@@ -103,7 +130,7 @@ pub fn replay_inbound(record: JournalRecord, started_ms: u64) -> Option<Inbound>
 
 /// Stable snake_case wire words for [`AgentStatus`] — the journal's status
 /// vocabulary. `waiting_input` is also the settle marker
-/// (`stella_store::journal::unsettled_prompt`) — renaming any of these is a
+/// (`stella_store::journal::unsettled_prompts`) — renaming any of these is a
 /// wire break.
 fn status_key(status: AgentStatus) -> &'static str {
     match status {
@@ -260,6 +287,12 @@ impl DurableQueue {
         self.warning.take()
     }
 
+    /// The queue head, undisturbed — the sub-session drain gates on it
+    /// (slash commands stay queued for the lead's dispatcher).
+    pub fn front(&self) -> Option<&String> {
+        self.items.front()
+    }
+
     pub fn pop_front(&mut self) -> Option<String> {
         let item = self.items.pop_front();
         if item.is_some() {
@@ -312,9 +345,11 @@ pub struct ResumeState {
     pub history: Option<Vec<CompletionMessage>>,
     /// The pending backlog exactly as the user last saw it.
     pub queue: Vec<String>,
-    /// The prompt an interruption cut short mid-turn, if any — goes back to
-    /// the FRONT of the queue (already deduplicated against `queue`).
-    pub interrupted: Option<String>,
+    /// The prompts an interruption cut short mid-dispatch — the lead's
+    /// turn and/or sub-session lanes (`req:<n>`) that never settled. They go
+    /// back at the FRONT of the queue in their original dispatch order
+    /// (already deduplicated against `queue`).
+    pub interrupted: Vec<String>,
     /// The staged-pipeline toggle to restore (`None` = default).
     pub pipeline: Option<bool>,
     /// Cumulative session spend to re-seed the budget guard (monotone spend
@@ -375,11 +410,19 @@ pub fn load_resume(
     let records = journal::read_journal(&dir);
     let history = journal::read_history(&dir);
     let queue = journal::read_queue(&dir);
-    let interrupted = journal::unsettled_prompt(&records)
+    let mut interrupted: Vec<String> = journal::unsettled_prompts(&records)
+        .into_iter()
         .map(|(_, text)| text)
-        // Already at the front of the restored backlog (a crash between the
-        // requeue and the next dispatch) → re-adding would double it.
-        .filter(|text| queue.first() != Some(text));
+        .collect();
+    // Already at the front of the restored backlog (a crash between the
+    // requeue and the next dispatch) → re-adding would double them. Only a
+    // leading run can have been requeued, so a prefix match is the test.
+    let requeued = interrupted
+        .iter()
+        .zip(queue.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+    interrupted.drain(..requeued);
     let pipeline = journal::last_pipeline(&records);
     let spent_usd = journal::last_spent_usd(&records);
     Ok(ResumeState {
@@ -397,14 +440,48 @@ pub fn load_resume(
 /// replay must never re-journal itself, or every resume would double the
 /// file). The caller replays BEFORE its first live send so ordering is the
 /// original stream's.
+///
+/// Lanes other than `lead` (sub-session workers) have no process behind
+/// them anymore: any lane the journal leaves in a live status is downgraded
+/// to `Killed` after its stream — a resumed dashboard must never show a
+/// worker "running" that died with the old process. (The lead is exempt:
+/// the caller restamps it with a fresh `Register` + `WaitingInput`.) Their
+/// unsettled prompts come back through [`ResumeState::interrupted`].
 pub fn replay_session(
     records: Vec<JournalRecord>,
     started_ms: u64,
+    lead: &str,
     deck_tx: &UnboundedSender<Inbound>,
 ) {
+    let mut last_status: std::collections::HashMap<String, AgentStatus> =
+        std::collections::HashMap::new();
     for record in records {
         if let Some(inbound) = replay_inbound(record, started_ms) {
+            match &inbound {
+                Inbound::Register(meta) => {
+                    last_status
+                        .entry(meta.id.clone())
+                        .or_insert(AgentStatus::Queued);
+                }
+                Inbound::Status { agent, status } => {
+                    last_status.insert(agent.clone(), *status);
+                }
+                _ => {}
+            }
             let _ = deck_tx.send(inbound);
+        }
+    }
+    for (agent, status) in last_status {
+        if agent != lead
+            && !matches!(
+                status,
+                AgentStatus::Done | AgentStatus::Failed | AgentStatus::Killed
+            )
+        {
+            let _ = deck_tx.send(Inbound::Status {
+                agent,
+                status: AgentStatus::Killed,
+            });
         }
     }
 }
@@ -498,6 +575,53 @@ mod tests {
                 text: "p".into(),
             })
             .is_none()
+        );
+    }
+
+    #[test]
+    fn replay_lane_envelopes_never_journal() {
+        // A `SessionOpen` replay streams another session's HISTORY through
+        // the same inbound channel — journaling it would copy that past into
+        // this session's journal, doubling it on every open.
+        let lane = format!("{REPLAY_LANE_PREFIX}ses-42");
+        assert!(
+            journal_record(&Inbound::Register(
+                AgentMeta::new(lane.clone(), "replay — old session", 0).with_role("replay"),
+            ))
+            .is_none()
+        );
+        assert!(
+            journal_record(&Inbound::Event {
+                agent: lane.clone(),
+                event: AgentEvent::Text {
+                    delta: "historic".into(),
+                },
+            })
+            .is_none()
+        );
+        assert!(
+            journal_record(&Inbound::Status {
+                agent: lane,
+                status: AgentStatus::Done,
+            })
+            .is_none()
+        );
+        // Sub-session lanes are the session's REAL history — they journal.
+        assert!(
+            journal_record(&Inbound::Event {
+                agent: "req:1".into(),
+                event: AgentEvent::Text {
+                    delta: "live".into()
+                },
+            })
+            .is_some()
+        );
+        assert!(
+            journal_record(&Inbound::PromptStarted {
+                agent: "sub:7".into(),
+                text: "task".into(),
+            })
+            .is_some()
         );
     }
 

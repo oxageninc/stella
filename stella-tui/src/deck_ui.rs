@@ -631,8 +631,8 @@ pub struct DeckUi {
     /// the progress shimmer, pulse, and caret blink to a static frame.
     pub no_anim: bool,
     /// Whether the SESSIONS overlay is open (empty-prompt `←` on the Session
-    /// tab, or `/sessions`). Modal while open: ↑/↓ move, `a` archive, `x`
-    /// delete, `r` refresh, Esc/`←` close.
+    /// tab, or `/sessions`). Modal while open: ↑/↓ move, `⏎` open (replay),
+    /// `a` archive, `x` delete, `r` refresh, Esc/`←` close.
     pub sessions_open: bool,
     /// The machine-wide session registry snapshot ([`Inbound::Sessions`]),
     /// pre-sorted by the driver; the overlay groups it by phase.
@@ -646,7 +646,8 @@ pub struct DeckUi {
     /// Vertical scroll offset (rows) for the CONTEXT overlay; render clamps.
     pub context_scroll: usize,
     /// Whether the INBOX overlay is open (`/inbox`): the persist-until-read
-    /// notifications. ↑/↓ move, Enter/Space mark read, `R` mark all read.
+    /// notifications. ↑/↓ move, Enter marks read (and opens the linked
+    /// session when there is one), Space marks read, `R` mark all read.
     pub inbox_open: bool,
     /// The notification snapshot ([`Inbound::Notifications`]), newest first.
     /// The footer badge shows its unread count even while the overlay is shut.
@@ -1724,10 +1725,10 @@ pub fn grouped_session_rows(ui: &DeckUi) -> Vec<&crate::envelope::SessionInfo> {
 }
 
 /// The SESSIONS overlay key map: ↑/↓ select, `⏎` resume the selected session
-/// (resumable rows only — the durable-state sessions of THIS workspace with
-/// no live owner), `a` archive, `x` delete (another session's record only —
-/// never this session's own), `r` refresh, Esc/`←`/`q` close. Modal:
-/// everything else is swallowed.
+/// when its row is resumable (the durable-state sessions of THIS workspace
+/// with no live owner) or open it read-only (replay) otherwise, `a` archive,
+/// `x` delete (another session's record only — never this session's own),
+/// `r` refresh, Esc/`←`/`q` close. Modal: everything else is swallowed.
 fn handle_sessions_key(key: KeyEvent, ui: &mut DeckUi) -> DeckAction {
     let count = grouped_session_rows(ui).len();
     ui.sessions_sel = ui.sessions_sel.min(count.saturating_sub(1));
@@ -1735,22 +1736,6 @@ fn handle_sessions_key(key: KeyEvent, ui: &mut DeckUi) -> DeckAction {
         KeyCode::Esc | KeyCode::Left | KeyCode::Char('q') => {
             ui.sessions_open = false;
             DeckAction::Handled
-        }
-        KeyCode::Enter => {
-            match grouped_session_rows(ui).get(ui.sessions_sel).copied() {
-                // Navigate INTO the chosen session: close the overlay and
-                // hand over to the driver, which replays it into this deck.
-                // The current session's own row (`mine`) and rows that
-                // cannot be reopened here swallow the key — a ⏎ that
-                // visibly does nothing is announced by the row's own
-                // dimmed state, not by a surprise action.
-                Some(row) if row.resumable && !row.mine => {
-                    let id = row.id.clone();
-                    ui.sessions_open = false;
-                    DeckAction::Send(WorkspaceInput::SessionResume { id })
-                }
-                _ => DeckAction::Handled,
-            }
         }
         KeyCode::Up => {
             ui.sessions_sel = ui.sessions_sel.saturating_sub(1);
@@ -1761,6 +1746,29 @@ fn handle_sessions_key(key: KeyEvent, ui: &mut DeckUi) -> DeckAction {
                 ui.sessions_sel = (ui.sessions_sel + 1).min(count - 1);
             }
             DeckAction::Handled
+        }
+        KeyCode::Enter => {
+            match grouped_session_rows(ui).get(ui.sessions_sel).copied() {
+                // Navigate INTO the chosen session live: close the overlay
+                // and hand over to the driver, which adopts the durable
+                // state and continues the session in this deck (see
+                // [`WorkspaceInput::SessionResume`]).
+                Some(row) if row.resumable && !row.mine => {
+                    let id = row.id.clone();
+                    ui.sessions_open = false;
+                    DeckAction::Send(WorkspaceInput::SessionResume { id })
+                }
+                // Every other row opens read-only: the driver registers a
+                // `replay:<id>` lane and streams the persisted events (see
+                // [`WorkspaceInput::SessionOpen`] — replay IS the fold). The
+                // overlay closes so the replayed lane is immediately visible.
+                Some(row) => {
+                    let id = row.id.clone();
+                    ui.sessions_open = false;
+                    DeckAction::Send(WorkspaceInput::SessionOpen { id })
+                }
+                None => DeckAction::Handled,
+            }
         }
         KeyCode::Char('r') => DeckAction::Send(WorkspaceInput::SessionsRefresh),
         KeyCode::Char('a') => match grouped_session_rows(ui).get(ui.sessions_sel).copied() {
@@ -1782,8 +1790,10 @@ fn handle_sessions_key(key: KeyEvent, ui: &mut DeckUi) -> DeckAction {
     }
 }
 
-/// The INBOX overlay key map: ↑/↓ select, Enter/Space mark the selected
-/// notification read, `R` mark all read, Esc/`q` close. Modal.
+/// The INBOX overlay key map: ↑/↓ select, `⏎` on a session-linked
+/// notification marks it read AND opens that session (closing the overlay);
+/// on an unlinked one `⏎` keeps its plain mark-read meaning. Space marks
+/// read, `R` mark all, Esc/`q` close. Modal.
 fn handle_inbox_key(key: KeyEvent, ui: &mut DeckUi) -> DeckAction {
     let count = ui.notifications.len();
     ui.inbox_sel = ui.inbox_sel.min(count.saturating_sub(1));
@@ -1802,7 +1812,33 @@ fn handle_inbox_key(key: KeyEvent, ui: &mut DeckUi) -> DeckAction {
             }
             DeckAction::Handled
         }
-        KeyCode::Enter | KeyCode::Char(' ') => match ui.notifications.get(ui.inbox_sel) {
+        KeyCode::Enter => match ui.notifications.get(ui.inbox_sel).cloned() {
+            Some(n) => match n.session_id {
+                // A session-linked notification: ⏎ marks it read (the
+                // unchanged contract) AND opens the session it is about,
+                // then closes the overlay. The read is the returned action;
+                // the open rides `pending_inputs` — a key returns one
+                // action, and the shell drains the queue right after (the
+                // same mechanism the CONTEXT opener uses), so the read
+                // reaches the driver first and the open follows.
+                Some(session) => {
+                    ui.inbox_open = false;
+                    if n.read {
+                        DeckAction::Send(WorkspaceInput::SessionOpen { id: session })
+                    } else {
+                        ui.pending_inputs
+                            .push(WorkspaceInput::SessionOpen { id: session });
+                        DeckAction::Send(WorkspaceInput::NotificationRead { id: n.id })
+                    }
+                }
+                // No session link: exactly the pre-existing mark-read
+                // behavior (a no-op once read), overlay stays open.
+                None if !n.read => DeckAction::Send(WorkspaceInput::NotificationRead { id: n.id }),
+                None => DeckAction::Handled,
+            },
+            None => DeckAction::Handled,
+        },
+        KeyCode::Char(' ') => match ui.notifications.get(ui.inbox_sel) {
             Some(n) if !n.read => {
                 DeckAction::Send(WorkspaceInput::NotificationRead { id: n.id.clone() })
             }
@@ -3955,6 +3991,142 @@ mod tests {
         ui
     }
 
+    fn session_info(id: &str) -> crate::envelope::SessionInfo {
+        crate::envelope::SessionInfo {
+            id: id.into(),
+            title: format!("title for {id}"),
+            summary: String::new(),
+            workspace: "/tmp/w".into(),
+            phase: crate::envelope::SessionPhase::Complete,
+            started_ms: 0,
+            updated_ms: 0,
+            mine: false,
+            resumable: false,
+        }
+    }
+
+    fn notification(
+        id: &str,
+        read: bool,
+        session: Option<&str>,
+    ) -> crate::envelope::NotificationInfo {
+        crate::envelope::NotificationInfo {
+            id: id.into(),
+            title: "a title".into(),
+            body: "a body".into(),
+            source: String::new(),
+            created_ms: 0,
+            read,
+            session_id: session.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn sessions_overlay_enter_opens_the_selected_session_and_closes() {
+        let model = model_with(&["lead"]);
+        let mut ui = ready_ui();
+        ui.sessions_open = true;
+        ui.sessions = vec![session_info("ses-1"), session_info("ses-2")];
+        ui.sessions_sel = 1;
+
+        let action = handle_deck_key(key(KeyCode::Enter), &model, &mut ui);
+        assert_eq!(
+            action,
+            DeckAction::Send(WorkspaceInput::SessionOpen { id: "ses-2".into() }),
+            "⏎ opens (replays) the selected session"
+        );
+        assert!(!ui.sessions_open, "the overlay closes on open");
+    }
+
+    #[test]
+    fn sessions_overlay_enter_with_no_rows_is_a_no_op() {
+        let model = model_with(&["lead"]);
+        let mut ui = ready_ui();
+        ui.sessions_open = true; // registry snapshot empty
+
+        let action = handle_deck_key(key(KeyCode::Enter), &model, &mut ui);
+        assert_eq!(action, DeckAction::Handled, "nothing to open");
+        assert!(ui.sessions_open, "the overlay stays up (Esc closes it)");
+    }
+
+    #[test]
+    fn inbox_enter_on_a_linked_notification_marks_read_and_opens_the_session() {
+        let model = model_with(&["lead"]);
+        let mut ui = ready_ui();
+        ui.inbox_open = true;
+        ui.notifications = vec![notification("n1", false, Some("ses-9"))];
+
+        let action = handle_deck_key(key(KeyCode::Enter), &model, &mut ui);
+        assert_eq!(
+            action,
+            DeckAction::Send(WorkspaceInput::NotificationRead { id: "n1".into() }),
+            "the read goes out as the key's action"
+        );
+        assert_eq!(
+            ui.pending_inputs,
+            vec![WorkspaceInput::SessionOpen { id: "ses-9".into() }],
+            "…and the open rides pending_inputs right behind it"
+        );
+        assert!(!ui.inbox_open, "the overlay closes when a session opens");
+    }
+
+    #[test]
+    fn inbox_enter_on_an_already_read_linked_notification_just_opens() {
+        let model = model_with(&["lead"]);
+        let mut ui = ready_ui();
+        ui.inbox_open = true;
+        ui.notifications = vec![notification("n1", true, Some("ses-9"))];
+
+        let action = handle_deck_key(key(KeyCode::Enter), &model, &mut ui);
+        assert_eq!(
+            action,
+            DeckAction::Send(WorkspaceInput::SessionOpen { id: "ses-9".into() }),
+            "already read — no second NotificationRead, just the open"
+        );
+        assert!(ui.pending_inputs.is_empty());
+        assert!(!ui.inbox_open);
+    }
+
+    #[test]
+    fn inbox_enter_without_a_session_link_keeps_the_mark_read_behavior() {
+        let model = model_with(&["lead"]);
+        let mut ui = ready_ui();
+        ui.inbox_open = true;
+        ui.notifications = vec![notification("n1", false, None)];
+
+        let action = handle_deck_key(key(KeyCode::Enter), &model, &mut ui);
+        assert_eq!(
+            action,
+            DeckAction::Send(WorkspaceInput::NotificationRead { id: "n1".into() }),
+            "unlinked ⏎ is exactly the old mark-read"
+        );
+        assert!(ui.pending_inputs.is_empty(), "no session to open");
+        assert!(ui.inbox_open, "the overlay stays open, as before");
+
+        // Once read, ⏎ on an unlinked notification is a no-op.
+        ui.notifications = vec![notification("n1", true, None)];
+        let action = handle_deck_key(key(KeyCode::Enter), &model, &mut ui);
+        assert_eq!(action, DeckAction::Handled);
+        assert!(ui.inbox_open);
+    }
+
+    #[test]
+    fn inbox_space_only_marks_read_and_never_opens() {
+        let model = model_with(&["lead"]);
+        let mut ui = ready_ui();
+        ui.inbox_open = true;
+        ui.notifications = vec![notification("n1", false, Some("ses-9"))];
+
+        let action = handle_deck_key(key(KeyCode::Char(' ')), &model, &mut ui);
+        assert_eq!(
+            action,
+            DeckAction::Send(WorkspaceInput::NotificationRead { id: "n1".into() }),
+            "␣ keeps its plain mark-read meaning"
+        );
+        assert!(ui.pending_inputs.is_empty(), "␣ never opens the session");
+        assert!(ui.inbox_open, "␣ never closes the overlay");
+    }
+
     #[test]
     fn eviction_clamps_the_selection_and_drops_stale_expansions() {
         use crate::model::MAX_TRANSCRIPT_ENTRIES;
@@ -4053,7 +4225,7 @@ mod tests {
     }
 
     #[test]
-    fn sessions_overlay_enter_resumes_only_a_resumable_foreign_row() {
+    fn sessions_overlay_enter_resumes_resumable_rows_and_opens_the_rest() {
         use crate::envelope::SessionPhase;
         let model = model_with(&["lead"]);
         let mut ui = ready_ui();
@@ -4065,16 +4237,8 @@ mod tests {
         ];
 
         // Grouped order: InProgress (mine) · Paused (resumable) · Complete.
-        // ⏎ on this deck's own row is swallowed; the overlay stays open.
-        ui.sessions_sel = 0;
-        assert_eq!(
-            handle_deck_key(key(KeyCode::Enter), &model, &mut ui),
-            DeckAction::Handled
-        );
-        assert!(ui.sessions_open);
-
-        // ⏎ on the resumable row navigates into it: the overlay closes and
-        // the driver is told to resume exactly that session.
+        // ⏎ on the resumable row navigates into it LIVE: the overlay closes
+        // and the driver is told to resume exactly that session.
         ui.sessions_sel = 1;
         assert_eq!(
             handle_deck_key(key(KeyCode::Enter), &model, &mut ui),
@@ -4084,14 +4248,17 @@ mod tests {
         );
         assert!(!ui.sessions_open, "the overlay closes on navigation");
 
-        // ⏎ on a foreign row with nothing to restore is swallowed too.
-        ui.sessions_open = true;
-        ui.sessions_sel = 2;
-        assert_eq!(
-            handle_deck_key(key(KeyCode::Enter), &model, &mut ui),
-            DeckAction::Handled
-        );
-        assert!(ui.sessions_open);
+        // ⏎ on any non-resumable row — this deck's own included — opens a
+        // read-only replay instead (the `replay:<id>` lane).
+        for (sel, id) in [(0, "ses-mine"), (2, "ses-foreign")] {
+            ui.sessions_open = true;
+            ui.sessions_sel = sel;
+            assert_eq!(
+                handle_deck_key(key(KeyCode::Enter), &model, &mut ui),
+                DeckAction::Send(WorkspaceInput::SessionOpen { id: id.into() })
+            );
+            assert!(!ui.sessions_open, "the overlay closes on open too");
+        }
     }
 
     #[test]

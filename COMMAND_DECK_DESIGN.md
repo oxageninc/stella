@@ -192,18 +192,26 @@ resuming is replaying it.
   `Text`/`Reasoning` deltas coalesce per run; conversation transitions
   (`PromptStarted`, `Complete`, `Error`, status, reset, pipeline) fsync.
   Out-of-band view snapshots never journal; ephemeral chrome (boot narration,
-  hints) is sent DIRECTLY to the deck so it never replays.
+  hints) is sent DIRECTLY to the deck so it never replays. `replay:<id>`
+  lanes (`SessionOpen`'s read-only streams) are filtered at the tee — another
+  session's past must never journal as this session's history. Sub-session
+  lanes (`req:<n>`/`sub:<task-id>`) DO journal: they are the session's real
+  history and replay with it.
 - **Sidecar snapshots**: `history.json` (the LLM `Vec<CompletionMessage>`,
   atomic temp+fsync+rename at every turn boundary and `/clear`) and
   `queue.json` (the prompt backlog, write-through on every mutation).
-- **Recovery rule**: a journal whose last `PromptStarted` has no settle record
-  after it (`Complete` / non-retryable `Error` / `waiting_input` status) was
-  interrupted mid-turn — resume puts that prompt back at the FRONT of the
-  queue and **parks dispatch** (the existing `HoldState`), so reopening a
-  session shows where it stood and spends nothing until the user says go.
+- **Recovery rule**: every `PromptStarted` with no settle record after it on
+  its own lane (`Complete` / non-retryable `Error` / `waiting_input` or a
+  terminal lane status) was interrupted mid-turn — the lead's and any
+  `req:<n>` worker's alike. Resume puts those prompts back at the FRONT of
+  the queue in dispatch order and **parks dispatch** (the existing
+  `HoldState`), so reopening a session shows where it stood and spends
+  nothing until the user says go.
 - **Navigation**: `stella resume [id|--list]` from the CLI;  `⏎` on a
   resumable row in the SESSIONS overlay (`WorkspaceInput::SessionResume`,
-  serviced between turns only) switches THIS deck to that session — the
+  serviced between turns and only while no workers are live) switches THIS
+  deck to that session (`⏎` on any other row opens a read-only
+  `SessionOpen` replay instead) — the
   current one parks as `Paused` (an untouched shell is removed instead), the
   target's journal replays behind a `SessionReset`, and its registry record
   is re-owned (same id, new pid). Quitting with a pending backlog is a
@@ -225,11 +233,18 @@ resuming is replaying it.
   scope review **auto-approves** in the deck (the `ScopeReview` event is
   narrated in the transcript, not gated) — a deck-native scope-review card is
   the follow-up, same seam as the driver's `ScopeDecision` no-op.
-- Seam-fed (no backend supervisor yet — build UI against the seam, drive with
-  the scenario feed): multi-agent `Register`/`Status` envelopes and
-  `AgentControl` (Pause/Stop/Restart). `Stop` maps to `UserInput::Cancel`
-  today; deep per-agent pause/kill needs a new `stella-fleet` abort API (noted
-  as the follow-up integration).
+- Live now: **sub-session workers** (`stella-cli/src/subsession.rs`) — the
+  first real producer of multi-agent `Register`/`Status` envelopes. Prompts
+  submitted mid-turn dispatch to dedicated `req:<n>` worker sessions instead
+  of waiting; `task_assign` spawns `sub:<task-id>` workers; `SessionOpen`
+  streams a dead session's persisted journal into a `replay:<id>` lane. The
+  task board (`task_*` tools) folds as `AgentEvent::TaskUpdate` snapshots
+  into a session-view checklist card, and a `gh`-backed monitor feeds the
+  footer's PR cell (`⇢ #183 open ✓`).
+- Still seam-fed: `AgentControl` beyond `Stop` (Pause/Resume/Restart) and
+  per-worker abort. `Stop` maps to `UserInput::Cancel` on the lead only; deep
+  per-agent pause/kill needs a new `stella-fleet` abort API (noted as the
+  follow-up integration), as does fleet-worktree isolation for workers.
 
 ## ISSUES tab
 

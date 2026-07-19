@@ -28,9 +28,10 @@
 //! a torn one. Streamed `Text`/`Reasoning` deltas are coalesced per run and
 //! written through the OS page cache; conversation *transitions* (a prompt
 //! dispatched, a turn completed or failed, a reset) are fsynced. The worst a
-//! power cut can lose is the streamed tail of the turn that was in flight —
-//! and that turn's prompt is re-queued on resume (its `PromptStarted` has no
-//! settle record after it), so the work itself is never lost.
+//! power cut can lose is the streamed tail of the turns that were in flight
+//! — and those turns' prompts are re-queued on resume (each lane's
+//! `PromptStarted` with no settle record after it), so the work itself is
+//! never lost.
 
 use std::fs::{File, OpenOptions};
 use std::io::Write as _;
@@ -79,10 +80,12 @@ pub enum JournalRecord {
     /// `waiting_input` doubles as the settle marker for prompts that were
     /// handled without a model turn (`/help`, `/init`, …).
     Status { agent: String, status: String },
-    /// The dispatcher handed a prompt to an agent. A `PromptStarted` with no
-    /// settle record after it (`Complete`, a non-retryable `Error`, or a
-    /// `waiting_input` status) marks the turn an interruption cut short —
-    /// resume returns its text to the front of the queue.
+    /// The dispatcher handed a prompt to an agent — the lead, or a
+    /// sub-session lane it drained the prompt to. A `PromptStarted` with no
+    /// settle record after it on the same agent (`Complete`, a non-retryable
+    /// `Error`, or a `waiting_input`/terminal status) marks the turn an
+    /// interruption cut short — resume returns its text to the front of the
+    /// queue.
     PromptStarted { agent: String, text: String },
     /// `/clear` — the agent's transcript and counters reset to seq 0.
     SessionReset { agent: String },
@@ -338,32 +341,43 @@ fn write_snapshot<T: Serialize + ?Sized>(dir: &Path, name: &str, value: &T) -> R
         .map_err(|e| StoreError(format!("cannot replace {}: {e}", path.display())))
 }
 
-/// Scan a journal for the prompt an interruption cut short: the LAST
-/// `PromptStarted` with no settle record after it. Settle records are a
-/// `Complete`, a **non-retryable** `Error` (a retryable one is a mid-turn
-/// warning, not an outcome), or a `waiting_input` status (how prompts that
-/// never ran a model turn — `/help`, `/init` — settle). Turns are serial per
-/// agent, so at most one prompt can be unsettled.
-pub fn unsettled_prompt(records: &[JournalRecord]) -> Option<(String, String)> {
-    let started = records
+/// Scan a journal for the prompts an interruption cut short: every
+/// `PromptStarted` with no settle record after it **on the same agent**, in
+/// dispatch order. Turns are serial per agent, but prompts dispatch to
+/// parallel lanes (the lead, plus `req:<n>` sub-session workers), so several
+/// can be unsettled at once. Settle records are a `Complete`, a
+/// **non-retryable** `Error` (a retryable one is a mid-turn warning, not an
+/// outcome), a `waiting_input` status (how prompts that never ran a model
+/// turn — `/help`, `/init` — settle), or a terminal lane status
+/// (`done`/`failed`/`killed` — how sub-session lanes end).
+pub fn unsettled_prompts(records: &[JournalRecord]) -> Vec<(String, String)> {
+    records
         .iter()
-        .rposition(|r| matches!(r, JournalRecord::PromptStarted { .. }))?;
-    let Some(JournalRecord::PromptStarted { agent, text }) = records.get(started) else {
-        return None;
-    };
-    let settled = records[started + 1..].iter().any(|r| match r {
-        JournalRecord::Event { agent: a, event } if a == agent => matches!(
-            event,
-            AgentEvent::Complete { .. }
-                | AgentEvent::Error {
-                    retryable: false,
-                    ..
+        .enumerate()
+        .filter_map(|(i, r)| {
+            let JournalRecord::PromptStarted { agent, text } = r else {
+                return None;
+            };
+            let settled = records[i + 1..].iter().any(|r| match r {
+                JournalRecord::Event { agent: a, event } if a == agent => matches!(
+                    event,
+                    AgentEvent::Complete { .. }
+                        | AgentEvent::Error {
+                            retryable: false,
+                            ..
+                        }
+                ),
+                JournalRecord::Status { agent: a, status } if a == agent => {
+                    matches!(
+                        status.as_str(),
+                        "waiting_input" | "done" | "failed" | "killed"
+                    )
                 }
-        ),
-        JournalRecord::Status { agent: a, status } if a == agent => status == "waiting_input",
-        _ => false,
-    });
-    (!settled).then(|| (agent.clone(), text.clone()))
+                _ => false,
+            });
+            (!settled).then(|| (agent.clone(), text.clone()))
+        })
+        .collect()
 }
 
 /// The last journaled staged-pipeline toggle, if any — resume restores it.
@@ -531,11 +545,11 @@ mod tests {
     }
 
     #[test]
-    fn unsettled_prompt_is_the_interrupted_one_only() {
+    fn unsettled_prompts_are_the_interrupted_ones_only() {
         let a = "lead".to_string();
         // Settled by Complete.
         let settled = vec![started(&a, "one"), complete(&a)];
-        assert_eq!(unsettled_prompt(&settled), None);
+        assert_eq!(unsettled_prompts(&settled), vec![]);
         // Settled by a handled command's waiting_input status.
         let handled = vec![
             started(&a, "/help"),
@@ -544,7 +558,7 @@ mod tests {
                 status: "waiting_input".into(),
             },
         ];
-        assert_eq!(unsettled_prompt(&handled), None);
+        assert_eq!(unsettled_prompts(&handled), vec![]);
         // A retryable error is a warning, not a settle.
         let interrupted = vec![
             started(&a, "one"),
@@ -559,8 +573,8 @@ mod tests {
             },
         ];
         assert_eq!(
-            unsettled_prompt(&interrupted),
-            Some((a.clone(), "two".into()))
+            unsettled_prompts(&interrupted),
+            vec![(a.clone(), "two".to_string())]
         );
         // A non-retryable error (cancel/abort) settles.
         let aborted = vec![
@@ -573,8 +587,44 @@ mod tests {
                 },
             },
         ];
-        assert_eq!(unsettled_prompt(&aborted), None);
-        assert_eq!(unsettled_prompt(&[]), None);
+        assert_eq!(unsettled_prompts(&aborted), vec![]);
+        assert_eq!(unsettled_prompts(&[]), vec![]);
+    }
+
+    #[test]
+    fn unsettled_prompts_track_each_lane_independently() {
+        let lead = "lead".to_string();
+        let req = "req:1".to_string();
+        // A worker's settle must not settle the lead's prompt (and vice
+        // versa): the interruption cut BOTH lanes' turns short here, and
+        // both come back, in dispatch order.
+        let both_cut = vec![
+            started(&lead, "refactor the fold"),
+            started(&req, "and check the docs"),
+            text(&lead, "working…"),
+            text(&req, "reading…"),
+        ];
+        assert_eq!(
+            unsettled_prompts(&both_cut),
+            vec![
+                (lead.clone(), "refactor the fold".to_string()),
+                (req.clone(), "and check the docs".to_string()),
+            ]
+        );
+        // A terminal lane status settles that lane only — `killed` (a
+        // user-stopped worker) must not resurrect its prompt on resume.
+        let worker_done = vec![
+            started(&lead, "refactor the fold"),
+            started(&req, "and check the docs"),
+            JournalRecord::Status {
+                agent: req.clone(),
+                status: "killed".into(),
+            },
+        ];
+        assert_eq!(
+            unsettled_prompts(&worker_done),
+            vec![(lead.clone(), "refactor the fold".to_string())]
+        );
     }
 
     #[test]
