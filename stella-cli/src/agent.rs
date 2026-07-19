@@ -57,7 +57,8 @@ You have these tools available:
 - edit_file: Replace an exact substring in a file (use replace_all for multiple)
 - delete_file: Delete a file within the workspace
 - run_lint / format_code: Run the project's own linter/formatter (cargo clippy/fmt, or the package.json lint/format scripts)
-- run_script: Run a verb the project itself declares — a Makefile target, package.json script, or cargo alias; args are passed argv-style and an unknown name lists the declared vocabulary
+- run_script: Run a script the project itself declares, by canonical verb (install/build/start/test/lint/format), qualified id (pnpm:build, make:lint), or declared name; args are passed argv-style and an unknown name lists the declared vocabulary
+- list_scripts: The full project scripts index — every detected script and its canonical verb binding; read-only, nothing executes
 - start_process / read_output / send_stdin / stop_process: Manage long-running processes (dev servers, REPLs, watchers) from an argv vector; one-shot commands belong in build_project/run_tests/run_script
 - repo_status / repo_commit / repo_push / repo_pull / repo_rollback: Version-control status, pathspec-explicit commits, guarded pushes (never the default branch, never forced), fast-forward-only pulls, and restoring named files to their last committed state
 - graph_query: Query the workspace's indexed code graph — where a symbol is defined or referenced, what a file imports, which files import it, or a file's neighborhood. The index is built automatically at session start and refreshes live as files change.
@@ -92,7 +93,8 @@ You have these tools available:
 - edit_file: Replace an exact substring in a file (use replace_all for multiple)
 - delete_file: Delete a file within the workspace
 - run_lint / format_code: Run the project's own linter/formatter (cargo clippy/fmt, or the package.json lint/format scripts)
-- run_script: Run a verb the project itself declares — a Makefile target, package.json script, or cargo alias; args are passed argv-style and an unknown name lists the declared vocabulary
+- run_script: Run a script the project itself declares, by canonical verb (install/build/start/test/lint/format), qualified id (pnpm:build, make:lint), or declared name; args are passed argv-style and an unknown name lists the declared vocabulary
+- list_scripts: The full project scripts index — every detected script and its canonical verb binding; read-only, nothing executes
 - start_process / read_output / send_stdin / stop_process: Manage long-running processes (dev servers, REPLs, watchers) from an argv vector; one-shot commands belong in build_project/run_tests/run_script
 - repo_status / repo_commit / repo_push / repo_pull / repo_rollback: Version-control status, pathspec-explicit commits, guarded pushes (never the default branch, never forced), fast-forward-only pulls, and restoring named files to their last committed state
 - graph_query: Query the workspace's indexed code graph — where a symbol is defined or referenced, what a file imports, which files import it, or a file's neighborhood. The index is built automatically at session start and refreshes live as files change. For symbol and dependency questions it is precise and cheaper than grep.
@@ -146,6 +148,7 @@ const STELLA_AB_RECALL_RATE: u32 = 10;
 /// `crate::rules::enforce_workspace_rules` arms at the tool boundary.
 fn assemble_system_prompt(base: &str, workspace_root: &std::path::Path) -> String {
     let mut prompt = base.to_string();
+    append_project_scripts(&mut prompt, workspace_root);
     append_workspace_memories(&mut prompt, workspace_root);
     let rules_section = stella_core::rules::render_rules_section(
         &crate::rules::load_workspace_rules(workspace_root),
@@ -155,6 +158,22 @@ fn assemble_system_prompt(base: &str, workspace_root: &std::path::Path) -> Strin
         prompt.push_str(&rules_section);
     }
     prompt
+}
+
+/// The project-scripts section of [`assemble_system_prompt`]: the scripts
+/// index's canonical verb → command bindings, rendered once at session
+/// start right after the base instructions (project ground truth before
+/// recalled lessons). Detection is static manifest parsing
+/// (`stella_tools::script`, docs/design/scripts-index.md) and the section
+/// is byte-stable for the same workspace state, so "install this project"
+/// costs one `run_script` call and zero discovery turns. Empty workspaces
+/// render nothing.
+fn append_project_scripts(prompt: &mut String, workspace_root: &std::path::Path) {
+    let index = stella_tools::script::ScriptIndex::detect_blocking(workspace_root);
+    if let Some(section) = index.render_prompt_section() {
+        prompt.push_str("\n\n");
+        prompt.push_str(&section);
+    }
 }
 
 /// The memories half of [`assemble_system_prompt`]: append the workspace's
@@ -3747,6 +3766,35 @@ mod tests {
         assert_eq!(
             row.cache_write_tokens, 640,
             "the event's cache-write count must reach the store, never a hard-coded 0"
+        );
+    }
+
+    /// The scripts section rides the byte-stable prompt prefix: two
+    /// assemblies over the same workspace must be byte-identical, the verb
+    /// bindings must be present, and a scriptless workspace must add
+    /// nothing (docs/design/scripts-index.md).
+    #[test]
+    fn assemble_system_prompt_carries_a_byte_stable_scripts_section() {
+        let root = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            root.path().join("package.json"),
+            r#"{"scripts": {"build": "next build", "test": "vitest"}}"#,
+        )
+        .unwrap();
+        std::fs::write(root.path().join("pnpm-lock.yaml"), "").unwrap();
+
+        let first = assemble_system_prompt(SYSTEM_PROMPT, root.path());
+        let second = assemble_system_prompt(SYSTEM_PROMPT, root.path());
+        assert_eq!(first, second, "same workspace state ⇒ identical bytes");
+        assert!(first.contains("## Project scripts"), "section present");
+        assert!(first.contains("build → pnpm run build"), "{first}");
+        assert!(first.contains("install → pnpm install"), "{first}");
+
+        let empty = tempfile::tempdir().expect("tempdir");
+        let bare = assemble_system_prompt(SYSTEM_PROMPT, empty.path());
+        assert!(
+            !bare.contains("## Project scripts"),
+            "no scripts → no section, no noise"
         );
     }
 

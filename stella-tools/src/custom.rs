@@ -103,6 +103,7 @@ pub const RESERVED_NAMES: &[&str] = &[
     "run_lint",
     "format_code",
     "run_script",
+    "list_scripts",
     // The long-running process group
     "start_process",
     "read_output",

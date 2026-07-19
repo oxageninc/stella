@@ -1,13 +1,25 @@
-//! `run_script` — run a verb the project itself declares, and nothing else.
+//! The project scripts index — `run_script` / `list_scripts`: run a verb
+//! the project itself declares, and nothing else.
 //!
-//! The tool's vocabulary is enumerated from the workspace's own manifests:
-//! `Makefile` targets, `package.json` `"scripts"`, and cargo aliases from
-//! `.cargo/config.toml`. A name outside that vocabulary is a named error
-//! that LISTS the discovered verbs — the error itself is the discovery
-//! surface, so the model learns the project's real commands instead of
-//! guessing shell lines. Arguments are passed argv-style to the runner
-//! (`make <target> <args…>`, `<pm> run <script> -- <args…>`,
-//! `cargo <alias> <args…>`) — no `sh -c`, no shell interpretation anywhere.
+//! Spec: `docs/design/scripts-index.md`. The index is a static,
+//! deterministic detection of package-manager scripts across ecosystems
+//! (cargo, npm/pnpm/yarn/bun, deno, uv/poetry, go, make, just, task,
+//! composer), mapped onto six canonical verbs — `install`, `build`,
+//! `start`, `test`, `lint`, `format`. Three surfaces share this module:
+//! the byte-stable `## Project scripts` prompt section, the
+//! `list_scripts`/`run_script` tools, and the `stella scripts` subcommand.
+//!
+//! Detection never invokes a package-manager binary and persists nothing —
+//! it is a handful of manifest reads, cheap enough to recompute on every
+//! call, so there is no cache file, no database, and no watcher to go
+//! stale. Same workspace state ⇒ byte-identical output (entries sort by
+//! `(dir, id)`, verbs render in fixed order). Execution is argv-exec via
+//! [`exec::run_argv`] — no `sh -c`, no shell interpretation anywhere — and
+//! an unknown name is a named error that LISTS the discovered vocabulary,
+//! so the error itself is a discovery surface.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -16,173 +28,1209 @@ use stella_protocol::tool::{ToolOutput, ToolSchema};
 use crate::exec;
 use crate::registry::Tool;
 
+/// The canonical verbs, in the fixed render/resolution order.
+pub const VERBS: [&str; 6] = ["install", "build", "start", "test", "lint", "format"];
+
 const DEFAULT_TIMEOUT_SECS: u64 = 600;
+/// Workspace-member enumeration cap — overflow is counted, not enumerated.
+const MAX_WORKSPACE_MEMBERS: usize = 50;
+/// Hard cap on the prompt section (it rides the byte-stable cached prefix).
+const PROMPT_SECTION_CHAR_CAP: usize = 1_500;
+/// Per-command cap inside the prompt section.
+const PROMPT_COMMAND_CHAR_CAP: usize = 120;
+/// Unknown-name errors list at most this many ids before deferring to
+/// `list_scripts`.
+const ERROR_VOCABULARY_CAP: usize = 40;
 
-/// Where a discovered verb came from — decides the runner argv.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ScriptSource {
-    Make,
-    Package,
-    CargoAlias,
+/// One indexed script: a qualified id (`<runner>:<name>`), the exact argv
+/// `run_script` execs (cwd = `dir`), and where it came from.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ScriptEntry {
+    /// Qualified id, unique per package dir: `pnpm:build`, `make:lint`.
+    pub id: String,
+    /// The tool that runs it: `cargo`, `pnpm`, `uv`, `make`, …
+    pub runner: &'static str,
+    /// The script/target/recipe name inside its ecosystem.
+    pub name: String,
+    /// The exec'd argv — never shell-interpreted.
+    #[serde(skip)]
+    pub argv: Vec<String>,
+    /// Human-readable command line (`argv` joined), for frames and hooks.
+    pub command: String,
+    /// Workspace-relative package dir; `"."` = root.
+    pub dir: String,
+    /// Workspace-relative manifest path, or `"synthesized"` for ecosystem
+    /// defaults (e.g. `cargo build --workspace`).
+    pub source: String,
+    /// Present only on the entry each canonical verb binds to.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verb: Option<&'static str>,
+    /// The manifest's own definition (e.g. the package.json script body).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw: Option<String>,
 }
 
-/// The project's declared verbs, grouped by manifest. Resolution order on a
-/// name collision is Makefile → package.json → cargo alias (first match
-/// wins), matching the enumeration order below.
-#[derive(Debug, Default)]
-struct Vocabulary {
-    make_targets: Vec<String>,
-    package_scripts: Vec<String>,
-    /// The package manager for `package_scripts` (lockfile-detected, same
-    /// rule as [`crate::project`]).
-    pm: &'static str,
-    cargo_aliases: Vec<String>,
+impl ScriptEntry {
+    fn synthesized(&self) -> bool {
+        self.source == "synthesized"
+    }
 }
 
-impl Vocabulary {
-    fn is_empty(&self) -> bool {
-        self.make_targets.is_empty()
-            && self.package_scripts.is_empty()
-            && self.cargo_aliases.is_empty()
+/// The detected index: all entries sorted by `(dir, id)` plus the canonical
+/// verb → qualified-id bindings (root package only).
+#[derive(Debug, Clone, Default)]
+pub struct ScriptIndex {
+    pub scripts: Vec<ScriptEntry>,
+    pub verbs: BTreeMap<&'static str, String>,
+    /// Workspace members beyond [`MAX_WORKSPACE_MEMBERS`] that were skipped.
+    pub truncated_members: usize,
+}
+
+/// Marker-order rank of a runner's ecosystem — the precedence used both for
+/// verb binding and for the "Detected:" line. npm-family runners share one
+/// rank: a package has exactly one of them.
+fn runner_rank(runner: &str) -> u8 {
+    match runner {
+        "cargo" => 1,
+        "npm" | "pnpm" | "yarn" | "bun" => 2,
+        "deno" => 3,
+        "uv" | "poetry" => 4,
+        "go" => 5,
+        "make" => 6,
+        "just" => 7,
+        "task" => 8,
+        "composer" => 9,
+        _ => 10,
+    }
+}
+
+fn is_npm_family(runner: &str) -> bool {
+    matches!(runner, "npm" | "pnpm" | "yarn" | "bun")
+}
+
+/// Explicit script names each verb matches, in priority order.
+fn verb_aliases(verb: &str) -> &'static [&'static str] {
+    match verb {
+        "install" => &["install", "setup", "bootstrap"],
+        "build" => &["build", "compile", "dist"],
+        "start" => &["start", "dev", "serve"],
+        "test" => &["test", "tests"],
+        "lint" => &["lint"],
+        "format" => &["format", "fmt"],
+        _ => &[],
+    }
+}
+
+/// Names that are never implicitly verb-bound: a canonical verb must not
+/// trigger a watcher or an outward-facing/destructive action.
+fn verb_eligible(name: &str) -> bool {
+    !name.contains("watch") && !matches!(name, "publish" | "deploy" | "release" | "clean")
+}
+
+impl ScriptIndex {
+    /// Detect the workspace's scripts synchronously. Small manifest reads
+    /// only — safe at session start next to the memory loading, which does
+    /// the same kind of I/O.
+    pub fn detect_blocking(root: &Path) -> Self {
+        let mut entries: Vec<ScriptEntry> = Vec::new();
+        let root_pm = node_pm(root, None);
+        detect_package(root, ".", true, root_pm, &mut entries);
+        let (members, truncated_members) = workspace_members(root);
+        for dir in &members {
+            detect_package(root, dir, false, root_pm, &mut entries);
+        }
+        // Stable sort + first-wins dedup: detectors push explicit entries
+        // before synthesized ones, so an alias/script named e.g. `install`
+        // beats the synthesized `install` at the same (dir, id).
+        entries
+            .sort_by(|a, b| (a.dir.as_str(), a.id.as_str()).cmp(&(b.dir.as_str(), b.id.as_str())));
+        entries.dedup_by(|a, b| a.dir == b.dir && a.id == b.id);
+        let verbs = resolve_verbs(&mut entries);
+        ScriptIndex {
+            scripts: entries,
+            verbs,
+            truncated_members,
+        }
     }
 
-    /// First source declaring `name`, in resolution order.
-    fn resolve(&self, name: &str) -> Option<ScriptSource> {
-        if self.make_targets.iter().any(|t| t == name) {
-            return Some(ScriptSource::Make);
-        }
-        if self.package_scripts.iter().any(|s| s == name) {
-            return Some(ScriptSource::Package);
-        }
-        if self.cargo_aliases.iter().any(|a| a == name) {
-            return Some(ScriptSource::CargoAlias);
-        }
-        None
+    /// [`ScriptIndex::detect_blocking`] on the blocking pool — the form tool
+    /// `execute()` methods use so manifest reads never block a runtime
+    /// worker thread (#64).
+    pub async fn detect(root: &Path) -> Self {
+        let root = root.to_path_buf();
+        tokio::task::spawn_blocking(move || Self::detect_blocking(&root))
+            .await
+            .unwrap_or_default()
     }
 
-    /// The unknown-name error: the full vocabulary, grouped by source —
-    /// this listing is the tool's discoverability surface.
-    fn unknown_name_error(&self, name: &str) -> String {
+    pub fn is_empty(&self) -> bool {
+        self.scripts.is_empty()
+    }
+
+    /// Distinct runners across all entries, in ecosystem-rank order.
+    pub fn detected_runners(&self) -> Vec<&'static str> {
+        let mut runners: Vec<&'static str> = self.scripts.iter().map(|e| e.runner).collect();
+        runners.sort_by_key(|r| (runner_rank(r), *r));
+        runners.dedup();
+        runners
+    }
+
+    /// The root-package entry a canonical verb binds to, if any.
+    pub fn verb_entry(&self, verb: &str) -> Option<&ScriptEntry> {
+        let id = self.verbs.get(verb)?;
+        self.scripts.iter().find(|e| e.dir == "." && &e.id == id)
+    }
+
+    /// Resolve a `run_script` input: a canonical verb, a qualified id, or a
+    /// unique bare name. `dir` narrows to one package when the same id
+    /// exists in several.
+    pub fn resolve(&self, name: &str, dir: Option<&str>) -> Result<&ScriptEntry, String> {
         if self.is_empty() {
-            return format!(
-                "unknown script `{name}` — this project declares no runnable verbs \
-                 (no Makefile targets, package.json scripts, or cargo aliases found)"
-            );
+            return Err(no_scripts_message());
         }
-        let mut groups = Vec::new();
-        if !self.make_targets.is_empty() {
-            groups.push(format!(
-                "Makefile targets: {}",
-                self.make_targets.join(", ")
-            ));
+        if VERBS.contains(&name) {
+            return self.verb_entry(name).ok_or_else(|| {
+                format!(
+                    "no `{name}` script detected in this workspace — {}",
+                    self.vocabulary_line()
+                )
+            });
         }
-        if !self.package_scripts.is_empty() {
-            groups.push(format!(
-                "package.json scripts: {}",
-                self.package_scripts.join(", ")
-            ));
+        let dir_matches = |e: &&ScriptEntry| dir.is_none_or(|d| e.dir == d.trim_end_matches('/'));
+        let mut pool: Vec<&ScriptEntry> = self
+            .scripts
+            .iter()
+            .filter(|e| e.id == name)
+            .filter(dir_matches)
+            .collect();
+        if pool.is_empty() {
+            pool = self
+                .scripts
+                .iter()
+                .filter(|e| e.name == name)
+                .filter(dir_matches)
+                .collect();
         }
-        if !self.cargo_aliases.is_empty() {
-            groups.push(format!("cargo aliases: {}", self.cargo_aliases.join(", ")));
+        match pool.len() {
+            1 => Ok(pool[0]),
+            0 => Err(format!(
+                "unknown script `{name}` — {}",
+                self.vocabulary_line()
+            )),
+            _ => {
+                let ids: Vec<String> = pool
+                    .iter()
+                    .map(|e| format!("{} ({})", e.id, e.dir))
+                    .collect();
+                Err(format!(
+                    "`{name}` is ambiguous — matches {}; pass the qualified id and a `dir`",
+                    ids.join(", ")
+                ))
+            }
         }
+    }
+
+    /// The unknown-name discovery line: canonical verbs plus the qualified
+    /// vocabulary (capped) — the error itself teaches the project's real
+    /// commands.
+    fn vocabulary_line(&self) -> String {
+        let verbs: Vec<&str> = VERBS
+            .iter()
+            .copied()
+            .filter(|v| self.verbs.contains_key(v))
+            .collect();
+        let ids: Vec<&str> = self.scripts.iter().map(|e| e.id.as_str()).collect();
+        let shown = ids.len().min(ERROR_VOCABULARY_CAP);
+        let more = if ids.len() > shown {
+            format!(" (+{} more via list_scripts)", ids.len() - shown)
+        } else {
+            String::new()
+        };
         format!(
-            "unknown script `{name}` — this project declares: {}",
-            groups.join("; ")
+            "this project declares verbs [{}] and scripts: {}{more}",
+            verbs.join(", "),
+            ids[..shown].join(", ")
         )
     }
-}
 
-/// Parse Makefile rule targets: lines opening with a plain
-/// `^[A-Za-z0-9_.-]+:` target. Skipped on purpose: special/`.PHONY`-style
-/// dot-targets, pattern rules (`%`), and variable assignments (`NAME :=`).
-fn parse_make_targets(src: &str) -> Vec<String> {
-    let mut targets = Vec::new();
-    for line in src.lines() {
-        let Some(colon) = line.find(':') else {
-            continue;
-        };
-        let name = &line[..colon];
-        if name.is_empty()
-            || !name
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
-            || name.starts_with('.')
-        {
-            continue;
+    /// The `## Project scripts` block for the byte-stable system prompt:
+    /// the verb bindings inline, everything else as a count + teaser.
+    /// `None` when nothing was detected — no section, no noise.
+    pub fn render_prompt_section(&self) -> Option<String> {
+        if self.is_empty() {
+            return None;
         }
-        // `NAME := value` / `NAME ::= value` are assignments, not rules.
-        let rest = &line[colon + 1..];
-        if rest.starts_with('=') || rest.starts_with(":=") {
-            continue;
+        let mut s = String::from("## Project scripts\n\nDetected: ");
+        s.push_str(&self.detected_runners().join(", "));
+        s.push_str(
+            ". Run these with the run_script tool — do not rediscover them by reading manifests.\n\n",
+        );
+        for verb in VERBS {
+            if let Some(entry) = self.verb_entry(verb) {
+                let mut command = entry.command.clone();
+                if command.chars().count() > PROMPT_COMMAND_CHAR_CAP {
+                    command = command.chars().take(PROMPT_COMMAND_CHAR_CAP - 1).collect();
+                    command.push('…');
+                }
+                s.push_str(&format!("{verb} → {command}\n"));
+            }
         }
-        if !targets.iter().any(|t| t == name) {
-            targets.push(name.to_string());
+        let unbound: Vec<&str> = self
+            .scripts
+            .iter()
+            .filter(|e| e.verb.is_none())
+            .map(|e| e.id.as_str())
+            .collect();
+        if !unbound.is_empty() {
+            let teaser = unbound
+                .iter()
+                .take(3)
+                .copied()
+                .collect::<Vec<_>>()
+                .join(", ");
+            let ellipsis = if unbound.len() > 3 { ", …" } else { "" };
+            s.push_str(&format!(
+                "\n{} more scripts ({teaser}{ellipsis}): call list_scripts.\n",
+                unbound.len()
+            ));
         }
+        if s.chars().count() > PROMPT_SECTION_CHAR_CAP {
+            s = s.chars().take(PROMPT_SECTION_CHAR_CAP - 1).collect();
+            s.push('…');
+        }
+        Some(s.trim_end().to_string())
     }
-    targets
+
+    /// The human/model list frame — shared verbatim between `list_scripts`
+    /// and `stella scripts list`. `dir_filter` narrows the entry listing to
+    /// one package.
+    pub fn render_list(&self, dir_filter: Option<&str>) -> String {
+        if self.is_empty() {
+            return no_scripts_message();
+        }
+        let mut s = format!(
+            "Project scripts — detected: {} (static manifest parse)\n",
+            self.detected_runners().join(", ")
+        );
+        if dir_filter.is_none() {
+            let mut any = false;
+            for verb in VERBS {
+                if let Some(entry) = self.verb_entry(verb) {
+                    if !any {
+                        s.push_str("\nCanonical verbs (run_script accepts these names):\n");
+                        any = true;
+                    }
+                    s.push_str(&format!(
+                        "  {verb:<8} {:<44} [{}]\n",
+                        entry.command, entry.id
+                    ));
+                }
+            }
+        }
+        s.push_str("\nAll scripts (id · command · source):\n");
+        let mut listed = 0usize;
+        for entry in &self.scripts {
+            if dir_filter.is_some_and(|d| entry.dir != d.trim_end_matches('/')) {
+                continue;
+            }
+            listed += 1;
+            let loc = if entry.dir == "." {
+                String::new()
+            } else {
+                format!("{} › ", entry.dir)
+            };
+            s.push_str(&format!(
+                "  {loc}{:<24} {:<44} {}\n",
+                entry.id, entry.command, entry.source
+            ));
+        }
+        if listed == 0 {
+            s.push_str("  (none in that dir)\n");
+        }
+        if self.truncated_members > 0 {
+            s.push_str(&format!(
+                "\n({} workspace members beyond the {MAX_WORKSPACE_MEMBERS}-member cap were not indexed)\n",
+                self.truncated_members
+            ));
+        }
+        s.trim_end().to_string()
+    }
+
+    /// The machine frame (`stella scripts list --json`), schema_version 1 —
+    /// shape pinned by `docs/design/scripts-index.md`.
+    pub fn to_json(&self) -> Value {
+        serde_json::json!({
+            "schema_version": 1,
+            "verbs": self.verbs,
+            "scripts": self.scripts,
+        })
+    }
 }
 
-/// Parse `[alias]` keys out of `.cargo/config.toml`.
-fn parse_cargo_aliases(src: &str) -> Vec<String> {
-    let Ok(value) = toml::from_str::<toml::Value>(src) else {
-        return Vec::new();
+fn no_scripts_message() -> String {
+    "no project scripts detected (looked for Cargo.toml, package.json, deno.json(c), \
+     pyproject.toml, go.mod, Makefile, justfile, Taskfile.yml, composer.json)"
+        .to_string()
+}
+
+/// The full argv actually exec'd: the entry's argv plus the caller's extra
+/// args, joined runner-natively (`--` separator before args for npm-family
+/// script runs, plain append otherwise). Never shell-interpreted.
+pub fn compose_argv(entry: &ScriptEntry, args: &[String]) -> Vec<String> {
+    let mut argv = entry.argv.clone();
+    if !args.is_empty() {
+        if is_npm_family(entry.runner) && !entry.synthesized() {
+            argv.push("--".into());
+        }
+        argv.extend(args.iter().cloned());
+    }
+    argv
+}
+
+/// Resolve `run_script`'s command line for the registry's `command.started`
+/// policy chain — best-effort: `None` (no gating) when the input or index
+/// can't resolve, in which case the tool itself returns the named error.
+pub(crate) async fn resolve_command_for_gate(root: &Path, input: &Value) -> Option<String> {
+    let name = script_name(input)?;
+    let dir = input.get("dir").and_then(|v| v.as_str());
+    let args = string_args(input);
+    let index = ScriptIndex::detect(root).await;
+    let entry = index.resolve(name, dir).ok()?;
+    Some(compose_argv(entry, &args).join(" "))
+}
+
+/// Resolve and run one script — the single execution path shared by the
+/// `run_script` tool and `stella scripts run`. Argv exec, cwd = the
+/// entry's package dir.
+pub async fn run_by_name(
+    root: &Path,
+    name: &str,
+    dir: Option<&str>,
+    args: &[String],
+    timeout_secs: u64,
+) -> ToolOutput {
+    let index = ScriptIndex::detect(root).await;
+    let entry = match index.resolve(name, dir) {
+        Ok(entry) => entry,
+        Err(message) => return ToolOutput::Error { message },
     };
-    value
-        .get("alias")
-        .and_then(|a| a.as_table())
-        .map(|table| table.keys().cloned().collect())
+    let argv = compose_argv(entry, args);
+    let display = argv.join(" ");
+    let cwd = if entry.dir == "." {
+        root.to_path_buf()
+    } else {
+        root.join(&entry.dir)
+    };
+    match exec::run_argv(&argv[0], &argv[1..], &cwd, timeout_secs).await {
+        Ok((0, output)) => ToolOutput::Ok {
+            content: format!("`{display}` PASSED (exit 0)\n{output}"),
+        },
+        Ok((code, output)) => ToolOutput::Error {
+            message: format!("`{display}` FAILED (exit {code})\n{output}"),
+        },
+        Err(e) => ToolOutput::Error { message: e },
+    }
+}
+
+/// The script name from a `run_script` input — `name` per the advertised
+/// schema; `script` accepted as a spec-parity alias.
+fn script_name(input: &Value) -> Option<&str> {
+    input
+        .get("name")
+        .or_else(|| input.get("script"))
+        .and_then(|v| v.as_str())
+}
+
+fn string_args(input: &Value) -> Vec<String> {
+    input
+        .get("args")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
-/// Enumerate the workspace's declared verbs. Async file probes for the same
-/// reason as [`crate::project`]'s `detect` — this runs inside `execute()`.
-async fn discover(root: &std::path::Path) -> Vocabulary {
-    let mut vocab = Vocabulary {
-        pm: "npm",
-        ..Vocabulary::default()
+// ---------------------------------------------------------------------------
+// Detection
+// ---------------------------------------------------------------------------
+
+/// Run every ecosystem detector over one package dir. Cargo synthesizes at
+/// the workspace root only — per-crate cargo entries would be noise (the
+/// `--workspace` commands already cover the members).
+fn detect_package(
+    root: &Path,
+    rel: &str,
+    is_root: bool,
+    root_pm: &'static str,
+    out: &mut Vec<ScriptEntry>,
+) {
+    let dir = if rel == "." {
+        root.to_path_buf()
+    } else {
+        root.join(rel)
     };
-    if let Ok(src) = tokio::fs::read_to_string(root.join("Makefile")).await {
-        vocab.make_targets = parse_make_targets(&src);
+    if is_root {
+        detect_cargo(&dir, out);
     }
-    if let Ok(raw) = tokio::fs::read_to_string(root.join("package.json")).await
-        && let Ok(pkg) = serde_json::from_str::<Value>(&raw)
-        && let Some(scripts) = pkg.get("scripts").and_then(|s| s.as_object())
-    {
-        vocab.package_scripts = scripts.keys().cloned().collect();
-        let exists = |name: &'static str| async move {
-            tokio::fs::try_exists(root.join(name))
-                .await
-                .unwrap_or(false)
-        };
-        vocab.pm = if exists("pnpm-lock.yaml").await {
-            "pnpm"
-        } else if exists("yarn.lock").await {
-            "yarn"
-        } else {
-            "npm"
-        };
-    }
-    if let Ok(src) = tokio::fs::read_to_string(root.join(".cargo").join("config.toml")).await {
-        vocab.cargo_aliases = parse_cargo_aliases(&src);
-    }
-    vocab
+    let pm = if is_root {
+        root_pm
+    } else {
+        node_pm(&dir, Some(root_pm))
+    };
+    detect_node(&dir, rel, pm, out);
+    detect_deno(&dir, rel, out);
+    detect_python(&dir, rel, out);
+    detect_go(&dir, rel, out);
+    detect_make(&dir, rel, out);
+    detect_just(&dir, rel, out);
+    detect_taskfile(&dir, rel, out);
+    detect_composer(&dir, rel, out);
 }
 
-/// The runner argv for a resolved verb — pure, so the shape is testable.
-fn runner_argv(source: ScriptSource, pm: &str, name: &str, args: &[String]) -> Vec<String> {
-    let mut argv: Vec<String> = match source {
-        ScriptSource::Make => vec!["make".into(), name.into()],
-        ScriptSource::Package => {
-            let mut v = vec![pm.to_string(), "run".into(), name.into()];
-            if !args.is_empty() {
-                v.push("--".into());
-            }
-            v
-        }
-        ScriptSource::CargoAlias => vec!["cargo".into(), name.into()],
+fn manifest_path(rel: &str, name: &str) -> String {
+    if rel == "." {
+        name.to_string()
+    } else {
+        format!("{rel}/{name}")
+    }
+}
+
+fn entry(
+    runner: &'static str,
+    name: &str,
+    argv: Vec<&str>,
+    rel: &str,
+    source: String,
+    raw: Option<String>,
+) -> ScriptEntry {
+    let argv: Vec<String> = argv.into_iter().map(String::from).collect();
+    ScriptEntry {
+        id: format!("{runner}:{name}"),
+        runner,
+        name: name.to_string(),
+        command: argv.join(" "),
+        argv,
+        dir: rel.to_string(),
+        source,
+        verb: None,
+        raw,
+    }
+}
+
+fn synthesized(runner: &'static str, name: &str, argv: Vec<&str>, rel: &str) -> ScriptEntry {
+    entry(runner, name, argv, rel, "synthesized".into(), None)
+}
+
+/// The package manager for a dir with `package.json`, from its lockfile —
+/// falling back to the workspace root's pm for lockfile-less members
+/// (hoisted-lockfile monorepos).
+fn node_pm(dir: &Path, inherited: Option<&'static str>) -> &'static str {
+    if dir.join("pnpm-lock.yaml").exists() {
+        "pnpm"
+    } else if dir.join("yarn.lock").exists() {
+        "yarn"
+    } else if dir.join("bun.lock").exists() || dir.join("bun.lockb").exists() {
+        "bun"
+    } else if dir.join("package-lock.json").exists() {
+        "npm"
+    } else {
+        inherited.unwrap_or("npm")
+    }
+}
+
+fn detect_node(dir: &Path, rel: &str, pm: &'static str, out: &mut Vec<ScriptEntry>) {
+    let Ok(text) = std::fs::read_to_string(dir.join("package.json")) else {
+        return;
     };
-    argv.extend(args.iter().cloned());
-    argv
+    let Ok(pkg) = serde_json::from_str::<Value>(&text) else {
+        return;
+    };
+    let source = manifest_path(rel, "package.json");
+    if let Some(scripts) = pkg.get("scripts").and_then(|s| s.as_object()) {
+        for (name, body) in scripts {
+            out.push(entry(
+                pm,
+                name,
+                vec![pm, "run", name],
+                rel,
+                source.clone(),
+                body.as_str().map(String::from),
+            ));
+        }
+    }
+    out.push(synthesized(pm, "install", vec![pm, "install"], rel));
+}
+
+fn detect_deno(dir: &Path, rel: &str, out: &mut Vec<ScriptEntry>) {
+    let (text, name) = match std::fs::read_to_string(dir.join("deno.json")) {
+        Ok(t) => (t, "deno.json"),
+        Err(_) => match std::fs::read_to_string(dir.join("deno.jsonc")) {
+            Ok(t) => (strip_jsonc_comments(&t), "deno.jsonc"),
+            Err(_) => return,
+        },
+    };
+    let Ok(doc) = serde_json::from_str::<Value>(&text) else {
+        return;
+    };
+    let source = manifest_path(rel, name);
+    if let Some(tasks) = doc.get("tasks").and_then(|t| t.as_object()) {
+        for (task, body) in tasks {
+            out.push(entry(
+                "deno",
+                task,
+                vec!["deno", "task", task],
+                rel,
+                source.clone(),
+                body.as_str().map(String::from),
+            ));
+        }
+    }
+    out.push(synthesized("deno", "install", vec!["deno", "install"], rel));
+}
+
+fn detect_python(dir: &Path, rel: &str, out: &mut Vec<ScriptEntry>) {
+    let Ok(text) = std::fs::read_to_string(dir.join("pyproject.toml")) else {
+        return;
+    };
+    let Ok(doc) = toml::from_str::<toml::Value>(&text) else {
+        return;
+    };
+    let tool = |name: &str| doc.get("tool").and_then(|t| t.get(name));
+    let runner: &'static str = if dir.join("uv.lock").exists() || tool("uv").is_some() {
+        "uv"
+    } else if dir.join("poetry.lock").exists() || tool("poetry").is_some() {
+        "poetry"
+    } else {
+        "uv"
+    };
+    let source = manifest_path(rel, "pyproject.toml");
+    if let Some(scripts) = doc
+        .get("project")
+        .and_then(|p| p.get("scripts"))
+        .and_then(|s| s.as_table())
+    {
+        for (name, target) in scripts {
+            out.push(entry(
+                runner,
+                name,
+                vec![runner, "run", name],
+                rel,
+                source.clone(),
+                target.as_str().map(String::from),
+            ));
+        }
+    }
+    if runner == "poetry" {
+        out.push(synthesized(
+            runner,
+            "install",
+            vec!["poetry", "install"],
+            rel,
+        ));
+    } else {
+        out.push(synthesized(runner, "install", vec!["uv", "sync"], rel));
+    }
+    // Test/lint/format synthesize only when the tool is actually declared —
+    // `uv run pytest` in a pytest-less project is a guess, not a script.
+    if has_python_dep(&doc, "pytest") {
+        out.push(synthesized(
+            runner,
+            "test",
+            vec![runner, "run", "pytest"],
+            rel,
+        ));
+    }
+    if has_python_dep(&doc, "ruff") {
+        out.push(synthesized(
+            runner,
+            "lint",
+            vec![runner, "run", "ruff", "check"],
+            rel,
+        ));
+        out.push(synthesized(
+            runner,
+            "format",
+            vec![runner, "run", "ruff", "format"],
+            rel,
+        ));
+    }
+}
+
+/// Whether `pyproject.toml` declares `tool_name` anywhere dependencies live:
+/// `[project] dependencies`, `[project.optional-dependencies]`,
+/// `[dependency-groups]`, `[tool.poetry.dependencies]`, or
+/// `[tool.poetry.group.*.dependencies]`.
+fn has_python_dep(doc: &toml::Value, tool_name: &str) -> bool {
+    let mut names: Vec<String> = Vec::new();
+    let project = doc.get("project");
+    if let Some(reqs) = project
+        .and_then(|p| p.get("dependencies"))
+        .and_then(|v| v.as_array())
+    {
+        names.extend(reqs.iter().filter_map(|r| r.as_str()).map(req_name));
+    }
+    if let Some(extras) = project
+        .and_then(|p| p.get("optional-dependencies"))
+        .and_then(|o| o.as_table())
+    {
+        for group in extras.values() {
+            if let Some(reqs) = group.as_array() {
+                names.extend(reqs.iter().filter_map(|r| r.as_str()).map(req_name));
+            }
+        }
+    }
+    if let Some(groups) = doc.get("dependency-groups").and_then(|g| g.as_table()) {
+        for group in groups.values() {
+            if let Some(reqs) = group.as_array() {
+                // Non-string items are `{include-group = …}` tables — skip.
+                names.extend(reqs.iter().filter_map(|r| r.as_str()).map(req_name));
+            }
+        }
+    }
+    let poetry = doc.get("tool").and_then(|t| t.get("poetry"));
+    if let Some(deps) = poetry
+        .and_then(|p| p.get("dependencies"))
+        .and_then(|d| d.as_table())
+    {
+        names.extend(deps.keys().map(|k| req_name(k)));
+    }
+    if let Some(groups) = poetry
+        .and_then(|p| p.get("group"))
+        .and_then(|g| g.as_table())
+    {
+        for group in groups.values() {
+            if let Some(deps) = group.get("dependencies").and_then(|d| d.as_table()) {
+                names.extend(deps.keys().map(|k| req_name(k)));
+            }
+        }
+    }
+    let want = req_name(tool_name);
+    names.contains(&want)
+}
+
+/// PEP 508-ish requirement → normalized distribution name (`Pytest>=8` →
+/// `pytest`, `ruff == 0.4` → `ruff`).
+fn req_name(req: &str) -> String {
+    req.trim()
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        .collect::<String>()
+        .to_lowercase()
+        .replace('_', "-")
+}
+
+fn detect_go(dir: &Path, rel: &str, out: &mut Vec<ScriptEntry>) {
+    if !dir.join("go.mod").exists() {
+        return;
+    }
+    out.push(synthesized(
+        "go",
+        "install",
+        vec!["go", "mod", "download"],
+        rel,
+    ));
+    out.push(synthesized(
+        "go",
+        "build",
+        vec!["go", "build", "./..."],
+        rel,
+    ));
+    out.push(synthesized("go", "test", vec!["go", "test", "./..."], rel));
+    out.push(synthesized("go", "lint", vec!["go", "vet", "./..."], rel));
+    out.push(synthesized("go", "format", vec!["go", "fmt", "./..."], rel));
+}
+
+fn detect_cargo(root: &Path, out: &mut Vec<ScriptEntry>) {
+    let Ok(text) = std::fs::read_to_string(root.join("Cargo.toml")) else {
+        return;
+    };
+    let Ok(doc) = toml::from_str::<toml::Value>(&text) else {
+        return;
+    };
+    // Aliases first: pushed before the synthesized set so an alias named
+    // e.g. `install` wins the (dir, id) dedup.
+    if let Ok(config) = std::fs::read_to_string(root.join(".cargo/config.toml"))
+        && let Ok(config) = toml::from_str::<toml::Value>(&config)
+        && let Some(aliases) = config.get("alias").and_then(|a| a.as_table())
+    {
+        for (alias, value) in aliases {
+            let raw = match value {
+                toml::Value::String(s) => Some(s.clone()),
+                toml::Value::Array(parts) => Some(
+                    parts
+                        .iter()
+                        .filter_map(|p| p.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                ),
+                _ => None,
+            };
+            out.push(entry(
+                "cargo",
+                alias,
+                vec!["cargo", alias],
+                ".",
+                ".cargo/config.toml".into(),
+                raw,
+            ));
+        }
+    }
+    out.push(synthesized("cargo", "install", vec!["cargo", "fetch"], "."));
+    out.push(synthesized(
+        "cargo",
+        "build",
+        vec!["cargo", "build", "--workspace"],
+        ".",
+    ));
+    out.push(synthesized(
+        "cargo",
+        "test",
+        vec!["cargo", "test", "--workspace"],
+        ".",
+    ));
+    out.push(synthesized(
+        "cargo",
+        "lint",
+        vec!["cargo", "clippy", "--workspace", "--all-targets"],
+        ".",
+    ));
+    out.push(synthesized("cargo", "format", vec!["cargo", "fmt"], "."));
+    // `start` only when there is something to run: an explicit default-run
+    // binary, or a root src/main.rs.
+    let has_default_run = doc
+        .get("package")
+        .and_then(|p| p.get("default-run"))
+        .is_some();
+    if has_default_run || root.join("src/main.rs").exists() {
+        out.push(synthesized("cargo", "start", vec!["cargo", "run"], "."));
+    }
+}
+
+fn detect_make(dir: &Path, rel: &str, out: &mut Vec<ScriptEntry>) {
+    let text = match std::fs::read_to_string(dir.join("Makefile")) {
+        Ok(t) => t,
+        Err(_) => match std::fs::read_to_string(dir.join("makefile")) {
+            Ok(t) => t,
+            Err(_) => return,
+        },
+    };
+    let source = manifest_path(rel, "Makefile");
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    for line in text.lines() {
+        // Recipe lines are tab-indented; comments, directives, and
+        // assignments (`:=`, `VAR = x`) are not targets.
+        if line.starts_with([' ', '\t', '#']) || line.is_empty() {
+            continue;
+        }
+        let Some(colon) = line.find(':') else {
+            continue;
+        };
+        // `:=` / `::=` assignments, and `=` before the colon, are variables.
+        if line[colon + 1..].starts_with('=') || line[..colon].contains('=') {
+            continue;
+        }
+        for name in line[..colon].split_whitespace() {
+            let valid = !name.is_empty()
+                && !name.starts_with('.')
+                && !name.contains('%')
+                && !name.contains('$')
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-' | '/'));
+            if valid && seen.insert(name.to_string()) {
+                out.push(entry(
+                    "make",
+                    name,
+                    vec!["make", name],
+                    rel,
+                    source.clone(),
+                    None,
+                ));
+            }
+        }
+    }
+}
+
+fn detect_just(dir: &Path, rel: &str, out: &mut Vec<ScriptEntry>) {
+    let (text, name) = match std::fs::read_to_string(dir.join("justfile")) {
+        Ok(t) => (t, "justfile"),
+        Err(_) => match std::fs::read_to_string(dir.join(".justfile")) {
+            Ok(t) => (t, ".justfile"),
+            Err(_) => return,
+        },
+    };
+    let source = manifest_path(rel, name);
+    for line in text.lines() {
+        // Recipe headers are unindented `name params…: deps` lines; skip
+        // comments, attributes (`[private]`), directives, assignments
+        // (`x := y`), and `_`-prefixed (hidden-by-convention) recipes.
+        if line.starts_with([' ', '\t', '#', '[']) || line.is_empty() {
+            continue;
+        }
+        let Some(first) = line.split_whitespace().next() else {
+            continue;
+        };
+        if matches!(first, "export" | "set" | "import" | "mod" | "alias") {
+            continue;
+        }
+        let recipe = first.strip_suffix(':').unwrap_or(first);
+        let rest = line[first.len()..].trim_start();
+        // `x := y` is an assignment; a header either ends its first token
+        // with `:` or carries params before a later colon.
+        if rest.starts_with(":=") || (first.len() == recipe.len() && !rest.contains(':')) {
+            continue;
+        }
+        let valid = recipe
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic())
+            && recipe
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'));
+        if valid {
+            out.push(entry(
+                "just",
+                recipe,
+                vec!["just", recipe],
+                rel,
+                source.clone(),
+                None,
+            ));
+        }
+    }
+}
+
+fn detect_taskfile(dir: &Path, rel: &str, out: &mut Vec<ScriptEntry>) {
+    let (text, name) = match std::fs::read_to_string(dir.join("Taskfile.yml")) {
+        Ok(t) => (t, "Taskfile.yml"),
+        Err(_) => match std::fs::read_to_string(dir.join("Taskfile.yaml")) {
+            Ok(t) => (t, "Taskfile.yaml"),
+            Err(_) => return,
+        },
+    };
+    let source = manifest_path(rel, name);
+    // Minimal YAML walk: task names are the keys one indent level under the
+    // top-level `tasks:` key; deeper lines are task bodies.
+    let mut in_tasks = false;
+    let mut task_indent: Option<usize> = None;
+    for line in text.lines() {
+        let trimmed = line.trim_end();
+        if trimmed.is_empty() || trimmed.trim_start().starts_with('#') {
+            continue;
+        }
+        let indent = trimmed.len() - trimmed.trim_start().len();
+        if indent == 0 {
+            in_tasks = trimmed == "tasks:";
+            task_indent = None;
+            continue;
+        }
+        if !in_tasks {
+            continue;
+        }
+        let level = *task_indent.get_or_insert(indent);
+        if indent != level {
+            continue;
+        }
+        let key = trimmed.trim_start();
+        let Some(colon) = key.find(':') else {
+            continue;
+        };
+        let task = &key[..colon];
+        let valid = !task.is_empty()
+            && !task.starts_with('-')
+            && task
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | ':' | '-'));
+        if valid {
+            out.push(entry(
+                "task",
+                task,
+                vec!["task", task],
+                rel,
+                source.clone(),
+                None,
+            ));
+        }
+    }
+}
+
+fn detect_composer(dir: &Path, rel: &str, out: &mut Vec<ScriptEntry>) {
+    let Ok(text) = std::fs::read_to_string(dir.join("composer.json")) else {
+        return;
+    };
+    let Ok(pkg) = serde_json::from_str::<Value>(&text) else {
+        return;
+    };
+    let source = manifest_path(rel, "composer.json");
+    if let Some(scripts) = pkg.get("scripts").and_then(|s| s.as_object()) {
+        for (name, body) in scripts {
+            let raw = match body {
+                Value::String(s) => Some(s.clone()),
+                Value::Array(parts) => Some(
+                    parts
+                        .iter()
+                        .filter_map(|p| p.as_str())
+                        .collect::<Vec<_>>()
+                        .join("; "),
+                ),
+                _ => None,
+            };
+            out.push(entry(
+                "composer",
+                name,
+                vec!["composer", "run", name],
+                rel,
+                source.clone(),
+                raw,
+            ));
+        }
+    }
+    out.push(synthesized(
+        "composer",
+        "install",
+        vec!["composer", "install"],
+        rel,
+    ));
+}
+
+/// Strip `//` and `/* */` comments from JSONC, string-aware.
+fn strip_jsonc_comments(src: &str) -> String {
+    let mut out = String::with_capacity(src.len());
+    let mut chars = src.chars().peekable();
+    let mut in_string = false;
+    while let Some(c) = chars.next() {
+        if in_string {
+            out.push(c);
+            if c == '\\' {
+                if let Some(next) = chars.next() {
+                    out.push(next);
+                }
+            } else if c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => {
+                in_string = true;
+                out.push(c);
+            }
+            '/' if chars.peek() == Some(&'/') => {
+                for next in chars.by_ref() {
+                    if next == '\n' {
+                        out.push('\n');
+                        break;
+                    }
+                }
+            }
+            '/' if chars.peek() == Some(&'*') => {
+                chars.next();
+                let mut prev = ' ';
+                for next in chars.by_ref() {
+                    if prev == '*' && next == '/' {
+                        break;
+                    }
+                    prev = next;
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Workspace members
+// ---------------------------------------------------------------------------
+
+/// Member dirs declared by the root manifests: `package.json` `workspaces`,
+/// `pnpm-workspace.yaml` `packages`, `[workspace] members` in `Cargo.toml`.
+/// Sorted, deduplicated, capped — the overflow count is reported, never
+/// silently dropped.
+fn workspace_members(root: &Path) -> (Vec<String>, usize) {
+    let mut patterns: Vec<String> = Vec::new();
+    if let Ok(text) = std::fs::read_to_string(root.join("package.json"))
+        && let Ok(pkg) = serde_json::from_str::<Value>(&text)
+    {
+        let globs = pkg
+            .get("workspaces")
+            .map(|w| w.get("packages").unwrap_or(w))
+            .and_then(|w| w.as_array());
+        if let Some(globs) = globs {
+            patterns.extend(globs.iter().filter_map(|g| g.as_str()).map(String::from));
+        }
+    }
+    if let Ok(text) = std::fs::read_to_string(root.join("pnpm-workspace.yaml")) {
+        patterns.extend(pnpm_workspace_globs(&text));
+    }
+    if let Ok(text) = std::fs::read_to_string(root.join("Cargo.toml"))
+        && let Ok(doc) = toml::from_str::<toml::Value>(&text)
+        && let Some(members) = doc
+            .get("workspace")
+            .and_then(|w| w.get("members"))
+            .and_then(|m| m.as_array())
+    {
+        patterns.extend(members.iter().filter_map(|m| m.as_str()).map(String::from));
+    }
+
+    let mut dirs: BTreeSet<String> = BTreeSet::new();
+    for pattern in &patterns {
+        expand_member_pattern(root, pattern, &mut dirs);
+    }
+    dirs.remove(".");
+    let truncated = dirs.len().saturating_sub(MAX_WORKSPACE_MEMBERS);
+    (
+        dirs.into_iter().take(MAX_WORKSPACE_MEMBERS).collect(),
+        truncated,
+    )
+}
+
+/// The `packages:` globs of a `pnpm-workspace.yaml` — a minimal line-based
+/// parse (top-level key, then `- pattern` items); negations are skipped.
+fn pnpm_workspace_globs(text: &str) -> Vec<String> {
+    let mut globs = Vec::new();
+    let mut in_packages = false;
+    for line in text.lines() {
+        let trimmed = line.trim_end();
+        if trimmed.is_empty() || trimmed.trim_start().starts_with('#') {
+            continue;
+        }
+        if !trimmed.starts_with([' ', '\t']) {
+            in_packages = trimmed == "packages:";
+            continue;
+        }
+        if !in_packages {
+            continue;
+        }
+        if let Some(item) = trimmed.trim_start().strip_prefix("- ") {
+            let item = item.trim().trim_matches('"').trim_matches('\'');
+            if !item.is_empty() && !item.starts_with('!') {
+                globs.push(item.to_string());
+            }
+        }
+    }
+    globs
+}
+
+/// Expand one member pattern: a literal dir, or a `base/*` / `base/**`
+/// one-level glob. Anything fancier is skipped — deterministically, not
+/// approximately.
+fn expand_member_pattern(root: &Path, pattern: &str, dirs: &mut BTreeSet<String>) {
+    let pattern = pattern.trim().trim_end_matches('/');
+    if pattern.is_empty() {
+        return;
+    }
+    let base = pattern
+        .strip_suffix("/*")
+        .or_else(|| pattern.strip_suffix("/**"));
+    if let Some(base) = base {
+        let Ok(read) = std::fs::read_dir(root.join(base)) else {
+            return;
+        };
+        for child in read.filter_map(|e| e.ok()) {
+            let name = child.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') || name == "node_modules" || name == "target" {
+                continue;
+            }
+            if child.path().is_dir() {
+                dirs.insert(format!("{base}/{name}"));
+            }
+        }
+    } else if !pattern.contains('*') && root.join(pattern).is_dir() {
+        dirs.insert(pattern.to_string());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Verb resolution
+// ---------------------------------------------------------------------------
+
+/// Bind the six canonical verbs over the sorted entries (root package only):
+/// (1) an explicit script in the first-ranked ecosystem, (2) that
+/// ecosystem's synthesized default, (3) explicit scripts of later-ranked
+/// ecosystems. Synthesized defaults of later ecosystems never bind.
+fn resolve_verbs(entries: &mut [ScriptEntry]) -> BTreeMap<&'static str, String> {
+    let mut map = BTreeMap::new();
+    let mut ranks: Vec<u8> = entries
+        .iter()
+        .filter(|e| e.dir == ".")
+        .map(|e| runner_rank(e.runner))
+        .collect();
+    ranks.sort_unstable();
+    ranks.dedup();
+    let Some(&first) = ranks.first() else {
+        return map;
+    };
+    for verb in VERBS {
+        let winner = find_explicit(entries, first, verb)
+            .or_else(|| find_synthesized(entries, first, verb))
+            .or_else(|| {
+                ranks
+                    .iter()
+                    .skip(1)
+                    .find_map(|&rank| find_explicit(entries, rank, verb))
+            });
+        if let Some(i) = winner {
+            entries[i].verb = Some(verb);
+            map.insert(verb, entries[i].id.clone());
+        }
+    }
+    map
+}
+
+fn find_explicit(entries: &[ScriptEntry], rank: u8, verb: &str) -> Option<usize> {
+    verb_aliases(verb).iter().find_map(|alias| {
+        entries.iter().position(|e| {
+            e.dir == "."
+                && !e.synthesized()
+                && runner_rank(e.runner) == rank
+                && e.name == *alias
+                && verb_eligible(&e.name)
+        })
+    })
+}
+
+fn find_synthesized(entries: &[ScriptEntry], rank: u8, verb: &str) -> Option<usize> {
+    entries.iter().position(|e| {
+        e.dir == "." && e.synthesized() && runner_rank(e.runner) == rank && e.name == verb
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Tools
+// ---------------------------------------------------------------------------
+
+pub struct ListScripts;
+
+#[async_trait]
+impl Tool for ListScripts {
+    fn schema(&self) -> ToolSchema {
+        ToolSchema {
+            name: "list_scripts".into(),
+            description: "List the project's indexed package-manager scripts and their \
+                          canonical verb bindings (install/build/start/test/lint/format). \
+                          Static manifest detection — nothing is executed."
+                .into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "dir": { "type": "string", "description": "Narrow to one workspace package dir" }
+                }
+            }),
+            read_only: true,
+        }
+    }
+
+    async fn execute(&self, input: &Value, root: &std::path::Path) -> ToolOutput {
+        let index = ScriptIndex::detect(root).await;
+        let dir = input.get("dir").and_then(|v| v.as_str());
+        ToolOutput::Ok {
+            content: index.render_list(dir),
+        }
+    }
 }
 
 /// `run_script` — see the module doc.
@@ -193,16 +1241,18 @@ impl Tool for RunScript {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "run_script".into(),
-            description: "Run a verb this project itself declares: a Makefile target, a \
-                          package.json script, or a cargo alias. args are passed argv-style \
-                          (never through a shell). An unknown name returns the full list of \
-                          declared verbs — call it with any name to discover them."
+            description: "Run a script this project itself declares, by canonical verb \
+                          (install|build|start|test|lint|format), qualified id (e.g. \
+                          pnpm:build, make:lint), or declared name. args are passed \
+                          argv-style (never through a shell). An unknown name returns the \
+                          declared vocabulary — see also list_scripts."
                 .into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "name": { "type": "string", "description": "A declared verb (Makefile target, package.json script, or cargo alias)" },
-                    "args": { "type": "array", "items": { "type": "string" }, "description": "Extra arguments, passed argv-style to the runner" },
+                    "name": { "type": "string", "description": "Canonical verb, qualified id, or declared script/target/alias name" },
+                    "dir": { "type": "string", "description": "Package dir when the name exists in several packages" },
+                    "args": { "type": "array", "items": { "type": "string" }, "description": "Extra arguments, passed argv-style to the runner (after `--` for npm-family scripts)" },
                     "timeout_secs": { "type": "integer" }
                 },
                 "required": ["name"]
@@ -212,42 +1262,18 @@ impl Tool for RunScript {
     }
 
     async fn execute(&self, input: &Value, root: &std::path::Path) -> ToolOutput {
-        let Some(name) = input.get("name").and_then(|v| v.as_str()) else {
+        let Some(name) = script_name(input) else {
             return ToolOutput::Error {
                 message: "missing required field `name`".into(),
             };
         };
-        let args: Vec<String> = input
-            .get("args")
-            .and_then(|v| v.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let dir = input.get("dir").and_then(|v| v.as_str());
+        let args = string_args(input);
         let timeout_secs = input
             .get("timeout_secs")
             .and_then(|v| v.as_u64())
             .unwrap_or(DEFAULT_TIMEOUT_SECS);
-
-        let vocab = discover(root).await;
-        let Some(source) = vocab.resolve(name) else {
-            return ToolOutput::Error {
-                message: vocab.unknown_name_error(name),
-            };
-        };
-        let argv = runner_argv(source, vocab.pm, name, &args);
-        let display = argv.join(" ");
-        match exec::run_argv(&argv[0], &argv[1..], root, timeout_secs).await {
-            Ok((0, output)) => ToolOutput::Ok {
-                content: format!("`{display}` PASSED (exit 0)\n{output}"),
-            },
-            Ok((code, output)) => ToolOutput::Error {
-                message: format!("`{display}` FAILED (exit {code})\n{output}"),
-            },
-            Err(e) => ToolOutput::Error { message: e },
-        }
+        run_by_name(root, name, dir, &args, timeout_secs).await
     }
 }
 
@@ -255,144 +1281,397 @@ impl Tool for RunScript {
 mod tests {
     use super::*;
 
-    #[test]
-    fn make_targets_parse_rules_and_skip_specials_and_assignments() {
-        let src = "\
-.PHONY: build test\n\
-build: deps\n\
-\tcargo build\n\
-test:\n\
-\tcargo test\n\
-%.o: %.c\n\
-\tcc -c $<\n\
-VERSION := 1.2.3\n\
-NAME:=x\n\
-gate-all.v2: build\n";
-        assert_eq!(
-            parse_make_targets(src),
-            vec!["build", "test", "gate-all.v2"]
-        );
+    fn write(dir: &Path, rel: &str, content: &str) {
+        let path = dir.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, content).unwrap();
     }
 
     #[test]
-    fn cargo_aliases_parse_the_alias_table() {
-        let src = "[alias]\ntc = \"test -p stella-core\"\ngate = [\"fmt\", \"--check\"]\n\n[build]\njobs = 4\n";
-        let mut aliases = parse_cargo_aliases(src);
-        aliases.sort();
-        assert_eq!(aliases, vec!["gate", "tc"]);
-        assert!(parse_cargo_aliases("not toml [").is_empty());
-    }
-
-    #[test]
-    fn runner_argv_is_shell_free_and_source_shaped() {
-        let args = vec!["--flag".to_string(), "a b".to_string()];
-        assert_eq!(
-            runner_argv(ScriptSource::Make, "npm", "gate", &args).join("|"),
-            "make|gate|--flag|a b"
-        );
-        assert_eq!(
-            runner_argv(ScriptSource::Package, "pnpm", "dev", &args).join("|"),
-            "pnpm|run|dev|--|--flag|a b"
-        );
-        // No args → no dangling `--`.
-        assert_eq!(
-            runner_argv(ScriptSource::Package, "npm", "dev", &[]).join("|"),
-            "npm|run|dev"
-        );
-        assert_eq!(
-            runner_argv(ScriptSource::CargoAlias, "npm", "tc", &args).join("|"),
-            "cargo|tc|--flag|a b"
-        );
-    }
-
-    #[tokio::test]
-    async fn unknown_name_lists_the_discovered_vocabulary() {
+    fn node_scripts_and_lockfile_pm_bind_verbs() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("Makefile"),
-            "build:\n\ttrue\ngate:\n\ttrue\n",
-        )
-        .unwrap();
-        std::fs::write(
-            dir.path().join("package.json"),
-            r#"{"scripts": {"dev": "vite", "lint": "eslint ."}}"#,
-        )
-        .unwrap();
-        std::fs::create_dir_all(dir.path().join(".cargo")).unwrap();
-        std::fs::write(
-            dir.path().join(".cargo/config.toml"),
-            "[alias]\ntc = \"test -p stella-core\"\n",
-        )
-        .unwrap();
+        write(
+            dir.path(),
+            "package.json",
+            r#"{"scripts": {"build": "next build", "dev": "next dev", "test": "vitest",
+                "test:watch": "vitest --watch", "deploy": "vercel deploy"}}"#,
+        );
+        write(dir.path(), "pnpm-lock.yaml", "");
+        let index = ScriptIndex::detect_blocking(dir.path());
 
-        let out = RunScript
-            .execute(&serde_json::json!({"name": "nope"}), dir.path())
-            .await;
-        let ToolOutput::Error { message } = out else {
-            panic!("unknown name must be an error");
-        };
-        for expected in [
-            "unknown script `nope`",
-            "Makefile targets: build, gate",
-            "dev",
-            "lint",
-            "cargo aliases: tc",
-        ] {
-            assert!(message.contains(expected), "missing {expected}: {message}");
-        }
-    }
-
-    #[tokio::test]
-    async fn an_empty_project_names_every_manifest_it_looked_for() {
-        let dir = tempfile::tempdir().unwrap();
-        let out = RunScript
-            .execute(&serde_json::json!({"name": "build"}), dir.path())
-            .await;
-        let ToolOutput::Error { message } = out else {
-            panic!("expected error");
-        };
-        assert!(message.contains("declares no runnable verbs"), "{message}");
-        assert!(message.contains("Makefile targets"), "{message}");
-    }
-
-    /// Whether `make` exists on PATH — the execution test skips cleanly
-    /// without it (mirrors the real-git skip in stella-fleet).
-    async fn make_available() -> bool {
-        tokio::process::Command::new("make")
-            .arg("--version")
-            .output()
-            .await
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-    }
-
-    #[tokio::test]
-    async fn a_declared_make_target_runs_and_args_pass_argv_style() {
-        if !make_available().await {
-            eprintln!("skipping run_script make test: `make` not available");
-            return;
-        }
-        let dir = tempfile::tempdir().unwrap();
-        // The target prints its first argument-variable-free marker; args
-        // land as extra make goals, so use a no-op goal to prove they are
-        // separate argv entries and never shell-joined.
-        std::fs::write(
-            dir.path().join("Makefile"),
-            "hello:\n\t@echo script_ran_ok\nnoop:\n\t@true\n",
-        )
-        .unwrap();
-        let out = RunScript
-            .execute(
-                &serde_json::json!({"name": "hello", "args": ["noop"]}),
-                dir.path(),
-            )
-            .await;
-        match out {
-            ToolOutput::Ok { content } => {
-                assert!(content.contains("script_ran_ok"), "{content}");
-                assert!(content.contains("`make hello noop` PASSED"), "{content}");
+        assert_eq!(index.verbs.get("build").unwrap(), "pnpm:build");
+        assert_eq!(index.verbs.get("test").unwrap(), "pnpm:test");
+        assert_eq!(index.verbs.get("start").unwrap(), "pnpm:dev");
+        assert_eq!(index.verbs.get("install").unwrap(), "pnpm:install");
+        let build = index.verb_entry("build").unwrap();
+        assert_eq!(build.command, "pnpm run build");
+        assert_eq!(build.argv, vec!["pnpm", "run", "build"]);
+        assert_eq!(build.raw.as_deref(), Some("next build"));
+        assert_eq!(index.verb_entry("install").unwrap().command, "pnpm install");
+        // watch/deploy names are listed but never verb-bound.
+        for entry in &index.scripts {
+            if entry.name == "test:watch" || entry.name == "deploy" {
+                assert!(entry.verb.is_none(), "{} must not bind a verb", entry.id);
             }
-            ToolOutput::Error { message } => panic!("expected ok: {message}"),
+        }
+    }
+
+    #[test]
+    fn cargo_root_synthesizes_verbs_and_reads_aliases() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "Cargo.toml",
+            "[package]\nname = \"x\"\nversion = \"0.1.0\"\n",
+        );
+        write(
+            dir.path(),
+            ".cargo/config.toml",
+            "[alias]\nxt = \"test --workspace\"\n",
+        );
+        let index = ScriptIndex::detect_blocking(dir.path());
+
+        assert_eq!(index.verbs.get("install").unwrap(), "cargo:install");
+        assert_eq!(index.verb_entry("install").unwrap().command, "cargo fetch");
+        assert_eq!(
+            index.verb_entry("build").unwrap().command,
+            "cargo build --workspace"
+        );
+        // No default-run bin and no src/main.rs → no start verb.
+        assert!(!index.verbs.contains_key("start"));
+        let alias = index.scripts.iter().find(|e| e.id == "cargo:xt").unwrap();
+        assert_eq!(alias.argv, vec!["cargo", "xt"]);
+        assert_eq!(alias.raw.as_deref(), Some("test --workspace"));
+        assert_eq!(alias.source, ".cargo/config.toml");
+    }
+
+    #[test]
+    fn make_targets_parse_and_skip_variables_and_patterns() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "Makefile",
+            ".PHONY: build test\nVAR := x\nOTHER = y\n\nbuild:\n\tcargo build\n\
+             test: build\n\techo test\n%.o: %.c\n\tcc\n.hidden:\n\ttrue\n",
+        );
+        let index = ScriptIndex::detect_blocking(dir.path());
+        let ids: Vec<&str> = index.scripts.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, vec!["make:build", "make:test"]);
+        // make is the only ecosystem → its explicit targets bind the verbs.
+        assert_eq!(index.verbs.get("build").unwrap(), "make:build");
+        assert_eq!(index.verbs.get("test").unwrap(), "make:test");
+        assert!(!index.verbs.contains_key("install"));
+    }
+
+    #[test]
+    fn justfile_recipes_skip_hidden_and_assignments() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "justfile",
+            "version := \"1\"\n\n# comment\nbuild target=\"debug\":\n    cargo build\n\
+             _helper:\n    true\nfmt:\n    cargo fmt\n",
+        );
+        let index = ScriptIndex::detect_blocking(dir.path());
+        let ids: Vec<&str> = index.scripts.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, vec!["just:build", "just:fmt"]);
+        assert_eq!(index.verbs.get("format").unwrap(), "just:fmt");
+    }
+
+    #[test]
+    fn pyproject_uv_synthesizes_only_declared_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "pyproject.toml",
+            "[project]\nname = \"x\"\ndependencies = [\"requests>=2\"]\n\n\
+             [dependency-groups]\ndev = [\"pytest>=8\", \"ruff\"]\n\n\
+             [project.scripts]\nserve = \"x.app:main\"\n",
+        );
+        write(dir.path(), "uv.lock", "");
+        let index = ScriptIndex::detect_blocking(dir.path());
+
+        assert_eq!(index.verb_entry("install").unwrap().command, "uv sync");
+        assert_eq!(index.verb_entry("test").unwrap().command, "uv run pytest");
+        assert_eq!(
+            index.verb_entry("lint").unwrap().command,
+            "uv run ruff check"
+        );
+        assert_eq!(
+            index.verb_entry("format").unwrap().command,
+            "uv run ruff format"
+        );
+        // The [project.scripts] entry point is explicit and binds `start`
+        // via its `serve` alias.
+        assert_eq!(index.verbs.get("start").unwrap(), "uv:serve");
+        assert_eq!(index.verb_entry("start").unwrap().command, "uv run serve");
+
+        // Without pytest/ruff declared, none of test/lint/format synthesize.
+        let bare = tempfile::tempdir().unwrap();
+        write(bare.path(), "pyproject.toml", "[project]\nname = \"y\"\n");
+        let bare_index = ScriptIndex::detect_blocking(bare.path());
+        assert!(!bare_index.verbs.contains_key("test"));
+        assert!(!bare_index.verbs.contains_key("lint"));
+    }
+
+    #[test]
+    fn poetry_marker_selects_poetry_runner() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "pyproject.toml",
+            "[tool.poetry]\nname = \"x\"\n\n[tool.poetry.dependencies]\npytest = \"^8\"\n",
+        );
+        let index = ScriptIndex::detect_blocking(dir.path());
+        assert_eq!(
+            index.verb_entry("install").unwrap().command,
+            "poetry install"
+        );
+        assert_eq!(
+            index.verb_entry("test").unwrap().command,
+            "poetry run pytest"
+        );
+    }
+
+    #[test]
+    fn multi_ecosystem_rank_one_wins_then_later_explicit_fills_gaps() {
+        // Node (rank 2) is first: its scripts win; the Makefile (rank 6)
+        // fills verbs node doesn't define.
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "package.json",
+            r#"{"scripts": {"test": "vitest"}}"#,
+        );
+        write(dir.path(), "Makefile", "build:\n\ttrue\ntest:\n\ttrue\n");
+        let index = ScriptIndex::detect_blocking(dir.path());
+        assert_eq!(index.verbs.get("test").unwrap(), "npm:test");
+        assert_eq!(index.verbs.get("build").unwrap(), "make:build");
+        // Synthesized install of the first ecosystem still binds.
+        assert_eq!(index.verbs.get("install").unwrap(), "npm:install");
+    }
+
+    #[test]
+    fn workspace_members_are_indexed_with_their_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "package.json",
+            r#"{"workspaces": ["packages/*"], "scripts": {"build": "true"}}"#,
+        );
+        write(dir.path(), "pnpm-lock.yaml", "");
+        write(
+            dir.path(),
+            "packages/app/package.json",
+            r#"{"scripts": {"dev": "vite"}}"#,
+        );
+        let index = ScriptIndex::detect_blocking(dir.path());
+        let member = index
+            .scripts
+            .iter()
+            .find(|e| e.dir == "packages/app" && e.name == "dev")
+            .expect("member script indexed");
+        assert_eq!(member.id, "pnpm:dev");
+        assert_eq!(member.source, "packages/app/package.json");
+        // Verbs bind at the root only.
+        assert_eq!(index.verbs.get("start"), None);
+        assert_eq!(index.verbs.get("build").unwrap(), "pnpm:build");
+    }
+
+    #[test]
+    fn pnpm_workspace_yaml_and_taskfile_and_composer_and_deno_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "pnpm-workspace.yaml",
+            "# comment\npackages:\n  - docs\n  - '!excluded'\nother:\n  - not-a-package\n",
+        );
+        write(dir.path(), "package.json", r#"{"scripts": {}}"#);
+        write(dir.path(), "pnpm-lock.yaml", "");
+        write(
+            dir.path(),
+            "docs/package.json",
+            r#"{"scripts": {"dev": "next dev"}}"#,
+        );
+        write(
+            dir.path(),
+            "Taskfile.yml",
+            "version: '3'\ntasks:\n  greet:\n    cmds:\n      - echo hi\n  lint:\n    cmds:\n      - true\n",
+        );
+        write(
+            dir.path(),
+            "composer.json",
+            r#"{"scripts": {"post-install-cmd": ["A\\B::hook"], "check": "phpstan"}}"#,
+        );
+        write(
+            dir.path(),
+            "deno.jsonc",
+            "{\n  // a comment\n  \"tasks\": { \"bench\": \"deno bench\" }\n}\n",
+        );
+        let index = ScriptIndex::detect_blocking(dir.path());
+        let has = |id: &str| index.scripts.iter().any(|e| e.id == id);
+        assert!(has("task:greet"), "{:?}", index.scripts);
+        assert!(has("task:lint"));
+        assert!(has("composer:check"));
+        assert!(has("deno:bench"));
+        assert!(
+            index
+                .scripts
+                .iter()
+                .any(|e| e.dir == "docs" && e.id == "pnpm:dev"),
+            "pnpm-workspace member indexed"
+        );
+        assert!(
+            !index.scripts.iter().any(|e| e.dir == "not-a-package"),
+            "keys outside packages: must not enumerate"
+        );
+    }
+
+    #[test]
+    fn go_synthesizes_the_full_verb_set() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "go.mod", "module example.com/x\n");
+        let index = ScriptIndex::detect_blocking(dir.path());
+        assert_eq!(
+            index.verb_entry("install").unwrap().command,
+            "go mod download"
+        );
+        assert_eq!(index.verb_entry("test").unwrap().command, "go test ./...");
+        assert_eq!(index.verb_entry("lint").unwrap().command, "go vet ./...");
+    }
+
+    #[test]
+    fn detection_is_byte_stable() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "package.json",
+            r#"{"scripts": {"b": "1", "a": "2", "c": "3"}}"#,
+        );
+        write(dir.path(), "Makefile", "x:\n\ttrue\n");
+        let a = ScriptIndex::detect_blocking(dir.path());
+        let b = ScriptIndex::detect_blocking(dir.path());
+        assert_eq!(a.render_prompt_section(), b.render_prompt_section());
+        assert_eq!(a.render_list(None), b.render_list(None));
+        assert_eq!(a.to_json().to_string(), b.to_json().to_string());
+    }
+
+    #[test]
+    fn prompt_section_lists_verbs_and_counts_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "package.json",
+            r#"{"scripts": {"build": "next build", "docs:gen": "typedoc"}}"#,
+        );
+        let index = ScriptIndex::detect_blocking(dir.path());
+        let section = index.render_prompt_section().unwrap();
+        assert!(section.starts_with("## Project scripts"));
+        assert!(section.contains("build → npm run build"), "{section}");
+        assert!(section.contains("install → npm install"));
+        assert!(section.contains("more scripts"), "{section}");
+        assert!(section.contains("npm:docs:gen"), "{section}");
+        assert!(section.chars().count() <= PROMPT_SECTION_CHAR_CAP);
+
+        let empty = tempfile::tempdir().unwrap();
+        assert!(
+            ScriptIndex::detect_blocking(empty.path())
+                .render_prompt_section()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn resolve_accepts_verb_id_and_unique_name_and_lists_vocabulary() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "package.json",
+            r#"{"scripts": {"build": "true", "typecheck": "tsc"}}"#,
+        );
+        let index = ScriptIndex::detect_blocking(dir.path());
+        assert_eq!(index.resolve("build", None).unwrap().id, "npm:build");
+        assert_eq!(index.resolve("npm:build", None).unwrap().id, "npm:build");
+        assert_eq!(
+            index.resolve("typecheck", None).unwrap().id,
+            "npm:typecheck"
+        );
+        // The unknown-name error IS the discovery surface: it lists the
+        // bound verbs and the qualified vocabulary.
+        let err = index.resolve("typechek", None).unwrap_err();
+        assert!(err.contains("unknown script `typechek`"), "{err}");
+        assert!(err.contains("npm:typecheck"), "{err}");
+        assert!(err.contains("build"), "{err}");
+        let err = index.resolve("lint", None).unwrap_err();
+        assert!(err.contains("no `lint` script detected"), "{err}");
+    }
+
+    #[test]
+    fn compose_argv_is_shell_free_and_uses_npm_family_separator() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "package.json",
+            r#"{"scripts": {"test": "vitest"}}"#,
+        );
+        write(dir.path(), "Makefile", "lint:\n\ttrue\n");
+        let index = ScriptIndex::detect_blocking(dir.path());
+
+        let test = index.resolve("test", None).unwrap();
+        assert_eq!(
+            compose_argv(test, &["--run".into(), "my file".into()]).join("|"),
+            "npm|run|test|--|--run|my file",
+            "args reach the child verbatim — no shell, no quoting"
+        );
+        let lint = index.resolve("make:lint", None).unwrap();
+        assert_eq!(
+            compose_argv(lint, &["V=1".into()]).join("|"),
+            "make|lint|V=1"
+        );
+        // Synthesized npm install takes plain args (no `--`).
+        let install = index.resolve("install", None).unwrap();
+        assert_eq!(
+            compose_argv(install, &["--frozen-lockfile".into()]).join("|"),
+            "npm|install|--frozen-lockfile"
+        );
+    }
+
+    #[test]
+    fn strip_jsonc_preserves_strings_and_removes_comments() {
+        let src = "{ // c\n \"a\": \"http://x/*y*/\", /* b\n */ \"t\": 1 }";
+        let stripped = strip_jsonc_comments(src);
+        let doc: Value = serde_json::from_str(&stripped).unwrap();
+        assert_eq!(doc.get("a").unwrap(), "http://x/*y*/");
+        assert_eq!(doc.get("t").unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn run_script_tool_executes_indexed_entries_only() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "Makefile", "greet:\n\t@echo hello-from-make\n");
+
+        let out = RunScript
+            .execute(&serde_json::json!({"name": "make:greet"}), dir.path())
+            .await;
+        match &out {
+            ToolOutput::Ok { content } => {
+                assert!(content.contains("PASSED"), "{content}");
+                assert!(content.contains("hello-from-make"), "{content}");
+            }
+            other => panic!("{other:?}"),
+        }
+
+        let out = RunScript
+            .execute(&serde_json::json!({"name": "rm -rf /"}), dir.path())
+            .await;
+        assert!(out.is_error(), "non-indexed input must be refused: {out:?}");
+
+        let out = ListScripts
+            .execute(&serde_json::json!({}), dir.path())
+            .await;
+        match &out {
+            ToolOutput::Ok { content } => assert!(content.contains("make:greet"), "{content}"),
+            other => panic!("{other:?}"),
         }
     }
 }
