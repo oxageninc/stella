@@ -251,8 +251,9 @@ pub async fn run_deck_session(
     // MCP connect is NOT here: it can block up to 10s per server, so it runs
     // after the deck task spawns, narrated as transcript events (#98).
     let provider = agent::build_provider(cfg)?;
-    let registry: Arc<ToolRegistry> =
-        Arc::new(ToolRegistry::new_detected(cfg.workspace_root.clone()).await);
+    let registry: Arc<ToolRegistry> = Arc::new(
+        ToolRegistry::new_detected(cfg.workspace_root.clone(), agent::registry_options(cfg)).await,
+    );
     agent::populate_schema_index(&registry, &cfg.workspace_root);
     crate::rules::enforce_workspace_rules(&registry, &cfg.workspace_root);
     let custom_tools = agent::discover_custom_tools(cfg, true).await;

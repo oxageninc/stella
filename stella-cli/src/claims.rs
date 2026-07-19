@@ -31,6 +31,11 @@
 //! A missing/failed store degrades to no coordination rather than no work —
 //! the same observability-loss-not-work-stoppage contract as every other
 //! store write.
+//!
+//! Coverage note: with `bash` OFF by default (settings `tools.bash`), the
+//! historically documented "bash hole" — shell writes invisible to claim
+//! tracking — is closed in the default configuration; it exists only in
+//! sessions that explicitly opted the shell back in.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -55,8 +60,12 @@ const BUILD_POLL_MS: u64 = 500;
 pub(crate) const STALE_CLAIM_MAX_AGE_SECS: u64 = 6 * 3600;
 
 /// The tools whose successful call mutates the path in their `path` input.
-/// `bash` is the documented hole — a shell can write anything; claims cover
-/// the structured file tools, and the witness/verify ladder covers the rest.
+/// In the DEFAULT configuration this coverage is complete for file writes:
+/// `bash` — historically the documented hole, since a shell can write
+/// anything unattributably — is no longer registered unless the workspace
+/// opts in via settings (`tools.bash: "on"`). Only in an opted-in session
+/// does the hole reopen; claims cover the structured file tools, and the
+/// witness/verify ladder covers the rest.
 fn mutating_path<'i>(name: &str, input: &'i Value) -> Option<&'i str> {
     if matches!(name, "write_file" | "edit_file" | "delete_file") {
         input.get("path").and_then(Value::as_str)

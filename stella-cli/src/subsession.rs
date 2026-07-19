@@ -340,7 +340,8 @@ async fn run_worker(
         Ok(p) => p,
         Err(e) => return (None, 0.0, WorkerEnd::Failed(e)),
     };
-    let registry = ToolRegistry::new_detected(cfg.workspace_root.clone()).await;
+    let registry =
+        ToolRegistry::new_detected(cfg.workspace_root.clone(), agent::registry_options(cfg)).await;
     agent::populate_schema_index(&registry, &cfg.workspace_root);
     crate::rules::enforce_workspace_rules(&registry, &cfg.workspace_root);
 
