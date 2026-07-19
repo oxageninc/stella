@@ -338,6 +338,35 @@ enum ModelsCmd {
     },
 }
 
+/// `stella connect` subcommands — tracker connections consumed by the issue
+/// tools. GitHub uses the OAuth device flow (public client, no secret in the
+/// binary); Linear uses browser OAuth when an app is configured, else a
+/// personal API key. All traffic is user-initiated — connecting is what opts
+/// a workspace into tracker calls.
+#[derive(Subcommand)]
+pub enum ConnectCmd {
+    /// Connect GitHub via the OAuth device flow (or --token to paste a PAT)
+    Github {
+        /// Paste a personal access token instead of running the device flow
+        #[arg(long)]
+        token: bool,
+    },
+    /// Connect Linear via browser OAuth (needs STELLA_LINEAR_CLIENT_ID) or a
+    /// personal API key
+    Linear {
+        /// Paste a personal API key even when an OAuth app is configured
+        #[arg(long)]
+        api_key: bool,
+    },
+    /// Show stored connections, their accounts, and credential precedence
+    Status,
+    /// Forget a stored connection
+    Remove {
+        /// github | linear
+        provider: String,
+    },
+}
+
 /// `stella mcp` subcommands — the scriptable half of the MCP management surface
 /// (the deck's MCP tab is the interactive half; per-session enable/disable and
 /// the masked auth prompt live only there).
