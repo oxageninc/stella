@@ -763,7 +763,10 @@ impl Config {
     }
 
     pub fn print_config(&self) {
-        println!("{}\n", "Stella — Current Configuration".yellow().bold());
+        println!(
+            "{}\n",
+            "Stella — Current Configuration".bright_cyan().bold()
+        );
         println!(
             "  Provider:   {}",
             self.provider.display_name.bright_magenta()
@@ -885,7 +888,7 @@ impl Config {
         };
         println!(
             "{}\n",
-            "Stella — Available Providers & Models".yellow().bold()
+            "Stella — Available Providers & Models".bright_cyan().bold()
         );
         let key_status = |p: &ProviderConfig, settings_key: bool| {
             let has_key = settings_key
