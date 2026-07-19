@@ -9,6 +9,7 @@
 pub mod agent_use;
 pub mod bash;
 pub mod ci;
+pub mod code_map;
 pub mod custom;
 pub mod delete;
 pub mod edit;
@@ -25,9 +26,11 @@ pub mod issue_ops;
 pub mod issues;
 pub mod media;
 pub mod memory;
+pub mod process;
 pub mod project;
 pub mod read;
 pub mod registry;
+pub mod repo;
 pub mod sandbox;
 pub mod schema_gate;
 pub mod screenshot;
@@ -38,7 +41,7 @@ pub mod validate;
 pub mod verify;
 pub mod write;
 
-pub use registry::ToolRegistry;
+pub use registry::{RegistryOptions, ToolRegistry};
 
 /// Resolve `path` against `root` and verify the result stays inside `root`.
 ///
