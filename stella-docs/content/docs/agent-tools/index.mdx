@@ -181,7 +181,11 @@ X-Tenant = "acme"
 ```
 
 <Callout type="warn">
-`web_auth.toml` holds live session secrets — treat it like `credentials.toml`. Stella redacts the values from its own logs and never echoes them into a tool result, but the file itself is plaintext: restrict it to owner-only (`chmod 600`). Unknown keys are a hard parse error, and a broken file makes every web tool fail loudly rather than silently fetching unauthenticated. Cookies and `Authorization` are dropped on cross-host redirects.
+`web_auth.toml` holds live session secrets — treat it like `credentials.toml`. Stella redacts the values from its own logs and never echoes them into a tool result, but the file itself is plaintext: restrict it to owner-only (`chmod 600`). Unknown keys are a hard parse error, and a broken file makes every web tool fail loudly rather than silently fetching unauthenticated. `cookie` and `authorization` are dropped on a cross-host redirect; a secret in a custom `headers` entry is **not** — it would follow the redirect, so only put secrets in custom headers for hosts you trust to redirect.
+</Callout>
+
+<Callout type="warn">
+**No network allowlist.** With the opt-in on, the agent can fetch any `http(s)` URL the host can reach — including `localhost`, private ranges, and cloud metadata endpoints. This is deliberate: it matches the `bash` opt-in and is what makes *"read my internal tool"* or *"scrape my localhost dev server"* work. The gate is the settings opt-in itself, not a per-URL filter — so enable `web` where you'd be comfortable enabling `bash`, and be aware that a page the agent fetches could try to steer it toward an internal URL (prompt injection). Combine with [`PreToolUse` hooks or `guard-tool` rules](/docs/agent-tools/permissions) if you need to constrain destinations.
 </Callout>
 
 ### Session tools

@@ -11,8 +11,17 @@
 //! Logged-in fetches ride the user's own sessions via
 //! `~/.config/stella/web_auth.toml` (override with `STELLA_WEB_AUTH_FILE`):
 //! per-domain cookies/headers are injected at request time and never appear
-//! in tool output, so the secrets never enter the model's context. Reqwest
-//! drops the sensitive headers on cross-host redirects.
+//! in tool output, so the secrets never enter the model's context. reqwest
+//! strips `Cookie`/`Authorization` on a cross-host redirect; a secret placed
+//! in a custom `[domains.x.headers]` entry is NOT in reqwest's sensitive set
+//! and would follow the redirect, so scope custom-header secrets to hosts
+//! you trust to redirect.
+//!
+//! No SSRF guard: an opted-in session can fetch any http(s) URL the host can
+//! reach — including `localhost` and cloud metadata endpoints. This is
+//! deliberate (matching the `bash` opt-in, and required for the "fetch my
+//! internal tool / dev server" use case); the gate is the settings opt-in,
+//! not a network allowlist.
 //!
 //! Fetch/extract are `read_only` (they observe the web, not the workspace);
 //! `web_download` writes through [`crate::resolve_within_root`] and is
