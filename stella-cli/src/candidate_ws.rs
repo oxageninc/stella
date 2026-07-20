@@ -125,8 +125,33 @@ async fn copy_preserving_mtime(src: &Path, dst: &Path) -> std::io::Result<()> {
     tokio::fs::copy(src, dst).await?;
     let meta = tokio::fs::metadata(src).await?;
     if let Ok(modified) = meta.modified() {
-        let dst_file = std::fs::OpenOptions::new().write(true).open(dst)?;
-        dst_file.set_times(std::fs::FileTimes::new().set_modified(modified))?;
+        // `std::fs::copy` copies the source's permission bits, so a read-only
+        // source (e.g. a `chmod 444` untracked artifact) yields a read-only
+        // `dst`. Opening that `.write(true)` to stamp the mtime would fail
+        // with EACCES for the owner, aborting the whole candidate snapshot.
+        // Temporarily clear the read-only bit, set the time, then restore the
+        // original permissions so the snapshot's mode still mirrors the real
+        // tree.
+        let perms = meta.permissions();
+        let restore = if perms.readonly() {
+            let mut writable = perms.clone();
+            writable.set_readonly(false);
+            std::fs::set_permissions(dst, writable)?;
+            Some(perms)
+        } else {
+            None
+        };
+        let res = std::fs::OpenOptions::new()
+            .write(true)
+            .open(dst)
+            .and_then(|dst_file| {
+                dst_file.set_times(std::fs::FileTimes::new().set_modified(modified))
+            });
+        if let Some(perms) = restore {
+            // Restore the original read-only bits regardless of the result.
+            let _ = std::fs::set_permissions(dst, perms);
+        }
+        res?;
     }
     Ok(())
 }
