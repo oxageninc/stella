@@ -17,7 +17,7 @@
 //! surface the problem where it's cheap to fix, not to gate.
 
 use crate::config::{PROVIDERS, ProviderConfig};
-use crate::engine_config::parse_model_spec;
+use crate::engine_config::{ModelSpec, model_spec_for, parse_model_spec};
 use crate::model_catalog::validate_model_slug;
 use crate::settings::{AgentEngineConfig, EngineAgentKind};
 use stella_model::catalog::Catalog;
@@ -49,32 +49,6 @@ fn kind_label(kind: EngineAgentKind) -> &'static str {
         EngineAgentKind::Judge => "judge",
         EngineAgentKind::Triage => "triage",
     }
-}
-
-/// Every model reference the settings pin, paired with its location. Covers
-/// `default_model`, each agent's explicit `model`, and every `allowed_models`
-/// candidate — the full set of strings that can reach model resolution.
-fn model_refs(engine: &AgentEngineConfig) -> Vec<(String, String)> {
-    let mut refs: Vec<(String, String)> = Vec::new();
-    if let Some(model) = &engine.default_model {
-        refs.push(("default_model".to_string(), model.clone()));
-    }
-    for kind in [
-        EngineAgentKind::Default,
-        EngineAgentKind::Worker,
-        EngineAgentKind::Judge,
-        EngineAgentKind::Triage,
-    ] {
-        if let Some(agent) = engine.agent(kind)
-            && let Some(model) = &agent.model
-        {
-            refs.push((format!("agents.{}.model", kind_label(kind)), model.clone()));
-        }
-    }
-    for (i, model) in engine.allowed_models().iter().enumerate() {
-        refs.push((format!("allowed_models[{i}]"), model.clone()));
-    }
-    refs
 }
 
 /// Whether this provider's seed-catalog ids are vendor-namespaced (carry a
@@ -120,10 +94,43 @@ fn wire_shape_issue(provider: &str, wire: &str) -> Option<String> {
     None
 }
 
-/// Validate one configured spec, resolving it to its wire slug exactly as the
-/// engine would. `None` means "no problem I can prove" (valid, a provider pin
-/// with no model — the provider default answers — or a settings-defined
-/// provider whose endpoint is the authority).
+/// Validate an already-resolved [`ModelSpec`] — the wire slug exactly as the
+/// engine would send it — against the provider catalog. `None` means "no
+/// problem I can prove" (valid, a provider pin with no model — the provider
+/// default answers — or a settings-defined provider whose endpoint is the
+/// authority). `value` is the user's original string, echoed back in the
+/// warning so it points at what they actually typed.
+fn check_resolved_spec(location: &str, value: &str, spec: &ModelSpec) -> Option<SettingsIssue> {
+    // A provider pin with no slug rides the provider's own default model.
+    if spec.model.is_empty() {
+        return None;
+    }
+    // Only built-in providers have a catalog to validate against; a
+    // settings-defined custom endpoint is its own authority (mirrors
+    // `validate_model_slug`'s local/never-synced posture) — `?` skips it.
+    let provider_config = PROVIDERS.iter().find(|p| p.id == spec.provider)?;
+    // Wire-shape checks first — they catch the over-qualified / de-namespaced
+    // slugs the alias-tolerant catalog resolve would wave through.
+    if let Some(message) = wire_shape_issue(&spec.provider, &spec.model) {
+        return Some(SettingsIssue {
+            location: location.to_string(),
+            value: value.to_string(),
+            message,
+        });
+    }
+    match validate_model_slug(provider_config, &spec.model) {
+        Ok(()) => None,
+        Err(message) => Some(SettingsIssue {
+            location: location.to_string(),
+            value: value.to_string(),
+            message,
+        }),
+    }
+}
+
+/// Validate one configured model STRING (a `provider/slug` or bare slug with
+/// no separate `provider` field — `default_model`, `allowed_models`),
+/// resolving it to its wire slug exactly as the engine would.
 fn check_spec(
     location: &str,
     raw: &str,
@@ -142,42 +149,68 @@ fn check_spec(
                 .to_string(),
         });
     };
-    // A provider pin with no slug rides the provider's own default model.
-    if spec.model.is_empty() {
-        return None;
-    }
-    // Only built-in providers have a catalog to validate against; a
-    // settings-defined custom endpoint is its own authority (mirrors
-    // `validate_model_slug`'s local/never-synced posture) — `?` skips it.
-    let provider_config = PROVIDERS.iter().find(|p| p.id == spec.provider)?;
-    // Wire-shape checks first — they catch the over-qualified / de-namespaced
-    // slugs the alias-tolerant catalog resolve would wave through.
-    if let Some(message) = wire_shape_issue(&spec.provider, &spec.model) {
-        return Some(SettingsIssue {
-            location: location.to_string(),
-            value: trimmed.to_string(),
-            message,
-        });
-    }
-    match validate_model_slug(provider_config, &spec.model) {
-        Ok(()) => None,
-        Err(message) => Some(SettingsIssue {
-            location: location.to_string(),
-            value: trimmed.to_string(),
-            message,
-        }),
-    }
+    check_resolved_spec(location, trimmed, &spec)
 }
 
-/// Validate every model reference in the engine settings.
+/// Validate every model reference in the engine settings. Per-agent `model`
+/// entries are resolved through the engine's own [`model_spec_for`], so the
+/// check honors the agent's explicit `provider` field (a set `provider` sends
+/// `model` VERBATIM as the wire slug — no `provider/slug` split) and validates
+/// against the exact provider the request will hit. `default_model` and each
+/// `allowed_models` candidate are plain `provider/slug` strings, parsed as
+/// `--model` semantics.
 pub fn check_engine_settings(
     engine: &AgentEngineConfig,
     is_provider: &dyn Fn(&str) -> bool,
 ) -> Vec<SettingsIssue> {
-    model_refs(engine)
-        .into_iter()
-        .filter_map(|(location, raw)| check_spec(&location, &raw, is_provider))
-        .collect()
+    let mut issues = Vec::new();
+    if let Some(model) = &engine.default_model
+        && let Some(issue) = check_spec("default_model", model, is_provider)
+    {
+        issues.push(issue);
+    }
+    for kind in [
+        EngineAgentKind::Default,
+        EngineAgentKind::Worker,
+        EngineAgentKind::Judge,
+        EngineAgentKind::Triage,
+    ] {
+        // Only validate an agent's OWN explicit `model` pin here; the flat /
+        // `default_model` fallbacks are covered by their own locations above.
+        let Some(agent) = engine.agent(kind) else {
+            continue;
+        };
+        let Some(raw) = agent.model.as_deref() else {
+            continue;
+        };
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let location = format!("agents.{}.model", kind_label(kind));
+        // Resolve exactly as the engine does — honoring `agent.provider`.
+        match model_spec_for(engine, kind, is_provider) {
+            Some(spec) => {
+                if let Some(issue) = check_resolved_spec(&location, trimmed, &spec) {
+                    issues.push(issue);
+                }
+            }
+            // No pinned provider and the string names no known provider /
+            // seed slug: fall back to the plain-string diagnostic so a typo'd
+            // per-agent slug still surfaces as `unrecognized`.
+            None => {
+                if let Some(issue) = check_spec(&location, trimmed, is_provider) {
+                    issues.push(issue);
+                }
+            }
+        }
+    }
+    for (i, model) in engine.allowed_models().iter().enumerate() {
+        if let Some(issue) = check_spec(&format!("allowed_models[{i}]"), model, is_provider) {
+            issues.push(issue);
+        }
+    }
+    issues
 }
 
 /// The launch entry point: validate every configured model reference plus
@@ -291,6 +324,38 @@ mod tests {
     #[test]
     fn a_valid_resolved_model_is_not_flagged() {
         assert!(check_resolved_model(openrouter(), "openrouter/auto").is_none());
+    }
+
+    #[test]
+    fn per_agent_provider_pin_is_sent_verbatim_not_split() {
+        // A judge pinned to OpenRouter with a slug that itself contains `/`:
+        // the engine sends `openai/gpt-6` VERBATIM to OpenRouter (unseeded →
+        // its endpoint is the authority), so the check must NOT re-split the
+        // slug and validate the phantom `openai/gpt-6` against the OpenAI
+        // catalog (where `gpt-6` does not exist) — that was a false positive.
+        let engine: AgentEngineConfig = serde_json::from_str(
+            r#"{ "agents": { "judge": { "provider": "openrouter", "model": "openai/gpt-6" } } }"#,
+        )
+        .unwrap();
+        assert!(
+            check_engine_settings(&engine, &is_seed_provider).is_empty(),
+            "an OpenRouter-pinned verbatim slug must not be flagged"
+        );
+    }
+
+    #[test]
+    fn per_agent_provider_pin_validates_the_pinned_provider() {
+        // With no explicit `provider`, `openai/nope` splits to the OpenAI
+        // catalog and is correctly flagged (the string carries its own
+        // routing).
+        let engine: AgentEngineConfig = serde_json::from_str(
+            r#"{ "agents": { "judge": { "model": "openai/nope" } } }"#,
+        )
+        .unwrap();
+        let issues = check_engine_settings(&engine, &is_seed_provider);
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert_eq!(issues[0].location, "agents.judge.model");
+        assert_eq!(issues[0].value, "openai/nope");
     }
 
     #[test]
