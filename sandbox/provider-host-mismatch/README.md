@@ -50,6 +50,12 @@ alias stella_dev='./target/release/stella \
   --base-url https://api.z.ai/api/coding/paas/v4'
 ```
 
+`zai/glm-4.6` and `zai/glm-5.2` (the flagship) are both valid — verified by
+completing a real turn on the Z.ai coding endpoint. `stella models list
+--provider zai` prints every current slug if you want a different one; pick one
+that appears there, since the `run` path (unlike `config`) rejects any slug not
+in the catalog.
+
 Confirm before launching the TUI:
 
 ```sh
