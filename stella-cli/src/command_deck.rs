@@ -43,9 +43,16 @@
 //!   truncates the partial turn out of the conversation so the next prompt
 //!   starts from the last committed state. Never a mid-await corruption — the
 //!   dropped future takes its channel senders with it and the forwarder
-//!   drains what was already emitted. After a plain cancel the loop pops the
-//!   next queued prompt as usual ("interrupt current, run next" — the deck's
-//!   single Esc). A double-Esc `StopAndHold` is the same clean cancel plus
+//!   drains what was already emitted. The deck's single Esc is the SOFT stop
+//!   for step-loop lead turns (the engine ends at the next step boundary,
+//!   keeping completed work — `stella_core::SOFT_STOP_REASON`); pipeline
+//!   turns and worker lanes cancel immediately (a pipeline is a multi-stage
+//!   flow with no single soft-stop continuation). Mid-turn `>` steering,
+//!   though, reaches BOTH lead turn shapes — the step-loop engine and the
+//!   pipeline's execute engine both drain the steering tap at their step
+//!   boundaries. After a cancel the loop pops the next queued prompt as
+//!   usual ("interrupt current, run next").
+//!   A double-Esc `StopAndHold` is the immediate clean cancel plus
 //!   queue discipline: the interrupted prompt returns to the FRONT of the
 //!   backlog and dispatch parks until the user's next submission, which
 //!   arrives as `EnqueueFront` and runs ahead of it. The pair reaches the
@@ -1158,6 +1165,10 @@ pub async fn run_deck_session(
             });
         }
 
+        // Shared with the live input arms below: `>` steers, Esc soft-stops.
+        // Per-turn by construction — a stop latched here can't leak into
+        // the next turn.
+        let steering = subsession::SteeringTap::default();
         let end = {
             // Both arms return `Result<(), String>`, so one pinned future
             // drives either path through the same select loop.
@@ -1179,6 +1190,7 @@ pub async fn run_deck_session(
                         &sup_tx,
                         &lead_holder,
                         &discovery_activation,
+                        &steering,
                     )
                     .await
                 } else {
@@ -1197,6 +1209,7 @@ pub async fn run_deck_session(
                         &sup_tx,
                         &lead_holder,
                         &discovery_activation,
+                        &steering,
                     )
                     .await
                 }
@@ -1241,6 +1254,14 @@ pub async fn run_deck_session(
                         | Some(WorkspaceInput::ToAgent {
                             input: UserInput::Prompt { text, .. }, ..
                         }) => {
+                            // `>`-prefix = steer THIS turn (step-boundary
+                            // injection; the `Steered` event is the ack).
+                            // Works for both the step-loop lead turn and the
+                            // pipeline execute engine — both drain the tap.
+                            if let Some(steer) = text.trim_start().strip_prefix('>') {
+                                steering.push(steer.trim_start().to_string());
+                                continue;
+                            }
                             queue.push_back(text);
                             subsession::drain_queue(
                                 &mut queue,
@@ -1280,9 +1301,29 @@ pub async fn run_deck_session(
                             control: stella_tui::AgentControl::Stop, agent,
                         }) => {
                             if agent == LEAD {
-                                break TurnEnd::Cancelled { hold: false };
+                                // Pipeline turns accept mid-turn `>` steering
+                                // (the execute engine drains the tap) but the
+                                // STOP stays a hard cancel: a pipeline is
+                                // triage→…→judge, so a mid-execute soft stop
+                                // has no single obvious continuation. Only the
+                                // step-loop turn soft-stops.
+                                if pipeline_on {
+                                    break TurnEnd::Cancelled { hold: false };
+                                }
+                                // First Esc = SOFT stop: end at the next
+                                // boundary keeping completed steps. The
+                                // pair's second press (StopAndHold below)
+                                // stays the immediate hard cancel.
+                                steering.request_soft_stop();
+                                let _ = in_tx.send(Inbound::Event {
+                                    agent: LEAD.to_string(),
+                                    event: AgentEvent::Text {
+                                        delta: "\n[stopping at the next step boundary — Esc again to cancel immediately]\n".to_string(),
+                                    },
+                                });
+                            } else {
+                                subs.stop(&agent);
                             }
-                            subs.stop(&agent);
                         }
                         // Worker Pause/Resume/Restart while the lead works.
                         Some(WorkspaceInput::Control { agent, control }) if agent != LEAD => {
@@ -1451,15 +1492,27 @@ pub async fn run_deck_session(
         match end {
             TurnEnd::Finished(outcome) => {
                 if let Err(reason) = &outcome {
-                    // An aborted turn emits no `Complete`; this row flips the
-                    // dashboard to failed AND clears any pending gate.
-                    let _ = in_tx.send(Inbound::Event {
-                        agent: LEAD.to_string(),
-                        event: AgentEvent::Error {
-                            message: reason.clone(),
-                            retryable: false,
-                        },
-                    });
+                    if reason == stella_core::SOFT_STOP_REASON {
+                        // A user choice, not a failure: no Error row — the
+                        // work is kept and the next prompt continues from it.
+                        let _ = in_tx.send(Inbound::Event {
+                            agent: LEAD.to_string(),
+                            event: AgentEvent::Text {
+                                delta: "\n[stopped at the step boundary — completed work kept]\n"
+                                    .to_string(),
+                            },
+                        });
+                    } else {
+                        // An aborted turn emits no `Complete`; this row flips
+                        // the dashboard to failed AND clears any pending gate.
+                        let _ = in_tx.send(Inbound::Event {
+                            agent: LEAD.to_string(),
+                            event: AgentEvent::Error {
+                                message: reason.clone(),
+                                retryable: false,
+                            },
+                        });
+                    }
                 }
                 agent::record_turn_episode(
                     &memory,
@@ -3098,8 +3151,11 @@ fn deck_reserved() -> Vec<&'static str> {
 /// Build an [`Inbound::EngineConfig`] snapshot: the freshly merged
 /// `agent_engine_config` from the settings scope chain, plus the picker
 /// vocabularies — every provider whose credential currently resolves, and
-/// the seed catalog's `provider/slug` list as the model-picker fallback
-/// when `allowed_models` is empty. Re-reading the chain (rather than
+/// the catalog's `provider/slug` list as the model-picker fallback when
+/// `allowed_models` is empty. The model list is scoped to those same
+/// credentialed providers (plus the session's active one): a model you
+/// have no key for is not an option, and offering it anyway was exactly
+/// the "selectable but unusable" bug. Re-reading the chain (rather than
 /// caching) keeps the overlay honest about hand edits and about what a
 /// save at one scope means under the others.
 fn engine_config_inbound(cfg: &Config, status: Option<String>) -> Inbound {
@@ -3111,13 +3167,51 @@ fn engine_config_inbound(cfg: &Config, status: Option<String>) -> Inbound {
         .into_iter()
         .map(|p| p.config.id.to_string())
         .collect();
-    let catalog_models: Vec<String> = stella_model::catalog::Catalog::current()
+    // The session's provider is always usable — its credential resolved at
+    // startup (possibly interactively, which discovery never does).
+    let mut usable: std::collections::HashSet<&str> =
+        providers.iter().map(String::as_str).collect();
+    usable.insert(cfg.provider.id);
+    let catalog = stella_model::catalog::Catalog::current();
+    let mut catalog_models: Vec<String> = Vec::new();
+    let mut model_efforts: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    for entry in catalog
         .entries()
         .iter()
-        .map(|entry| format!("{}/{}", entry.provider, entry.id))
-        .collect();
+        .filter(|entry| usable.contains(entry.provider.as_str()))
+    {
+        let spec = format!("{}/{}", entry.provider, entry.id);
+        let levels = crate::engine_config::effort_levels(
+            &entry.provider,
+            crate::config::PROVIDERS
+                .iter()
+                .find(|p| p.id == entry.provider)
+                .map(|p| p.dialect)
+                .unwrap_or(crate::config::Dialect::OpenaiCompatible),
+            entry.supports_reasoning,
+        );
+        model_efforts.insert(spec.clone(), levels.iter().map(|s| s.to_string()).collect());
+        catalog_models.push(spec);
+    }
+    // `allowed_models` specs are picker entries too — give each its effort
+    // vocabulary so the effort row is model-aware under a restriction.
+    for raw in engine.allowed_models() {
+        if model_efforts.contains_key(raw) {
+            continue;
+        }
+        if let Some(spec) = crate::engine_config::parse_model_spec(raw, &|id| usable.contains(id)) {
+            let levels = crate::engine_config::effort_levels_for_spec(&spec.provider, &spec.model);
+            model_efforts.insert(raw.clone(), levels.iter().map(|s| s.to_string()).collect());
+        }
+    }
     Inbound::EngineConfig {
-        state: crate::engine_config::state_from_settings(&engine, providers, catalog_models),
+        state: crate::engine_config::state_from_settings(
+            &engine,
+            providers,
+            catalog_models,
+            model_efforts,
+        ),
         status,
     }
 }
@@ -3939,6 +4033,7 @@ async fn run_lead_turn(
     sup_tx: &UnboundedSender<SupervisorMsg>,
     claim_holder: &str,
     activated: &crate::discovery::ActivatedTools,
+    steering: &subsession::SteeringTap,
 ) -> Result<(), String> {
     budget.begin_turn();
 
@@ -3995,7 +4090,8 @@ async fn run_lead_turn(
             agent::engine_config_for(cfg),
             &TokioSleeper,
         )
-        .with_calibration(calibration);
+        .with_calibration(calibration)
+        .with_steering(steering);
         if let Some(hooks) = &cfg.hooks {
             engine = engine.with_hooks(hooks, &hook_runner);
         }
@@ -4075,6 +4171,7 @@ async fn run_lead_pipeline_turn(
     sup_tx: &UnboundedSender<SupervisorMsg>,
     claim_holder: &str,
     activated: &crate::discovery::ActivatedTools,
+    steering: &subsession::SteeringTap,
 ) -> Result<(), String> {
     budget.begin_turn();
 
@@ -4131,15 +4228,7 @@ async fn run_lead_pipeline_turn(
         let breaker = CircuitBreaker::new(Box::new(SystemClock::new()));
         let router = Router::new(wiring.pins.clone(), wiring.profiles.clone(), breaker);
 
-        let repo_structure = agent::GitRepoStructure {
-            root: cfg.workspace_root.clone(),
-        };
-        let repo_status = agent::GitRepoStatus {
-            root: cfg.workspace_root.clone(),
-        };
-        let command_runner = agent::ShellCommandRunner {
-            root: cfg.workspace_root.clone(),
-        };
+        let ws_ports = agent::workspace_ports(cfg.workspace_root.clone(), cfg);
         let no_recall = NoContextRecall;
         let recall: &dyn ContextRecallPort = match memory {
             Some(m) => m,
@@ -4151,15 +4240,19 @@ async fn run_lead_pipeline_turn(
             providers: &resolver,
             tools: &tapped,
             recall,
-            repo: &repo_structure,
-            repo_status: &repo_status,
-            commands: &command_runner,
+            repo: &ws_ports.repo_structure,
+            repo_status: &ws_ports.repo_status,
+            commands: &ws_ports.command_runner,
             approvals: &AutoApproveGate,
             sleeper: &TokioSleeper,
             hooks: cfg
                 .hooks
                 .as_ref()
                 .map(|h| (h, &hook_runner as &dyn stella_core::hooks::HookRunner)),
+            candidate_workspaces: Some(&ws_ports.candidate_workspaces),
+            // The deck's per-turn tap: `>` steers the execute engine mid-turn
+            // (the same tap the step-loop lead turn uses).
+            steering: Some(steering),
         };
         let config = PipelineConfig {
             engine: agent::pipeline_engine_config_for(cfg),

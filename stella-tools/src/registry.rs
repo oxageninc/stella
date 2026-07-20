@@ -148,6 +148,11 @@ pub struct RegistryOptions {
     /// the model never sees the schema, and calling `bash` anyway returns
     /// the standard unknown-tool error.
     pub bash: bool,
+    /// Register the web family (`web_fetch`, `web_extract_assets`,
+    /// `web_download`, and `web_search` when a BYOK search key is present).
+    /// Off by default everywhere — network egress is opt-in exactly like
+    /// the shell (settings `tools.web: "on"`).
+    pub web: bool,
 }
 
 impl ToolRegistry {
@@ -272,6 +277,21 @@ impl ToolRegistry {
         // policy enforced at the tool boundary, not by prompt discipline.
         if options.bash {
             entries.push(Arc::new(crate::bash::Bash));
+        }
+        // The web family is OPT-IN like bash (`tools.web: "on"`): a fetched
+        // page is untrusted input AND an uncontrolled egress channel, so
+        // network access is never ambient. `web_search` additionally needs a
+        // BYOK search key — no key, no dead schema, mirroring the media
+        // tools' conditional registration.
+        if options.web {
+            let auth: Arc<crate::web::WebAuthState> =
+                Arc::new(crate::web::WebAuthConfig::load_default());
+            entries.push(Arc::new(crate::web::WebFetch(auth.clone())));
+            entries.push(Arc::new(crate::web::WebExtractAssets(auth.clone())));
+            entries.push(Arc::new(crate::web::WebDownload(auth)));
+            if let Some(search) = crate::web::detect_search_backend() {
+                entries.push(Arc::new(crate::web::WebSearch(search)));
+            }
         }
         // The code-graph query tool exists only when `stella init` has built
         // an index — same conditional-registration discipline as the issue
@@ -571,13 +591,11 @@ impl ToolRegistry {
         };
         if let Some(bus) = &bus {
             let duration_ms = started_at.elapsed().as_millis() as u64;
-            // The command line the tool actually ran: bash's own input, or
-            // run_script's index-resolved command.
-            let command_line: Option<&str> = match name {
-                "bash" => Some(input.get("command").and_then(|v| v.as_str()).unwrap_or("")),
-                "run_script" => resolved_script_command.as_deref(),
-                _ => None,
-            };
+            // The command line the tool actually ran: bash's own input,
+            // run_script's index-resolved command, or start_process's
+            // joined argv.
+            let command_line =
+                Self::command_line_for(name, input, resolved_script_command.as_deref());
             match &output {
                 ToolOutput::Error { message } => {
                     bus.emit_named(
@@ -586,7 +604,7 @@ impl ToolRegistry {
                             "tool": name, "error": message, "duration_ms": duration_ms,
                         }),
                     );
-                    if let Some(command) = command_line {
+                    if let Some(command) = command_line.as_deref() {
                         bus.emit_named(
                             hook_names::COMMAND_FAILED,
                             serde_json::json!({ "command": command, "error": message }),
@@ -598,7 +616,7 @@ impl ToolRegistry {
                         hook_names::TOOL_CALL_COMPLETED,
                         serde_json::json!({ "tool": name, "duration_ms": duration_ms }),
                     );
-                    if let Some(command) = command_line {
+                    if let Some(command) = command_line.as_deref() {
                         bus.emit_named(
                             hook_names::COMMAND_COMPLETED,
                             serde_json::json!({ "command": command }),
@@ -665,7 +683,7 @@ impl ToolRegistry {
                 let mut hits: Vec<String> = coverage
                     .by_path
                     .iter()
-                    .filter(|(path, _)| haystack.contains(path.as_str()))
+                    .filter(|(path, _)| mentions_path(&haystack, path))
                     .flat_map(|(_, slices)| slices.iter().cloned())
                     .filter(|slice| !coverage.hinted.contains(slice))
                     .collect();
@@ -738,9 +756,10 @@ impl ToolRegistry {
     /// detectors for one already-final input: `sensitive_operation.detected`
     /// and `secret.detected` observers first (an auditor sees the attempt
     /// even when a policy then denies it), then the `file.*` chain for a
-    /// classified C/U/D op and the `command.started` chain for `bash` and
-    /// `run_script` (`resolved_command` is the latter's index-resolved
-    /// command line).
+    /// classified C/U/D op and the `command.started` chain for `bash`,
+    /// `run_script`, and `start_process` (`resolved_command` is
+    /// `run_script`'s index-resolved command line; see
+    /// [`Self::command_line_for`]).
     /// These chains gate — `modify` decisions are recorded but not honored
     /// here, because the input was already final after
     /// `tool.call.requested`. Reads are observable but never interceptable.
@@ -816,12 +835,8 @@ impl ToolRegistry {
                 }
             }
         }
-        let command_line: Option<&str> = match name {
-            "bash" => Some(input.get("command").and_then(|v| v.as_str()).unwrap_or("")),
-            "run_script" => resolved_command,
-            _ => None,
-        };
-        if let Some(command) = command_line {
+        let command_line = Self::command_line_for(name, input, resolved_command);
+        if let Some(command) = command_line.as_deref() {
             let outcome = bus.emit_blocking(HookEventDraft::new(
                 hook_names::COMMAND_STARTED,
                 serde_json::json!({ "command": command }),
@@ -900,6 +915,63 @@ impl ToolRegistry {
         index.session.extend(pass.created.iter().cloned());
     }
 
+    /// The live storage map for the gate: the persisted index + manifest,
+    /// re-read per gated write (so a mid-session `stella init` or manifest
+    /// edit is seen immediately), merged with the host-seeded baseline and
+    /// the objects created by earlier writes this session (covers the
+    /// watcher's re-index lag).
+    fn storage_snapshot(&self) -> stella_graph::StorageSnapshot {
+        let mut snapshot = stella_graph::load_storage_snapshot(&self.root);
+        let index = self.storage_index.lock().unwrap_or_else(|p| p.into_inner());
+        for rel in index.baseline.relations.iter().chain(index.session.iter()) {
+            if let Some(existing) = snapshot
+                .relations
+                .iter_mut()
+                .find(|r| r.address == rel.address)
+            {
+                // Same relation known from disk: union in any fields the
+                // overlay knows about that the index hasn't caught up on.
+                for field in &rel.fields {
+                    let key = stella_graph::storage::normalize_name(&field.name);
+                    if !existing
+                        .fields
+                        .iter()
+                        .any(|f| stella_graph::storage::normalize_name(&f.name) == key)
+                    {
+                        existing.fields.push(field.clone());
+                    }
+                }
+            } else {
+                snapshot.relations.push(rel.clone());
+            }
+        }
+        snapshot
+    }
+
+    /// Record what a landed write created: grow the session overlay, and —
+    /// when the model declared a `storage_intent` — append it to
+    /// `stella.storage.toml` (origin `declared`). The gate's justification
+    /// path is what populates the map: every challenged object is born
+    /// documented (spec §8 ring 3).
+    fn record_storage_objects(&self, pass: &crate::schema_gate::GatePass, intent: Option<&str>) {
+        if let Some(intent) = intent {
+            for address in &pass.intent_addresses {
+                let _ = stella_graph::manifest::append_meaning(
+                    &self.root,
+                    "relations",
+                    address,
+                    intent,
+                    "declared",
+                );
+            }
+        }
+        if pass.created.is_empty() {
+            return;
+        }
+        let mut index = self.storage_index.lock().unwrap_or_else(|p| p.into_inner());
+        index.session.extend(pass.created.iter().cloned());
+    }
+
     /// `[C|R|U|D]`-classify a call: reads → R, writes → C (new) or U
     /// (existing), edits → U, deletes → D. The path is normalized to its
     /// workspace-relative POSIX form here, so equivalent spellings
@@ -916,7 +988,9 @@ impl ToolRegistry {
             "read_file" => FileOp::Read,
             "edit_file" => FileOp::Update,
             "delete_file" => FileOp::Delete,
-            "write_file" => {
+            // `web_download` lands a file exactly like `write_file`, so it
+            // takes the same ledger classification and hook gating.
+            "write_file" | "web_download" => {
                 if full.exists() {
                     FileOp::Update
                 } else {
@@ -1150,6 +1224,35 @@ impl ToolRegistry {
     }
 }
 
+/// True when `haystack` mentions `path` as a whole path token: the hit may
+/// not extend into path characters on either side, so a map covering
+/// `lib.rs` never fires on `mylib.rs` or `graphlib.rs` — a false positive
+/// would permanently consume that map's once-per-session coverage hint.
+fn mentions_path(haystack: &str, path: &str) -> bool {
+    if path.is_empty() {
+        return false;
+    }
+    let is_path_char = |c: char| c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | '/');
+    let mut from = 0;
+    while let Some(pos) = haystack[from..].find(path) {
+        let start = from + pos;
+        let end = start + path.len();
+        // A preceding `/` is a component boundary, not an embedding: search
+        // results routinely print the workspace-relative map path with an
+        // absolute prefix (`/tmp/ws/covered.rs` covers `covered.rs`).
+        let clear_before = !haystack[..start]
+            .chars()
+            .next_back()
+            .is_some_and(|c| is_path_char(c) && c != '/');
+        let clear_after = !haystack[end..].chars().next().is_some_and(is_path_char);
+        if clear_before && clear_after {
+            return true;
+        }
+        from = end;
+    }
+    false
+}
+
 /// Fallback audit-log reason when the model omitted the tool's optional
 /// `reason` field — the schema requires a non-empty human-readable string.
 fn default_reason(op: FileOp) -> &'static str {
@@ -1190,6 +1293,27 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let reg = ToolRegistry::with_issue_backend(root.path().to_path_buf(), issue_backend);
         (root, reg)
+    }
+
+    /// A coverage hint must fire only on whole path tokens — a substring hit
+    /// (`lib.rs` inside `mylib.rs`) would permanently burn the map's
+    /// once-per-session hint on a file it doesn't cover.
+    #[test]
+    fn mentions_path_requires_token_boundaries() {
+        assert!(mentions_path("src/lib.rs:12: pub fn x()", "src/lib.rs"));
+        assert!(mentions_path("lib.rs", "lib.rs"));
+        // An absolute spelling of a covered relative path still matches.
+        assert!(mentions_path("/tmp/ws/src/lib.rs:3: fn y()", "src/lib.rs"));
+        assert!(mentions_path(
+            "see `core/driver.rs` for the loop",
+            "core/driver.rs"
+        ));
+        assert!(!mentions_path("mylib.rs:3: struct Y", "lib.rs"));
+        assert!(!mentions_path("graphlib.rs/index.js", "lib.rs"));
+        assert!(!mentions_path("src/lib.rs.bak", "src/lib.rs"));
+        // A miss on one occurrence must not mask a clean later occurrence.
+        assert!(mentions_path("mylib.rs and also lib.rs here", "lib.rs"));
+        assert!(!mentions_path("anything", ""));
     }
 
     #[tokio::test]
@@ -1407,6 +1531,7 @@ mod tests {
         }
         // And the default options value IS the off posture.
         assert!(!RegistryOptions::default().bash);
+        assert!(!RegistryOptions::default().web);
     }
 
     /// Witness: the explicit opt-in registers `bash` — schema advertised
@@ -1418,7 +1543,10 @@ mod tests {
             root.path().to_path_buf(),
             None,
             None,
-            RegistryOptions { bash: true },
+            RegistryOptions {
+                bash: true,
+                web: false,
+            },
         );
         assert!(reg.schemas().iter().any(|s| s.name == "bash"));
         let out = reg
@@ -1430,6 +1558,52 @@ mod tests {
         match out {
             ToolOutput::Ok { content } => assert!(content.contains("bash_enabled_ok")),
             ToolOutput::Error { message } => panic!("enabled bash must run: {message}"),
+        }
+    }
+
+    // ---- web opt-in (default OFF everywhere) --------------------------
+
+    /// Witness: the web family is settings opt-in exactly like bash —
+    /// absent by default, registered (fetch/extract/download, all
+    /// key-free) with the flag. `web_search` additionally needs a search
+    /// key, so its presence is environment-dependent and not pinned here.
+    #[test]
+    fn web_family_registers_only_with_the_opt_in_flag() {
+        let (_root, reg) = bare_registry(None);
+        let names: Vec<String> = reg.schemas().iter().map(|s| s.name.clone()).collect();
+        for absent in [
+            "web_fetch",
+            "web_extract_assets",
+            "web_download",
+            "web_search",
+        ] {
+            assert!(
+                !names.contains(&absent.to_string()),
+                "{absent} must be absent by default"
+            );
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let reg = ToolRegistry::with_backends_and_options(
+            root.path().to_path_buf(),
+            None,
+            None,
+            RegistryOptions {
+                bash: false,
+                web: true,
+            },
+        );
+        let schemas = reg.schemas();
+        for (expected, read_only) in [
+            ("web_fetch", true),
+            ("web_extract_assets", true),
+            ("web_download", false),
+        ] {
+            let schema = schemas
+                .iter()
+                .find(|s| s.name == expected)
+                .unwrap_or_else(|| panic!("{expected} must register with the web opt-in"));
+            assert_eq!(schema.read_only, read_only, "{expected}");
         }
     }
 
@@ -2379,7 +2553,10 @@ mod tests {
             dir.path().to_path_buf(),
             None,
             None,
-            RegistryOptions { bash: true },
+            RegistryOptions {
+                bash: true,
+                web: false,
+            },
         );
         let bus = HookBus::new("sess");
         bus.on_blocking(hook_names::COMMAND_STARTED, |_| HookDecision::Deny {
@@ -2429,6 +2606,50 @@ mod tests {
             *denied_command.lock().unwrap(),
             "make greet",
             "the chain must see the index-resolved command line"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_command_chain_gates_start_process_with_its_joined_argv() {
+        // `start_process` sits in the DEFAULT surface while `bash` is
+        // opt-in, and argv[0] may itself be a shell — so the same
+        // `command.started` policy that fences `bash` must fence the argv
+        // spawn, seeing the joined argv, before anything runs.
+        let (_dir, reg) = telemetry_fixture();
+        let bus = HookBus::new("sess");
+        let denied_command = StdArc::new(StdMutex::new(String::new()));
+        let sink = denied_command.clone();
+        bus.on_blocking(hook_names::COMMAND_STARTED, move |event| {
+            *sink.lock().unwrap() = event.payload["command"].as_str().unwrap_or("").to_string();
+            HookDecision::Deny {
+                reason: "no shell".into(),
+            }
+        })
+        .detach();
+        reg.attach_bus(bus);
+
+        let out = reg
+            .execute(
+                "start_process",
+                &serde_json::json!({"argv": ["bash", "-c", "echo hi"]}),
+            )
+            .await;
+        assert!(
+            out.is_error(),
+            "denied start_process must not spawn: {out:?}"
+        );
+        assert_eq!(
+            *denied_command.lock().unwrap(),
+            "bash -c echo hi",
+            "the chain must see the joined argv as the command line"
+        );
+        // The denial fired before the spawn: no handle may exist.
+        let read = reg
+            .execute("read_output", &serde_json::json!({"handle": "proc-1"}))
+            .await;
+        assert!(
+            read.is_error(),
+            "no process may exist after a denied spawn: {read:?}"
         );
     }
 }

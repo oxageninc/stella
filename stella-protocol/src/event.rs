@@ -67,6 +67,18 @@ pub enum AgentEvent {
     Text {
         delta: String,
     },
+    /// One in-order fragment of the answer text, emitted live while the
+    /// model call streams. Strictly a best-effort preview: the step's
+    /// following `Text` event carries the full text and is authoritative —
+    /// consumers must REPLACE any accumulated deltas with it, never merge
+    /// (a retried model call re-streams its deltas from the start, so the
+    /// accumulation can be garbled; there is no reset marker). Additive to
+    /// the stream-json wire contract: consumers must tolerate `text_delta`
+    /// lines appearing between events, and persistence layers may drop them
+    /// (the `Text` event is the durable record).
+    TextDelta {
+        text: String,
+    },
     Reasoning {
         delta: String,
     },
@@ -89,6 +101,12 @@ pub enum AgentEvent {
         attempt: u32,
         reason: String,
     },
+    /// A user message queued mid-turn was injected at a step boundary
+    /// (`stella-core` steering) — the transcript's record that the model
+    /// was steered, and when.
+    Steered {
+        text: String,
+    },
     /// A compaction pass ran (`stella-core::compaction`). Fields mirror
     /// `CompactionReport` — kept as a flat struct here (not a re-exported
     /// type) so `stella-protocol` never depends on `stella-core` (dependency
@@ -98,6 +116,17 @@ pub enum AgentEvent {
         after_tokens: u64,
         evicted: usize,
         deduped: usize,
+        /// Older results of a repeated identical call, stubbed as stale.
+        /// `serde(default)` so journals written before these fields parse.
+        #[serde(default)]
+        superseded: usize,
+        /// Large old outputs middle-out truncated instead of dropped whole.
+        #[serde(default)]
+        aged: usize,
+        /// Messages replaced by a model-written history summary — the
+        /// overflow fallback when eviction alone cannot reach budget.
+        #[serde(default)]
+        summarized: usize,
     },
     /// Emitted after every provider/media call that spends money
     /// The TUI HUD renders spend live from this
@@ -458,6 +487,21 @@ mod tests {
     }
 
     #[test]
+    fn text_delta_roundtrips_with_its_own_type_tag() {
+        // `text_delta` is additive on the wire: a distinct tag from `text`,
+        // so a pre-delta consumer that skips unknown lines keeps parsing the
+        // authoritative `text` events unchanged.
+        let event = AgentEvent::TextDelta { text: "Hel".into() };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"type\":\"text_delta\""), "{json}");
+        let back: AgentEvent = serde_json::from_str(&json).unwrap();
+        match back {
+            AgentEvent::TextDelta { text } => assert_eq!(text, "Hel"),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
     fn tool_result_roundtrips_and_streams_without_speculated_still_parse() {
         // Round-trip with the flag set.
         let event = AgentEvent::ToolResult {
@@ -516,6 +560,9 @@ mod tests {
             after_tokens: 4_000,
             evicted: 3,
             deduped: 2,
+            superseded: 1,
+            aged: 1,
+            summarized: 0,
         };
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains("\"type\":\"compaction\""), "{json}");

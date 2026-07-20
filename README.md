@@ -1,8 +1,8 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/brand/lockups/stella-logo-dark.svg">
-    <source media="(prefers-color-scheme: light)" srcset="docs/brand/lockups/stella-logo-light.svg">
-    <img src="docs/brand/lockups/stella-logo-light.svg" alt="Stella" width="420">
+    <source media="(prefers-color-scheme: dark)" srcset="docs/brand/lockups/lockup-horizontal-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="docs/brand/lockups/lockup-horizontal-light.svg">
+    <img src="docs/brand/lockups/lockup-horizontal-light.svg" alt="Stella" width="420">
   </picture>
 </p>
 
@@ -138,6 +138,16 @@ route through the dedicated coding endpoint.
 
 **Credential chain** (first hit wins): `--api-key` flag → provider env var →
 `settings.json` `api_key` → `~/.config/stella/credentials.toml` → interactive prompt.
+
+**Project `.env` files** — so keys can follow the project you're in, Stella
+reads `.env`, `.env.local`, and `.env.<mode>.local` (e.g. `.env.production.local`)
+from the working directory (or the nearest ancestor within the same git repo)
+into the environment at startup, most-specific file first. Template files
+(`.env.example`, `.env.sample`, `.env.dist`) and non-`.local` mode files
+(`.env.production`) are never read. **Your live shell always wins** — a value
+already exported (or `OPENROUTER_API_KEY=… stella …`) is never overwritten by a
+file, so unset a stale export if you mean to switch. Disable the whole mechanism
+with `STELLA_NO_ENV_FILE=1`; see what loaded with `STELLA_ENV_DEBUG=1`.
 
 ```bash
 stella models    # list providers, models, and key status
@@ -492,7 +502,7 @@ repository and is pulled in as a pinned git dependency, not as workspace members
 | `stella-graph` | Tree-sitter symbol + import-edge indexer (Rust/TS/JS/Python/SQL) |
 | `stella-pipeline` | The orchestration plane above the engine — the default `stella run` path: triage → plan → scope review → witness → execute → verify → judge (`stella-docs/content/docs/inference-pipeline.mdx`) |
 | `stella-fleet` | The multi-agent fleet behind `stella fleet`: DAG planner + wave scheduling, git-worktree isolation per task |
-| `stella-media` | Multimodal generation behind one `MediaProvider` port — image generation wired as the `generate_image` tool (registered when a media-capable key is set); SVG/video library-complete but not yet exposed as tools |
+| `stella-media` | Multimodal generation behind one `MediaProvider` port — `generate_svg` always on; `generate_image` and `generate_video`/`poll_video` registered when a media-capable key is set (video behind a headless cost gate) |
 | `stella-tui` | The Command Deck — a pure event-fold core + thin crossterm shell |
 | `stella-observatory` | The Observatory — `stella observe`'s loopback-only telemetry dashboard over the local SQLite stores |
 | Open Context Protocol | Its own project now: [macanderson/opencontextprotocol](https://github.com/macanderson/opencontextprotocol) — wire types, host runtime, and the public conformance suite. Stella is its reference host and depends on it via git. |

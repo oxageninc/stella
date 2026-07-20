@@ -20,6 +20,7 @@
 mod agent;
 mod agents_installed;
 mod attachments;
+mod candidate_ws;
 mod claims;
 mod command_deck;
 mod config;
@@ -27,6 +28,7 @@ mod connect_cmd;
 mod discovery;
 mod domains;
 mod engine_config;
+mod env_files;
 mod export;
 mod extensions;
 mod fleet_cmd;
@@ -358,23 +360,29 @@ enum Command {
 /// on-disk master list every slug validates against.
 #[derive(Subcommand)]
 enum ModelsCmd {
-    /// Sync the master list of valid provider/model slugs and pricing from
-    /// models.dev (public, no API key). Incremental: an unchanged list is
-    /// one conditional request (ETag) and zero writes; pricing changes
-    /// append a new model-card version (the latest version is what
-    /// displays everywhere).
+    /// Sync the model catalog: the models.dev master list (public, no API
+    /// key), then every configured provider's own live /models listing.
+    /// Incremental: an unchanged master list is one conditional request
+    /// (ETag) and zero writes; pricing changes append a new model-card
+    /// version (the latest version is what displays everywhere). Also runs
+    /// automatically once a day while a provider credential is configured.
     Refresh {
         /// Re-download even when the server says the list is unchanged
         /// (recovery hatch for a corrupted local catalog)
         #[arg(long)]
         force: bool,
     },
-    /// List the model catalog: every known provider/model slug with its
-    /// latest pricing (USD per Mtok), context window, and model maker
+    /// List the model catalog: provider/model slugs with latest pricing
+    /// (USD per Mtok), context window, capability, and model maker. Scoped
+    /// to providers whose credential resolves; --all lifts the scope.
     List {
         /// Only this provider id (e.g. anthropic, openrouter)
         #[arg(long)]
         provider: Option<String>,
+
+        /// Include providers with no configured credential
+        #[arg(long)]
+        all: bool,
     },
 }
 
@@ -929,7 +937,18 @@ fn main() -> ExitCode {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
 
+    // Load project-scoped `.env`/`.env.local`/`.env.<mode>.local` before
+    // parsing, so both clap's `env = …` fields and downstream credential
+    // resolution see project keys. Runs here at single-threaded startup where
+    // mutating the process environment is safe. The live shell always wins;
+    // `STELLA_NO_ENV_FILE=1` opts out entirely.
+    let loaded_env = env_files::maybe_load();
+
     let cli = Cli::parse();
+
+    // Value-free confirmation (names only), gated on STELLA_ENV_DEBUG + a TTY +
+    // a human output format so it never pollutes json/stream-json.
+    env_files::announce(&loaded_env, cli.output_format);
 
     match run(cli) {
         Ok(()) => ExitCode::SUCCESS,
@@ -957,7 +976,9 @@ fn run(cli: Cli) -> Result<(), String> {
                     .build()
                     .map_err(|e| format!("failed to start runtime: {e}"))?
                     .block_on(model_catalog::run_refresh(*force)),
-                Some(ModelsCmd::List { provider }) => model_catalog::run_list(provider.as_deref()),
+                Some(ModelsCmd::List { provider, all }) => {
+                    model_catalog::run_list(provider.as_deref(), *all)
+                }
             };
         }
         Some(Command::Tools { validate }) => {
@@ -1031,9 +1052,10 @@ fn run(cli: Cli) -> Result<(), String> {
     };
 
     // Everything past here resolves a provider (and may build one), so the
-    // model catalog must be live first: open catalog.db, refresh a stale
-    // master list (only ever after the user's first explicit
-    // `stella models refresh` — the no-phone-home rule), and install the
+    // model catalog must be live first: open catalog.db, auto-sync each
+    // configured provider's own live model listing (BYOK-clean), re-fetch a
+    // stale models.dev master list only after the user's explicit first
+    // `stella models refresh` (the no-phone-home rule), and install the
     // runtime catalog that slug validation and pricing resolve against.
     model_catalog::bootstrap();
 

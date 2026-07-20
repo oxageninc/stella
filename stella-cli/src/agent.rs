@@ -277,6 +277,21 @@ fn tuned_engine_config(cfg: &Config, kind: crate::settings::EngineAgentKind) -> 
         cwd: cfg.workspace_root.display().to_string(),
         ..EngineConfig::default()
     };
+    // Compaction must fire BEFORE the provider's context window overflows:
+    // the engine default (150k) exceeds some catalog windows (deepseek-chat
+    // is 128k), where provider-side overflow would land before compaction
+    // ever triggered. The window only ever LOWERS the default — 3/4 leaves
+    // headroom for the estimator's error band plus the next step's output.
+    if let Ok(entry) =
+        stella_model::catalog::Catalog::current().resolve_for(cfg.provider.id, &cfg.model_id)
+    {
+        let window = entry.context_window as u64;
+        if window > 0 {
+            engine.compaction_budget_tokens = engine
+                .compaction_budget_tokens
+                .min(window.saturating_mul(3) / 4);
+        }
+    }
     if let Some(settings) = &cfg.engine_settings {
         let tuning = crate::engine_config::tuning_for(settings, kind);
         if tuning.temperature.is_some() {
@@ -288,6 +303,17 @@ fn tuned_engine_config(cfg: &Config, kind: crate::settings::EngineAgentKind) -> 
         engine.effort = tuning.effort;
         engine.reasoning = tuning.reasoning;
         engine.params = tuning.params;
+    }
+    // Capability clamp: a catalog-confirmed non-reasoning model must not
+    // carry effort/reasoning onto the wire — providers reject or silently
+    // ignore them, and both outcomes are worse than omitting the fields
+    // (the auto modes set effort for every role without knowing the
+    // model). Unknown capability passes through: the provider stays the
+    // authority.
+    if crate::engine_config::model_supports_reasoning(cfg.provider.id, &cfg.model_id) == Some(false)
+    {
+        engine.effort = None;
+        engine.reasoning = None;
     }
     engine
 }
@@ -480,15 +506,7 @@ async fn run_pipeline_one_shot(
         let tools =
             crate::discovery::DiscoveryToolSet::new(&interactive, cfg.workspace_root.clone());
 
-        let repo_structure = GitRepoStructure {
-            root: cfg.workspace_root.clone(),
-        };
-        let repo_status = GitRepoStatus {
-            root: cfg.workspace_root.clone(),
-        };
-        let command_runner = ShellCommandRunner {
-            root: cfg.workspace_root.clone(),
-        };
+        let ws_ports = workspace_ports(cfg.workspace_root.clone(), cfg);
 
         let breaker = CircuitBreaker::new(Box::new(SystemClock::new()));
         let router = Router::new(wiring.pins.clone(), wiring.profiles.clone(), breaker);
@@ -522,9 +540,9 @@ async fn run_pipeline_one_shot(
             providers: &resolver,
             tools: &tools,
             recall,
-            repo: &repo_structure,
-            repo_status: &repo_status,
-            commands: &command_runner,
+            repo: &ws_ports.repo_structure,
+            repo_status: &ws_ports.repo_status,
+            commands: &ws_ports.command_runner,
             approvals: if is_text {
                 &stdio_gate
             } else {
@@ -535,6 +553,9 @@ async fn run_pipeline_one_shot(
                 .hooks
                 .as_ref()
                 .map(|h| (h, &hook_runner as &dyn stella_core::hooks::HookRunner)),
+            candidate_workspaces: Some(&ws_ports.candidate_workspaces),
+            // Headless / fleet: no concurrent input channel to steer from.
+            steering: None,
         };
 
         let pipeline = Pipeline::new(ports, tx.clone(), pipeline_config);
@@ -802,12 +823,37 @@ pub(crate) fn resolve_engine_wiring(cfg: &Config, worker_ref: &ModelRef) -> Engi
     } else {
         model_spec_for(&engine, EngineAgentKind::Judge, &is_provider)
     };
+    let triage_spec = model_spec_for(&engine, EngineAgentKind::Triage, &is_provider);
+
+    // Capability clamp, mirroring `tuned_engine_config`: a role whose
+    // model (pinned, provider-default, or riding the worker) is a
+    // catalog-confirmed non-reasoning model must not carry effort or
+    // reasoning onto the wire. Unknown capability passes through.
+    {
+        let clamp = |overrides: &mut stella_pipeline::RoleCallOverrides,
+                     spec: Option<&ModelSpec>| {
+            let resolved: Option<(String, String)> = match spec {
+                Some(s) if !s.model.is_empty() => Some((s.provider.clone(), s.model.clone())),
+                // Provider pin without a model → the provider's default.
+                Some(s) => crate::config::PROVIDERS
+                    .iter()
+                    .find(|p| p.id == s.provider && !p.default_model.is_empty())
+                    .map(|p| (s.provider.clone(), p.default_model.to_string())),
+                None => Some((worker_ref.provider.clone(), worker_ref.model_id.clone())),
+            };
+            if let Some((provider, model)) = resolved
+                && crate::engine_config::model_supports_reasoning(&provider, &model) == Some(false)
+            {
+                overrides.effort = None;
+                overrides.reasoning = None;
+            }
+        };
+        clamp(&mut wiring.role_overrides.triage, triage_spec.as_ref());
+        clamp(&mut wiring.role_overrides.judge, judge_spec.as_ref());
+    }
+
     let role_specs = [
-        (
-            Role::Triage,
-            "triage",
-            model_spec_for(&engine, EngineAgentKind::Triage, &is_provider),
-        ),
+        (Role::Triage, "triage", triage_spec),
         (Role::Judge, "judge", judge_spec),
     ];
 
@@ -968,25 +1014,63 @@ impl RepoStatusPort for GitRepoStatus {
             .split('\0')
             .filter(|p| !p.is_empty())
         {
-            // Fingerprint = size:mtime_nanos — changes whenever the file is
-            // written, without reading (and hashing) potentially large
-            // untracked files on every snapshot. Unreadable metadata → a
-            // sentinel so the file still registers as present.
-            let fingerprint = match std::fs::metadata(self.root.join(rel)) {
-                Ok(meta) => {
-                    let mtime = meta
-                        .modified()
-                        .ok()
-                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                        .map(|d| d.as_nanos())
-                        .unwrap_or(0);
-                    format!("{}:{mtime}", meta.len())
-                }
-                Err(_) => "unreadable".to_string(),
-            };
+            // Unreadable metadata → a sentinel so the file still registers
+            // as present.
+            let fingerprint =
+                fs_fingerprint(&self.root.join(rel)).unwrap_or_else(|| "unreadable".to_string());
             out.insert(rel.to_string(), fingerprint);
         }
         out
+    }
+}
+
+/// The pipeline's untracked-file fingerprint: `len:mtime_nanos` — changes
+/// whenever the file is written, without reading (and hashing) potentially
+/// large files on every snapshot. `None` when the file's metadata cannot be
+/// read (absent or unreadable). One definition, shared with the best-of-N
+/// candidate snapshot ports, so fingerprints from the real tree and a
+/// snapshot are comparable (the witness tamper watchlist depends on it).
+pub(crate) fn fs_fingerprint(path: &std::path::Path) -> Option<String> {
+    let meta = std::fs::metadata(path).ok()?;
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    Some(format!("{}:{mtime}", meta.len()))
+}
+
+/// The workspace-rooted pipeline ports every session driver constructs the
+/// same way — repo structure/status, the verification command runner, and
+/// best-of-N candidate isolation, all rooted at the same tree. One bundle
+/// and one constructor so the four drivers (one-shot, goal loop, deck,
+/// fleet worker) can never drift apart on the wiring.
+pub(crate) struct WorkspacePorts {
+    pub(crate) repo_structure: GitRepoStructure,
+    pub(crate) repo_status: GitRepoStatus,
+    pub(crate) command_runner: ShellCommandRunner,
+    /// Inert unless `candidates > 1` — the pipeline never calls it on
+    /// single-shot runs.
+    pub(crate) candidate_workspaces: crate::candidate_ws::GitCandidateWorkspaces,
+}
+
+/// Build the [`WorkspacePorts`] bundle rooted at `root` (the session
+/// workspace, or a fleet worker's own worktree).
+pub(crate) fn workspace_ports(root: std::path::PathBuf, cfg: &Config) -> WorkspacePorts {
+    // The candidate registry mirrors the session's custom tool surface —
+    // discovered from the same root, so a candidate sees exactly the custom
+    // tools the session does (re-rooted at its snapshot at create time).
+    let custom_tools = stella_tools::custom::discover(&root).tools;
+    WorkspacePorts {
+        repo_structure: GitRepoStructure { root: root.clone() },
+        repo_status: GitRepoStatus { root: root.clone() },
+        command_runner: ShellCommandRunner { root: root.clone() },
+        candidate_workspaces: crate::candidate_ws::GitCandidateWorkspaces::new(
+            root,
+            registry_options(cfg),
+            custom_tools,
+        ),
     }
 }
 
@@ -2334,12 +2418,17 @@ pub fn run_tools_listing() -> Result<(), String> {
     tui::section_header("Stella tools");
 
     // The listing mirrors a real session's surface, so the settings-driven
-    // switches (bash opt-in) apply here exactly as they do at session start.
+    // switches (bash/web opt-ins) apply here exactly as they do at session
+    // start.
     let settings = crate::settings::Settings::load(&workspace_root)?;
     let bash_enabled = settings.bash_tool_enabled();
+    let web_enabled = settings.web_tools_enabled();
     let registry = ToolRegistry::new(
         workspace_root.clone(),
-        stella_tools::RegistryOptions { bash: bash_enabled },
+        stella_tools::RegistryOptions {
+            bash: bash_enabled,
+            web: web_enabled,
+        },
     );
     println!("  {}", "built-in:".dimmed());
     let mut native: Vec<String> = stella_core::ports::ToolExecutor::schemas(&registry)
@@ -2355,6 +2444,15 @@ pub fn run_tools_listing() -> Result<(), String> {
             "    {} {}",
             "·".dimmed(),
             "bash — disabled (default); enable with \"tools\": {\"bash\": \"on\"} in settings"
+                .dimmed()
+        );
+    }
+    if !web_enabled {
+        println!(
+            "    {} {}",
+            "·".dimmed(),
+            "web_search/web_fetch/web_extract_assets/web_download — disabled (default); \
+             enable with \"tools\": {\"web\": \"on\"} in settings"
                 .dimmed()
         );
     }
@@ -2836,7 +2934,13 @@ fn spawn_renderer(
         let mut seq = 0u64;
         let mut store_warned = false;
         while let Some(event) = rx.recv().await {
-            if let Some((store, id)) = &execution {
+            // `TextDelta` previews never reach the store: the authoritative
+            // `Text` event carries the full step text into the audit record,
+            // and one SQLite insert per token would stall this drain loop.
+            let preview = matches!(event, AgentEvent::TextDelta { .. });
+            if let Some((store, id)) = &execution
+                && !preview
+            {
                 if !persist_event(store, *id, seq, &event, &provider_id) && !store_warned {
                     eprintln!(
                         "  {} store write failed — telemetry for this execution is incomplete",
@@ -3300,15 +3404,7 @@ async fn run_goal_pipeline_turn(
         let breaker = CircuitBreaker::new(Box::new(SystemClock::new()));
         let router = Router::new(wiring.pins.clone(), wiring.profiles.clone(), breaker);
 
-        let repo_structure = GitRepoStructure {
-            root: cfg.workspace_root.clone(),
-        };
-        let repo_status = GitRepoStatus {
-            root: cfg.workspace_root.clone(),
-        };
-        let command_runner = ShellCommandRunner {
-            root: cfg.workspace_root.clone(),
-        };
+        let ws_ports = workspace_ports(cfg.workspace_root.clone(), cfg);
         let no_recall = NoContextRecall;
         let recall: &dyn ContextRecallPort = &no_recall;
         let hook_runner = ShellHookRunner;
@@ -3343,15 +3439,18 @@ async fn run_goal_pipeline_turn(
                 providers: &resolver,
                 tools: &tools,
                 recall,
-                repo: &repo_structure,
-                repo_status: &repo_status,
-                commands: &command_runner,
+                repo: &ws_ports.repo_structure,
+                repo_status: &ws_ports.repo_status,
+                commands: &ws_ports.command_runner,
                 approvals: &AutoApproveGate,
                 sleeper: &TokioSleeper,
                 hooks: cfg
                     .hooks
                     .as_ref()
                     .map(|h| (h, &hook_runner as &dyn stella_core::hooks::HookRunner)),
+                candidate_workspaces: Some(&ws_ports.candidate_workspaces),
+                // Goal pipeline rounds run without an interactive steer tap.
+                steering: None,
             };
             let pipeline = Pipeline::new(ports, tx.clone(), pipeline_config);
             let round_goal = format!(
@@ -3489,6 +3588,7 @@ async fn run_goal_pipeline_turn(
 pub(crate) fn registry_options(cfg: &Config) -> stella_tools::RegistryOptions {
     stella_tools::RegistryOptions {
         bash: cfg.tools_bash,
+        web: cfg.tools_web,
     }
 }
 
@@ -4077,6 +4177,7 @@ mod tests {
             hooks: None,
             engine_settings: None,
             tools_bash: false,
+            tools_web: false,
         }
     }
 
