@@ -473,7 +473,7 @@ async fn run_task(
     let provider = agent::build_provider(&cfg)?;
     let registry =
         ToolRegistry::new_detected(root.to_path_buf(), agent::registry_options(&cfg)).await;
-    crate::rules::enforce_workspace_rules(&registry, root, &cfg.authority);
+    let active_rules = crate::rules::enforce_workspace_rules(&registry, root, &cfg.authority);
     // Claim-on-first-write (crate::claims): tool-level write claims + the
     // transient build lane, coordinated across every writer in the
     // workspace. Same holder as the fleet's declared claims — re-entrant.
@@ -482,7 +482,11 @@ async fn run_task(
     let mut messages = vec![CompletionMessage::system(
         // Each worker is its own session in its own workspace, so its
         // SessionStart hooks fire here, in the worktree.
-        agent::with_session_hook_context(agent::build_system_prompt(&cfg, root), &cfg).await,
+        agent::with_session_hook_context(
+            agent::build_system_prompt(&cfg, root, &active_rules),
+            &cfg,
+        )
+        .await,
     )];
     // The raw step-loop path needs the task prompt as a user message in the
     // history; the pipeline path takes the goal separately and appends its own
@@ -542,7 +546,7 @@ async fn run_task(
         let router = Router::new(wiring.pins.clone(), wiring.profiles.clone(), breaker);
         // Rooted at the fleet worker's own worktree, so a candidate snapshot
         // nests off that worktree's checkout, never the primary repo's.
-        let ws_ports = agent::workspace_ports(root.to_path_buf(), &cfg);
+        let ws_ports = agent::workspace_ports(root.to_path_buf(), &cfg, active_rules.clone());
         let recall = NoContextRecall;
         let hook_runner = ShellHookRunner;
         let ports = PipelinePorts {

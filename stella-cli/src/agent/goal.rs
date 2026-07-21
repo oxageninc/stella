@@ -23,7 +23,8 @@ pub(crate) async fn run_raw_one_shot(
         ToolRegistry::new_detected(cfg.workspace_root.clone(), registry_options(cfg)).await,
     );
     populate_schema_index(&registry, &cfg.workspace_root);
-    crate::rules::enforce_workspace_rules(&registry, &cfg.workspace_root, &cfg.authority);
+    let active_rules =
+        crate::rules::enforce_workspace_rules(&registry, &cfg.workspace_root, &cfg.authority);
     // Auto-build + live-refresh the code graph in the background so a
     // multi-step one-shot turn can reach for `graph_query` once the index is
     // ready. Status goes to stderr — stdout may be machine-readable JSON.
@@ -56,7 +57,11 @@ pub(crate) async fn run_raw_one_shot(
 
     let mut messages = vec![
         CompletionMessage::system(
-            with_session_hook_context(build_system_prompt(cfg, &cfg.workspace_root), cfg).await,
+            with_session_hook_context(
+                build_system_prompt(cfg, &cfg.workspace_root, &active_rules),
+                cfg,
+            )
+            .await,
         ),
         crate::attachments::user_message(prompt),
     ];
@@ -174,7 +179,8 @@ pub async fn run_goal_cmd(
         ToolRegistry::new_detected(cfg.workspace_root.clone(), registry_options(cfg)).await,
     );
     populate_schema_index(&registry, &cfg.workspace_root);
-    crate::rules::enforce_workspace_rules(&registry, &cfg.workspace_root, &cfg.authority);
+    let active_rules =
+        crate::rules::enforce_workspace_rules(&registry, &cfg.workspace_root, &cfg.authority);
     // Auto-build + live-refresh the code-graph index in the background so
     // `graph_query` is available for the goal loop without a manual `stella
     // init`. Non-blocking; status to stderr. Kept alive until the goal returns.
@@ -204,7 +210,11 @@ pub async fn run_goal_cmd(
     println!("  {}\n", goal.dimmed());
 
     let mut messages = vec![CompletionMessage::system(
-        with_session_hook_context(build_system_prompt(cfg, &cfg.workspace_root), cfg).await,
+        with_session_hook_context(
+            build_system_prompt(cfg, &cfg.workspace_root, &active_rules),
+            cfg,
+        )
+        .await,
     )];
     let mut memory = SessionMemory::open_with_authority(&cfg.workspace_root, true, &cfg.authority);
     if let Some(m) = &memory {
@@ -228,6 +238,7 @@ pub async fn run_goal_cmd(
             &store,
             goal,
             Some(presence.id()),
+            active_rules.clone(),
         )
         .await
     } else {
@@ -440,6 +451,7 @@ async fn run_goal_pipeline_turn(
     store: &Option<Arc<Store>>,
     goal: &str,
     session: Option<&str>,
+    active_rules: crate::rules::ResolvedRules,
 ) -> Result<(), String> {
     let turn_start = Instant::now();
     let execution = begin_execution(store, "goal", goal, cfg, session);
@@ -515,7 +527,7 @@ async fn run_goal_pipeline_turn(
         let breaker = CircuitBreaker::new(Box::new(SystemClock::new()));
         let router = Router::new(wiring.pins.clone(), wiring.profiles.clone(), breaker);
 
-        let ws_ports = workspace_ports(cfg.workspace_root.clone(), cfg);
+        let ws_ports = workspace_ports(cfg.workspace_root.clone(), cfg, active_rules.clone());
         let no_recall = NoContextRecall;
         let recall: &dyn ContextRecallPort = &no_recall;
         let hook_runner = ShellHookRunner;

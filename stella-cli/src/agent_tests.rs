@@ -1,6 +1,7 @@
 use super::*;
 use crate::config::{ConfiguredProvider, PROVIDERS, ProviderConfig};
 use stella_model::credential::ApiKey;
+use stella_pipeline::CandidateWorkspacePort;
 
 /// The store write path for `StepUsage`: every token field on the event
 /// — cache writes included — lands in the telemetry row verbatim.
@@ -64,15 +65,16 @@ fn assemble_system_prompt_carries_a_byte_stable_scripts_section() {
         project_prompts_allowed: true,
         ..crate::settings::AuthorityPolicy::default()
     };
-    let first = assemble_system_prompt(SYSTEM_PROMPT, root.path(), &authority);
-    let second = assemble_system_prompt(SYSTEM_PROMPT, root.path(), &authority);
+    let rules = crate::rules::ResolvedRules::default();
+    let first = assemble_system_prompt(SYSTEM_PROMPT, root.path(), &authority, &rules);
+    let second = assemble_system_prompt(SYSTEM_PROMPT, root.path(), &authority, &rules);
     assert_eq!(first, second, "same workspace state ⇒ identical bytes");
     assert!(first.contains("## Project scripts"), "section present");
     assert!(first.contains("build → pnpm run build"), "{first}");
     assert!(first.contains("install → pnpm install"), "{first}");
 
     let empty = tempfile::tempdir().expect("tempdir");
-    let bare = assemble_system_prompt(SYSTEM_PROMPT, empty.path(), &authority);
+    let bare = assemble_system_prompt(SYSTEM_PROMPT, empty.path(), &authority, &rules);
     assert!(
         !bare.contains("## Project scripts"),
         "no scripts → no section, no noise"
@@ -241,7 +243,8 @@ fn system_prompt_carries_the_workspace_rules_section() {
 
     let mut cfg = cfg_for("zai");
     cfg.authority.project_prompts_allowed = true;
-    let prompt = build_system_prompt(&cfg, root.path());
+    let rules = crate::rules::load_workspace_rules(root.path(), &cfg.authority);
+    let prompt = build_system_prompt(&cfg, root.path(), &rules);
     assert!(
         prompt.starts_with(SYSTEM_PROMPT),
         "rules append to the prompt; the base prefix must stay intact"
@@ -294,7 +297,8 @@ fn untrusted_project_prompt_sources_are_absent_from_the_system_prompt() {
     let mut cfg = cfg_for("zai");
     cfg.workspace_root = root.path().to_path_buf();
     cfg.authority.project_prompts_allowed = false;
-    let untrusted = build_system_prompt(&cfg, root.path());
+    let untrusted_rules = crate::rules::load_workspace_rules(root.path(), &cfg.authority);
+    let untrusted = build_system_prompt(&cfg, root.path(), &untrusted_rules);
     for marker in [
         "authority-marker",
         "PROJECT_MEMORY_AUTHORITY_MARKER",
@@ -308,7 +312,8 @@ fn untrusted_project_prompt_sources_are_absent_from_the_system_prompt() {
     }
 
     cfg.authority.project_prompts_allowed = true;
-    let trusted = build_system_prompt(&cfg, root.path());
+    let trusted_rules = crate::rules::load_workspace_rules(root.path(), &cfg.authority);
+    let trusted = build_system_prompt(&cfg, root.path(), &trusted_rules);
     for marker in [
         "authority-marker",
         "PROJECT_MEMORY_AUTHORITY_MARKER",
@@ -337,7 +342,8 @@ fn system_prompt_carries_the_workspace_maps_index() {
 
     let mut cfg = cfg_for("zai");
     cfg.authority.project_prompts_allowed = true;
-    let prompt = build_system_prompt(&cfg, root.path());
+    let rules = crate::rules::ResolvedRules::default();
+    let prompt = build_system_prompt(&cfg, root.path(), &rules);
     assert!(
         prompt.contains("## Workspace maps"),
         "index section missing"
@@ -350,7 +356,11 @@ fn system_prompt_carries_the_workspace_maps_index() {
 
     // No maps → no section, no tokens.
     let bare = tempfile::tempdir().expect("tempdir");
-    let empty = build_system_prompt(&cfg_for("zai"), bare.path());
+    let empty = build_system_prompt(
+        &cfg_for("zai"),
+        bare.path(),
+        &crate::rules::ResolvedRules::default(),
+    );
     assert!(!empty.contains("## Workspace maps"));
 }
 
@@ -427,6 +437,83 @@ fn non_tty_text_output_is_headless_without_losing_text_rendering() {
         "an explicit interactive approval host retains scope review"
     );
     assert!(!interactive.headless_bypass_scope_review);
+}
+
+#[tokio::test]
+async fn candidate_rules_reuse_the_parent_snapshot_after_source_removal() {
+    let root = tempfile::tempdir().unwrap();
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root.path())
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "t@t.t"]);
+    git(&["config", "user.name", "t"]);
+    std::fs::write(root.path().join("base.txt"), "base\n").unwrap();
+    git(&["add", "base.txt"]);
+    git(&["commit", "-q", "-m", "base"]);
+
+    let rule_path = root.path().join(".stella/rules/protect-session.md");
+    std::fs::create_dir_all(rule_path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &rule_path,
+        "---\nguard-tool: Write\nguard-deny-path: protected/**\n---\nOriginal session guard.",
+    )
+    .unwrap();
+    let mut cfg = cfg_for("zai");
+    cfg.workspace_root = root.path().to_path_buf();
+    cfg.authority.project_prompts_allowed = true;
+
+    let parent_rules = crate::rules::load_workspace_rules(root.path(), &cfg.authority);
+    let parent = ToolRegistry::with_issue_backend(root.path().to_path_buf(), None);
+    crate::rules::attach_rule_guards(&parent, &parent_rules);
+    let parent_denied = parent
+        .execute(
+            "write_file",
+            &serde_json::json!({"path": "protected/parent.txt", "content": "no\n"}),
+        )
+        .await;
+    assert!(parent_denied.is_error(), "parent guard was not attached");
+
+    // Mutate the source after the parent session has resolved and attached
+    // it. Candidate creation must retain that original session snapshot.
+    std::fs::remove_file(&rule_path).unwrap();
+    let prompt = build_system_prompt(&cfg, root.path(), &parent_rules);
+    assert!(
+        prompt.contains("Original session guard.  [enforced]"),
+        "prompt rendering diverged from the parent rule snapshot: {prompt}"
+    );
+    let ws_ports = workspace_ports(root.path().to_path_buf(), &cfg, parent_rules.clone());
+    let candidate = ws_ports.candidate_workspaces.create().await.unwrap();
+    let output = candidate
+        .tools()
+        .execute(
+            "write_file",
+            &serde_json::json!({"path": "protected/candidate.txt", "content": "no\n"}),
+        )
+        .await;
+    let adopted = candidate.adopt().await.unwrap();
+    let landed = root.path().join("protected/candidate.txt").exists();
+    candidate.remove().await;
+
+    assert!(
+        output.is_error(),
+        "candidate reloaded weakened sources instead of retaining the parent snapshot: {output:?}"
+    );
+    assert!(
+        adopted.is_empty(),
+        "prohibited candidate edit was adoptable: {adopted:?}"
+    );
+    assert!(!landed, "prohibited candidate edit reached the parent tree");
 }
 
 #[test]

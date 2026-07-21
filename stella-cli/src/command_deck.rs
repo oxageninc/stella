@@ -264,15 +264,18 @@ pub async fn run_deck_session(
         ToolRegistry::new_detected(cfg.workspace_root.clone(), agent::registry_options(cfg)).await,
     );
     agent::populate_schema_index(&registry, &cfg.workspace_root);
-    crate::rules::enforce_workspace_rules(&registry, &cfg.workspace_root, &cfg.authority);
+    let active_rules =
+        crate::rules::enforce_workspace_rules(&registry, &cfg.workspace_root, &cfg.authority);
     let custom_tools = agent::discover_custom_tools(cfg, true).await;
     let mut budget = agent::build_budget_guard(budget_limit);
     let store = agent::open_store(&cfg.workspace_root);
     let calibration = agent::seed_calibration(&store, cfg);
 
-    let system_prompt =
-        agent::with_session_hook_context(agent::build_system_prompt(cfg, &cfg.workspace_root), cfg)
-            .await;
+    let system_prompt = agent::with_session_hook_context(
+        agent::build_system_prompt(cfg, &cfg.workspace_root, &active_rules),
+        cfg,
+    )
+    .await;
     let mut messages = vec![CompletionMessage::system(system_prompt.clone())];
     // `warn: false`: past this point diagnostics would land on the alternate
     // screen; a memory-less session degrades silently here.
@@ -1190,6 +1193,7 @@ pub async fn run_deck_session(
                         &mut messages,
                         &mut budget,
                         cfg,
+                        &active_rules,
                         execution.clone(),
                         &in_tx,
                         &ask_io,
@@ -4231,6 +4235,7 @@ async fn run_lead_pipeline_turn(
     messages: &mut Vec<CompletionMessage>,
     budget: &mut BudgetGuard,
     cfg: &Config,
+    active_rules: &crate::rules::ResolvedRules,
     execution: Option<(Arc<Store>, i64)>,
     in_tx: &UnboundedSender<Inbound>,
     ask_io: &DeckAskUserIo,
@@ -4295,7 +4300,8 @@ async fn run_lead_pipeline_turn(
         let breaker = CircuitBreaker::new(Box::new(SystemClock::new()));
         let router = Router::new(wiring.pins.clone(), wiring.profiles.clone(), breaker);
 
-        let ws_ports = agent::workspace_ports(cfg.workspace_root.clone(), cfg);
+        let ws_ports =
+            agent::workspace_ports(cfg.workspace_root.clone(), cfg, active_rules.clone());
         let no_recall = NoContextRecall;
         let recall: &dyn ContextRecallPort = match memory {
             Some(m) => m,

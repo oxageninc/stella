@@ -35,12 +35,33 @@
 //! extension providers publish through `stella_store::Store::upsert_rule`.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use stella_core::bus::{HookBus, HookDecision, names as hook_names};
 use stella_core::rules::{
     LoadRulesOptions, ProposedAction, Rule, RuleFile, RuleSource, evaluate_guards, load_rules,
 };
 use stella_tools::ToolRegistry;
+
+/// One immutable rule snapshot resolved at session assembly. Cloning this
+/// value clones only the [`Arc`], so prompt rendering, the parent registry,
+/// and every candidate registry observe the exact same source resolution.
+#[derive(Clone, Default)]
+pub(crate) struct ResolvedRules(Arc<[Rule]>);
+
+impl ResolvedRules {
+    pub(crate) fn as_slice(&self) -> &[Rule] {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for ResolvedRules {
+    type Target = [Rule];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
+}
 
 /// The production [`RuleSource`]: real `std::fs` reads over each directory
 /// in `dirs`, in the given order — every `.md` file's contents, name-sorted
@@ -133,17 +154,20 @@ impl RuleSource for SessionRuleSource {
 pub(crate) fn load_workspace_rules(
     workspace_root: &Path,
     authority: &crate::settings::AuthorityPolicy,
-) -> Vec<Rule> {
+) -> ResolvedRules {
     let user_rules_dir = std::env::var_os("HOME").map(|home| {
         PathBuf::from(home)
             .join(".config")
             .join("stella")
             .join("rules")
     });
-    load_rules_from_with_authority(
-        workspace_root,
-        user_rules_dir,
-        authority.project_prompts_allowed,
+    ResolvedRules(
+        load_rules_from_with_authority(
+            workspace_root,
+            user_rules_dir,
+            authority.project_prompts_allowed,
+        )
+        .into(),
     )
 }
 
@@ -230,8 +254,10 @@ pub(crate) fn enforce_workspace_rules(
     registry: &ToolRegistry,
     workspace_root: &Path,
     authority: &crate::settings::AuthorityPolicy,
-) {
-    attach_rule_guards(registry, load_workspace_rules(workspace_root, authority));
+) -> ResolvedRules {
+    let rules = load_workspace_rules(workspace_root, authority);
+    attach_rule_guards(registry, &rules);
+    rules
 }
 
 /// Map a registry tool name to the canonical vocabulary guards are authored
@@ -256,10 +282,11 @@ fn canonical_tool(name: &str) -> &str {
 /// the registry returns that as the tool error so the model self-corrects.
 /// With no guarded rules no bus is attached at all — a rule-less (or
 /// Tier-1-only) session keeps the exact pre-hooks execution path.
-pub(crate) fn attach_rule_guards(registry: &ToolRegistry, rules: Vec<Rule>) {
-    if rules.iter().all(|rule| rule.guard.is_none()) {
+pub(crate) fn attach_rule_guards(registry: &ToolRegistry, rules: &ResolvedRules) {
+    if rules.as_slice().iter().all(|rule| rule.guard.is_none()) {
         return;
     }
+    let rules = Arc::clone(&rules.0);
     let bus = HookBus::new(format!("rules-{}", std::process::id()));
     bus.on_blocking(hook_names::TOOL_CALL_REQUESTED, move |event| {
         let action = ProposedAction {
@@ -462,7 +489,7 @@ mod tests {
         let registry = ToolRegistry::with_issue_backend(root.path().to_path_buf(), None);
         let rules =
             load_rules_from_with_authority(root.path(), Some(user.path().join("rules")), true);
-        attach_rule_guards(&registry, rules);
+        attach_rule_guards(&registry, &ResolvedRules(rules.into()));
 
         let denied = registry
             .execute(
@@ -500,7 +527,7 @@ mod tests {
         assert_eq!(rules.len(), 2, "both trust-tier guards must remain active");
 
         let registry = ToolRegistry::with_issue_backend(root.path().to_path_buf(), None);
-        attach_rule_guards(&registry, rules);
+        attach_rule_guards(&registry, &ResolvedRules(rules.into()));
         for path in ["user-only/blocked.txt", "project-only/blocked.txt"] {
             let output = registry
                 .execute(

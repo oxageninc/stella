@@ -49,7 +49,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use std::sync::Arc;
-use stella_core::rules::Rule;
 use stella_fleet::git::{GitCli, SystemGitCli};
 use stella_pipeline::ports::{
     AdoptedChange, CandidateWorkspace, CandidateWorkspacePort, CommandRunner, RepoStatusPort,
@@ -213,7 +212,7 @@ pub(crate) struct GitCandidateWorkspaces {
     /// Immutable rules resolved from the real session workspace before any
     /// shadow exists. Candidate discovery must never depend on which ignored
     /// or store-backed policy files happened to enter a git snapshot.
-    active_rules: Arc<[Rule]>,
+    active_rules: crate::rules::ResolvedRules,
 }
 
 impl GitCandidateWorkspaces {
@@ -221,13 +220,13 @@ impl GitCandidateWorkspaces {
         root: PathBuf,
         options: RegistryOptions,
         custom_tools: Vec<CustomTool>,
-        active_rules: Vec<Rule>,
+        active_rules: crate::rules::ResolvedRules,
     ) -> Self {
         Self {
             root,
             options,
             custom_tools,
-            active_rules: active_rules.into(),
+            active_rules,
         }
     }
 
@@ -277,7 +276,7 @@ impl GitCandidateWorkspaces {
                 // not be a way around them. Applied while `registry` is still
                 // a plain `ToolRegistry`, before it moves into the `Arc`.
                 crate::agent::populate_schema_index(&registry, &ws_root);
-                crate::rules::attach_rule_guards(&registry, self.active_rules.to_vec());
+                crate::rules::attach_rule_guards(&registry, &self.active_rules);
                 // The candidate's tool surface: the snapshot-rooted registry
                 // plus the session's custom script tools, owned as one value
                 // (the workspace outlives every borrow). Custom tools re-root
@@ -708,7 +707,7 @@ mod tests {
             root.clone(),
             RegistryOptions::default(),
             Vec::new(),
-            Vec::new(),
+            crate::rules::ResolvedRules::default(),
         );
 
         let ws = port.create_workspace().await.unwrap();
@@ -774,7 +773,7 @@ mod tests {
             root.clone(),
             RegistryOptions::default(),
             custom_tools,
-            Vec::new(),
+            crate::rules::ResolvedRules::default(),
         );
         let ws = port.create_workspace().await.unwrap();
 
@@ -917,7 +916,7 @@ mod tests {
             root.clone(),
             RegistryOptions::default(),
             Vec::new(),
-            Vec::new(),
+            crate::rules::ResolvedRules::default(),
         );
         let loser = port.create_workspace().await.unwrap();
         let winner = port.create_workspace().await.unwrap();
@@ -972,7 +971,7 @@ mod tests {
             root.clone(),
             RegistryOptions::default(),
             Vec::new(),
-            Vec::new(),
+            crate::rules::ResolvedRules::default(),
         );
         let ws = port.create_workspace().await.unwrap();
 
@@ -1023,7 +1022,7 @@ mod tests {
             root.clone(),
             RegistryOptions::default(),
             Vec::new(),
-            Vec::new(),
+            crate::rules::ResolvedRules::default(),
         );
         match port.create_workspace().await {
             Err(WorkspaceError::Snapshot { reason }) => {

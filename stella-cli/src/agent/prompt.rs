@@ -121,6 +121,7 @@ pub(crate) fn assemble_system_prompt(
     base: &str,
     workspace_root: &std::path::Path,
     authority: &crate::settings::AuthorityPolicy,
+    active_rules: &crate::rules::ResolvedRules,
 ) -> String {
     let mut prompt = base.to_string();
     if authority.project_prompts_allowed {
@@ -128,9 +129,7 @@ pub(crate) fn assemble_system_prompt(
         append_workspace_memories(&mut prompt, workspace_root);
         append_exploration_index(&mut prompt, workspace_root);
     }
-    let rules_section = stella_core::rules::render_rules_section(
-        &crate::rules::load_workspace_rules(workspace_root, authority),
-    );
+    let rules_section = stella_core::rules::render_rules_section(active_rules.as_slice());
     if !rules_section.is_empty() {
         prompt.push('\n');
         prompt.push_str(&rules_section);
@@ -248,12 +247,17 @@ fn custom_prompt_base(cfg: &Config, kind: crate::settings::EngineAgentKind) -> O
 /// the Command Deck session assembles the same prompt). `workspace_root`
 /// is a parameter (not read off `cfg`) because fleet workers assemble the
 /// prompt for their own worktree root.
-pub(crate) fn build_system_prompt(cfg: &Config, workspace_root: &std::path::Path) -> String {
+pub(crate) fn build_system_prompt(
+    cfg: &Config,
+    workspace_root: &std::path::Path,
+    active_rules: &crate::rules::ResolvedRules,
+) -> String {
     let base = custom_prompt_base(cfg, crate::settings::EngineAgentKind::Default);
     assemble_system_prompt(
         base.as_deref().unwrap_or(SYSTEM_PROMPT),
         workspace_root,
         &cfg.authority,
+        active_rules,
     )
 }
 
@@ -262,12 +266,14 @@ pub(crate) fn build_system_prompt(cfg: &Config, workspace_root: &std::path::Path
 pub(crate) fn build_pipeline_system_prompt(
     cfg: &Config,
     workspace_root: &std::path::Path,
+    active_rules: &crate::rules::ResolvedRules,
 ) -> String {
     let base = custom_prompt_base(cfg, crate::settings::EngineAgentKind::Worker);
     assemble_system_prompt(
         base.as_deref().unwrap_or(PIPELINE_SYSTEM_PROMPT),
         workspace_root,
         &cfg.authority,
+        active_rules,
     )
 }
 

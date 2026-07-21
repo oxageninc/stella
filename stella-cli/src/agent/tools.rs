@@ -115,7 +115,11 @@ pub(crate) struct WorkspacePorts {
 
 /// Build the [`WorkspacePorts`] bundle rooted at `root` (the session
 /// workspace, or a fleet worker's own worktree).
-pub(crate) fn workspace_ports(root: std::path::PathBuf, cfg: &Config) -> WorkspacePorts {
+pub(crate) fn workspace_ports(
+    root: std::path::PathBuf,
+    cfg: &Config,
+    active_rules: crate::rules::ResolvedRules,
+) -> WorkspacePorts {
     // The candidate registry mirrors the session's custom tool surface —
     // discovered from the same root, so a candidate sees exactly the custom
     // tools the session does (re-rooted at its snapshot at create time).
@@ -126,10 +130,6 @@ pub(crate) fn workspace_ports(root: std::path::PathBuf, cfg: &Config) -> Workspa
         cfg.authority.project_custom_tools_allowed,
     )
     .tools;
-    // Resolve policy against the real session workspace exactly once. Every
-    // best-of-N shadow receives this immutable snapshot; ignored rule files
-    // and store-backed guards therefore cannot disappear during git overlay.
-    let active_rules = crate::rules::load_workspace_rules(&root, &cfg.authority);
     WorkspacePorts {
         repo_structure: GitRepoStructure { root: root.clone() },
         repo_status: GitRepoStatus { root: root.clone() },

@@ -96,7 +96,8 @@ async fn run_pipeline_one_shot(
         ToolRegistry::new_detected(cfg.workspace_root.clone(), registry_options(cfg)).await,
     );
     populate_schema_index(&registry, &cfg.workspace_root);
-    crate::rules::enforce_workspace_rules(&registry, &cfg.workspace_root, &cfg.authority);
+    let active_rules =
+        crate::rules::enforce_workspace_rules(&registry, &cfg.workspace_root, &cfg.authority);
     // Auto-build + live-refresh the code graph in the background so the
     // pipeline's localize step can reach for `graph_query` once it is ready.
     // Status goes to stderr — stdout may be machine-readable JSON.
@@ -150,8 +151,11 @@ async fn run_pipeline_one_shot(
         RoleProviderResolver::new(&*provider, model_ref.clone(), &wiring.extra_providers);
 
     let mut messages = vec![CompletionMessage::system(
-        with_session_hook_context(build_pipeline_system_prompt(cfg, &cfg.workspace_root), cfg)
-            .await,
+        with_session_hook_context(
+            build_pipeline_system_prompt(cfg, &cfg.workspace_root, &active_rules),
+            cfg,
+        )
+        .await,
     )];
     let mut memory = SessionMemory::open_with_authority(
         &cfg.workspace_root,
@@ -178,7 +182,7 @@ async fn run_pipeline_one_shot(
             crate::discovery::DiscoveryToolSet::new(&interactive, cfg.workspace_root.clone())
                 .with_project_prompts_allowed(cfg.authority.project_prompts_allowed);
 
-        let ws_ports = workspace_ports(cfg.workspace_root.clone(), cfg);
+        let ws_ports = workspace_ports(cfg.workspace_root.clone(), cfg, active_rules.clone());
 
         let breaker = CircuitBreaker::new(Box::new(SystemClock::new()));
         let router = Router::new(wiring.pins.clone(), wiring.profiles.clone(), breaker);
@@ -421,7 +425,8 @@ pub async fn run_interactive(cfg: &Config, budget_limit: Option<f64>) -> Result<
     )
     .await;
     populate_schema_index(&registry, &cfg.workspace_root);
-    crate::rules::enforce_workspace_rules(&registry, &cfg.workspace_root, &cfg.authority);
+    let active_rules =
+        crate::rules::enforce_workspace_rules(&registry, &cfg.workspace_root, &cfg.authority);
     // Auto-build the code-graph index in the background (a cheap incremental
     // refresh if it already exists) and keep it fresh via the live watcher, so
     // `graph_query` becomes available this session without a manual `stella
@@ -453,8 +458,11 @@ pub async fn run_interactive(cfg: &Config, budget_limit: Option<f64>) -> Result<
     // Built once per session and reused verbatim on /clear — the byte-stable
     // prefix (instructions + baked memories + SessionStart hook context) is
     // the prompt-cache contract (see build_system_prompt).
-    let system_prompt =
-        with_session_hook_context(build_system_prompt(cfg, &cfg.workspace_root), cfg).await;
+    let system_prompt = with_session_hook_context(
+        build_system_prompt(cfg, &cfg.workspace_root, &active_rules),
+        cfg,
+    )
+    .await;
     let mut messages = vec![CompletionMessage::system(system_prompt.clone())];
     let mut memory = SessionMemory::open_with_authority(&cfg.workspace_root, true, &cfg.authority);
     // Custom extensions: ⚡ commands/skills invocable as `/name args`, custom
