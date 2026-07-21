@@ -397,6 +397,7 @@ fn cfg_for(provider_id: &str) -> Config {
         provider,
         model_id,
         api_key: ApiKey::new("dummy-key-unused-offline"),
+        credential_source: None,
         workspace_root: std::path::PathBuf::from("/tmp"),
         base_url_override: None,
         hooks: None,

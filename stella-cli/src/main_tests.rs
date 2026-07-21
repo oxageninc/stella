@@ -7,7 +7,7 @@
 
 use clap::{CommandFactory, Parser};
 
-use super::{AuthCmd, Cli, Command, ConnectCmd, OutputFormat};
+use super::{AuthCmd, Cli, Command, ConnectCmd, OutputFormat, TelemetryCmd};
 
 #[cfg(unix)]
 fn legacy_codegraph_workspace(mode: u32) -> tempfile::TempDir {
@@ -91,6 +91,18 @@ fn observatory_preflight_reports_unsafe_legacy_store() {
 #[test]
 fn clap_command_is_internally_consistent() {
     Cli::command().debug_assert();
+}
+
+#[test]
+fn telemetry_status_remains_a_distinct_top_level_command() {
+    let cli = Cli::try_parse_from(["stella", "telemetry", "status"])
+        .expect("`telemetry status` must parse independently of adjacent auth commands");
+    assert!(matches!(
+        cli.command,
+        Some(Command::Telemetry {
+            cmd: TelemetryCmd::Status
+        })
+    ));
 }
 
 /// The load-bearing invariant: every flag defined at the root MUST be

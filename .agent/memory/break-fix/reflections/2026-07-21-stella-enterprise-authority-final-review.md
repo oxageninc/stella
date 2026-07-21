@@ -33,3 +33,5 @@ The CLI's duplicate bounded-identifier validation mirrors the store's private wi
 ### Confidence in the result: high
 
 Focused RED-to-GREEN witnesses cover the reported failures; the full affected CLI/store suites, strict clippy, docs build, formatting, and size ratchet are green. Parent final re-review inspected the split ledger module, constant-time skip schema, activation ordering, continuation behavior, and public claims with no remaining Critical or Important findings.
+
+The exact post-merge remote verification then exposed two unrelated CLI integration breaks: an unclosed `TelemetryCmd` delimiter and a stale direct `Config` fixture. Both were repaired with focused compile-and-parse witnesses before the follow-up push.

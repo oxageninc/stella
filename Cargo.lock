@@ -3058,8 +3058,6 @@ dependencies = [
  "futures-util",
  "hmac",
  "libc",
- "ocp-host",
- "ocp-types",
  "reqwest",
  "rpassword",
  "rusqlite",

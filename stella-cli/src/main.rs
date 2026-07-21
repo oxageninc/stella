@@ -416,6 +416,8 @@ enum TelemetryCmd {
     Flush,
     /// Explicitly discard rows bound to a superseded enrolled sink.
     RolloverDiscard,
+}
+
 /// `stella auth` subcommands — the whole `~/.config/stella/credentials.toml`
 /// management surface. Deliberately small: a handful of BYOK keys, not a
 /// config language (mirrors `CredentialsFile`'s own doc intent).
