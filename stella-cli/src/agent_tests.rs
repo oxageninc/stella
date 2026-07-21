@@ -16,6 +16,8 @@ fn persist_event_records_cache_write_tokens_from_step_usage() {
         .expect("begin execution");
     let event = AgentEvent::StepUsage {
         step: 0,
+        role: stella_protocol::ModelCallRole::Worker,
+        provider: "anthropic".into(),
         model: "claude-fable-5".into(),
         input_tokens: 1_000,
         output_tokens: 50,
@@ -26,6 +28,7 @@ fn persist_event_records_cache_write_tokens_from_step_usage() {
         duration_ms: 1_830,
         retries: 0,
         tool_calls: 1,
+        complete: true,
     };
 
     assert!(persist_event(&store, execution_id, 0, &event, "anthropic"));
@@ -707,3 +710,6 @@ fn judge_build_failure_falls_back_to_the_worker() {
         "a judge adapter that fails to build must fall back to the worker provider"
     );
 }
+
+#[path = "agent_tests/usage_completeness.rs"]
+mod usage_completeness;

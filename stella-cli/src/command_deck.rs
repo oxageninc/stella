@@ -98,9 +98,12 @@ use crate::agent;
 use crate::claims::ClaimTap;
 use crate::config::Config;
 use crate::interactive::{AskUserIo, FREE_TEXT_LABEL, InteractiveToolSet, SkillRegistry};
+
+mod forwarder;
 use crate::memory::{SessionMemory, inject_recall_block, turn_warrants_reflection};
 use crate::runtime::{SystemClock, TokioSleeper};
 use crate::subsession::{self, SubSessions, SupervisorMsg};
+pub(crate) use forwarder::spawn_forwarder;
 
 /// The lead agent's id — the one conversation this driver runs.
 const LEAD: &str = "lead";
@@ -1652,6 +1655,7 @@ pub async fn run_deck_session(
                         registry.as_ref(),
                         "cancelled",
                         cancelled_cost,
+                        false,
                     )
                 {
                     let _ = in_tx.send(Inbound::Event {
@@ -4205,7 +4209,7 @@ async fn run_lead_turn(
         engine.run_turn(messages, budget, &tx).await
     };
     drop(tx);
-    let _ = forwarder.await;
+    let persistence_complete = forwarder.await.unwrap_or(false);
     claims.release_all();
 
     if let Some((store, id)) = &execution {
@@ -4213,7 +4217,14 @@ async fn run_lead_turn(
             TurnOutcome::Completed { cost_usd, .. } => ("completed", *cost_usd),
             TurnOutcome::Aborted { cost_usd, .. } => ("aborted", *cost_usd),
         };
-        if !agent::record_execution_end(store, *id, registry, outcome_label, cost) {
+        if !agent::record_execution_end(
+            store,
+            *id,
+            registry,
+            outcome_label,
+            cost,
+            persistence_complete,
+        ) {
             let _ = in_tx.send(Inbound::Event {
                 agent: LEAD.to_string(),
                 event: AgentEvent::Error {
@@ -4380,12 +4391,19 @@ async fn run_lead_pipeline_turn(
         pipeline.run(prompt, messages, budget).await
     };
     drop(tx);
-    let _ = forwarder.await;
+    let persistence_complete = forwarder.await.unwrap_or(false);
     claims.release_all();
 
     if let Some((store, id)) = &execution {
         let (outcome_label, cost) = agent::pipeline_execution_closeout(&result);
-        if !agent::record_execution_end(store, *id, registry, outcome_label, cost) {
+        if !agent::record_execution_end(
+            store,
+            *id,
+            registry,
+            outcome_label,
+            cost,
+            persistence_complete,
+        ) {
             let _ = in_tx.send(Inbound::Event {
                 agent: LEAD.to_string(),
                 event: AgentEvent::Error {
@@ -4419,48 +4437,6 @@ async fn run_lead_pipeline_turn(
         },
         Err(e) => Err(e.to_string()),
     }
-}
-
-/// Drain one turn's engine events: persist each (via the shared
-/// [`agent::persist_event`] write path) and forward it to the deck as
-/// `agent`'s `Inbound::Event`. The deck-mode replacement for
-/// [`agent::spawn_renderer`], shared by the lead's turns and every
-/// sub-session worker (`crate::subsession`). stderr belongs to the alternate
-/// screen here, so a persistence failure warns *through the deck* instead —
-/// once — as a transcript-visible error event; silently losing the audit
-/// trail (disk full, DB locked) is not acceptable.
-pub(crate) fn spawn_forwarder(
-    mut rx: UnboundedReceiver<AgentEvent>,
-    execution: Option<(Arc<Store>, i64)>,
-    provider_id: String,
-    inbound: UnboundedSender<Inbound>,
-    lane: String,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut seq = 0u64;
-        let mut store_warned = false;
-        while let Some(event) = rx.recv().await {
-            if let Some((store, id)) = &execution {
-                if !agent::persist_event(store, *id, seq, &event, &provider_id) && !store_warned {
-                    store_warned = true;
-                    let _ = inbound.send(Inbound::Event {
-                        agent: lane.clone(),
-                        event: AgentEvent::Error {
-                            message: "store write failed — the persisted event/telemetry \
-                                      record for this session is incomplete"
-                                .to_string(),
-                            retryable: true,
-                        },
-                    });
-                }
-                seq += 1;
-            }
-            let _ = inbound.send(Inbound::Event {
-                agent: lane.clone(),
-                event,
-            });
-        }
-    })
 }
 
 // ── ask_user through the deck ───────────────────────────────────────────────

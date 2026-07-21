@@ -391,7 +391,7 @@ pub(crate) async fn run_goal_turn(
             .await
     };
     drop(tx);
-    let _ = renderer.await;
+    let persistence_complete = renderer.await.unwrap_or_default().persistence_complete;
 
     let files = registry.files_touched();
     if let Some((store, id)) = &execution {
@@ -399,7 +399,14 @@ pub(crate) async fn run_goal_turn(
             GoalOutcome::Met { cost_usd, .. } => ("goal_met", *cost_usd),
             GoalOutcome::Unmet { cost_usd, .. } => ("goal_unmet", *cost_usd),
         };
-        if !record_execution_end(store, *id, registry, outcome_label, cost) {
+        if !record_execution_end(
+            store,
+            *id,
+            registry,
+            outcome_label,
+            cost,
+            persistence_complete,
+        ) {
             warn_store_write_failed(
                 "the audit record (files touched / memory citations / outcome)",
             );
@@ -700,7 +707,7 @@ async fn run_goal_pipeline_turn(
     };
 
     drop(tx);
-    let _ = renderer.await;
+    let persistence_complete = renderer.await.unwrap_or_default().persistence_complete;
     // The shared guard is the settled ledger, including a judge turn that
     // aborted after spending and therefore returned no `judge_cost` value.
     let total_cost_usd = budget.session_spent_usd();
@@ -710,7 +717,14 @@ async fn run_goal_pipeline_turn(
             Ok(()) => "goal_met",
             Err(_) => "goal_unmet",
         };
-        if !record_execution_end(store, *id, registry, outcome_label, total_cost_usd) {
+        if !record_execution_end(
+            store,
+            *id,
+            registry,
+            outcome_label,
+            total_cost_usd,
+            persistence_complete,
+        ) {
             warn_store_write_failed(
                 "the audit record (files touched / memory citations / outcome)",
             );

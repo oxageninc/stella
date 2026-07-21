@@ -206,6 +206,19 @@ pub struct CompletionUsage {
     pub cache_write_tokens: u64,
 }
 
+impl CompletionUsage {
+    /// Whether this envelope proves accounting completeness. External
+    /// providers' all-zero envelopes are ambiguous (missing usage is commonly
+    /// normalized to zeros), while Stella's local provider is provably free.
+    pub fn is_complete_for(&self, provider: &str) -> bool {
+        provider == "local"
+            || self.input_tokens > 0
+            || self.output_tokens > 0
+            || self.cached_input_tokens > 0
+            || self.cache_write_tokens > 0
+    }
+}
+
 /// Why the model stopped generating, normalized across providers. Lets the
 /// engine tell a natural stop from a truncation (`Length`) so an empty or
 /// cut-off turn is surfaced to the user instead of being recorded as a clean

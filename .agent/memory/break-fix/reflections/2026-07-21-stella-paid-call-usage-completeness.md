@@ -1,0 +1,7 @@
+# Stella paid-call usage completeness
+
+The defect crossed four boundaries: provider dispatch, cancellation, local persistence, and enterprise backfill. Fixing only the visible aggregate would still allow unknown usage into trusted rollups.
+
+The durable invariant is monotonic: each dispatched call yields either one complete role/provider envelope or one content-free incomplete marker, and any later write failure permanently downgrades the execution. Export selection filters eligibility without consuming incomplete rows, so a bounded page remains live.
+
+The most useful regression shape combined exact-once cancellation at the cost-settlement no-await boundary with a duplicate event/telemetry write failure followed by an otherwise successful closeout.

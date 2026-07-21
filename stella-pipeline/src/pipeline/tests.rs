@@ -13,8 +13,8 @@ use stella_core::router::{CircuitBreaker, ProviderProfile, RoleTable};
 use stella_core::{Clock, ToolExecutor};
 use stella_protocol::event::BudgetMode;
 use stella_protocol::{
-    CompletionRequest, CompletionUsage, FileChangeKind, MessageRole, ProviderError, ScopeProposal,
-    ToolOutput, ToolSchema,
+    CompletionRequest, CompletionResult, CompletionUsage, FileChangeKind, MessageRole,
+    ProviderError, ScopeProposal, ToolOutput, ToolSchema,
 };
 use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::mpsc;
@@ -1562,3 +1562,4 @@ async fn best_of_n_without_a_port_degrades_to_the_shared_tree_with_a_warning() {
 
 mod task4;
 mod task5;
+mod usage;

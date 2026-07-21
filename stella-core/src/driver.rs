@@ -180,6 +180,7 @@ pub struct Engine<'a> {
     pub(crate) tools: &'a dyn ToolExecutor,
     pub(crate) sleeper: &'a dyn Sleeper,
     pub(crate) config: EngineConfig,
+    call_role: stella_protocol::ModelCallRole,
     /// Lifecycle hooks, off by default. Attached via [`Engine::with_hooks`]
     /// so `with_sleeper` keeps its existing signature. When `None`,
     /// no hook is ever consulted and the turn path adds zero work.
@@ -227,8 +228,6 @@ struct CommittedStep {
     /// attempt's pool never gets here — it is dropped with the attempt.
     speculation: SpeculationPool,
     estimated_input_tokens: u64,
-    retries: u32,
-    duration_ms: u64,
 }
 
 impl<'a> Engine<'a> {
@@ -248,11 +247,19 @@ impl<'a> Engine<'a> {
             tools,
             sleeper,
             config,
+            call_role: stella_protocol::ModelCallRole::Worker,
             hooks: None,
             calibration: None,
             gate: None,
             steering: None,
         }
+    }
+
+    /// Attribute this engine's provider calls to a concrete pipeline role.
+    /// Ordinary execution defaults to [`ModelCallRole::Worker`].
+    pub fn with_call_role(mut self, role: stella_protocol::ModelCallRole) -> Self {
+        self.call_role = role;
+        self
     }
 
     /// Attach lifecycle hooks (`crate::hooks`) to an engine, opt-in. Kept a
@@ -389,7 +396,7 @@ impl<'a> Engine<'a> {
                 return aborted;
             }
 
-            let committed = match self.run_model_call(messages, budget, events).await {
+            let committed = match self.run_model_call(step, messages, budget, events).await {
                 Ok(committed) => committed,
                 Err(reason) => {
                     return TurnOutcome::Aborted {
@@ -610,6 +617,7 @@ impl<'a> Engine<'a> {
     /// pass.
     async fn run_model_call(
         &self,
+        step: usize,
         messages: &[CompletionMessage],
         budget: &mut BudgetGuard,
         events: &UnboundedSender<AgentEvent>,
@@ -676,6 +684,20 @@ impl<'a> Engine<'a> {
         } = match retry_with_backoff(&self.config.retry_policy, self.sleeper, attempt).await {
             Ok(outcome) => outcome,
             Err(error) => {
+                let duration_ms = call_started.elapsed().as_millis() as u64;
+                let retries = if error.is_retryable() {
+                    self.config.retry_policy.max_retries
+                } else {
+                    0
+                };
+                let _ = events.send(AgentEvent::UsageIncomplete {
+                    role: self.call_role,
+                    provider: self.provider.id().to_string(),
+                    model: String::new(),
+                    reason: stella_protocol::UsageIncompleteReason::ProviderError,
+                    duration_ms,
+                    retries: Some(retries),
+                });
                 let message = error.to_string();
                 let _ = events.send(AgentEvent::Error {
                     message: message.clone(),
@@ -685,7 +707,6 @@ impl<'a> Engine<'a> {
             }
         };
         let budget_outcome = record_settled_cost(budget, result.cost_usd, events);
-        let speculation = speculation_future.await;
         let call_duration_ms = call_started.elapsed().as_millis() as u64;
 
         // Deferred-flush: these `Retry` events only reach the wire now
@@ -697,14 +718,33 @@ impl<'a> Engine<'a> {
             });
         }
 
+        // Cost and usage settle at one no-await boundary. Speculative tool
+        // work may still be draining; cancellation in that interval must not
+        // preserve spend while losing its per-call accounting envelope.
+        let _ = events.send(AgentEvent::StepUsage {
+            step,
+            role: self.call_role,
+            provider: self.provider.id().to_string(),
+            model: result.model.clone(),
+            input_tokens: result.usage.input_tokens,
+            output_tokens: result.usage.output_tokens,
+            cached_input_tokens: result.usage.cached_input_tokens,
+            cache_write_tokens: result.usage.cache_write_tokens,
+            estimated_input_tokens,
+            cost_usd: result.cost_usd,
+            duration_ms: call_duration_ms,
+            retries: retries.len() as u32,
+            tool_calls: result.tool_calls.len(),
+            complete: result.usage.is_complete_for(self.provider.id()),
+        });
+        let speculation = speculation_future.await;
+
         Ok(CommittedStep {
             result,
             budget_outcome,
             read_only_tools,
             speculation,
             estimated_input_tokens,
-            retries: retries.len() as u32,
-            duration_ms: call_duration_ms,
         })
     }
 
@@ -751,7 +791,7 @@ impl<'a> Engine<'a> {
     /// (see body), never as a mid-tool kill.
     fn handle_committed_result(
         &self,
-        step: usize,
+        _step: usize,
         committed: &CommittedStep,
         total_cost_usd: f64,
         messages: &mut Vec<CompletionMessage>,
@@ -771,20 +811,6 @@ impl<'a> Engine<'a> {
                 result.usage.input_tokens,
             );
         }
-
-        let _ = events.send(AgentEvent::StepUsage {
-            step,
-            model: result.model.clone(),
-            input_tokens: result.usage.input_tokens,
-            output_tokens: result.usage.output_tokens,
-            cached_input_tokens: result.usage.cached_input_tokens,
-            cache_write_tokens: result.usage.cache_write_tokens,
-            estimated_input_tokens: committed.estimated_input_tokens,
-            cost_usd: result.cost_usd,
-            duration_ms: committed.duration_ms,
-            retries: committed.retries,
-            tool_calls: result.tool_calls.len(),
-        });
 
         let BudgetOutcome::AbortTurn {
             spent_usd,
@@ -3161,4 +3187,5 @@ mod tests {
     }
 
     mod task4;
+    mod usage_completeness;
 }
