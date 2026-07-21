@@ -92,6 +92,10 @@ def parse_canonical_object(raw: bytes, *, label: str) -> dict[str, object]:
         raise ValueError(f"{label} must contain a JSON object")
     try:
         expected = canonical_file_bytes(value)
+    except UnicodeEncodeError as exc:
+        raise ValueError(
+            f"{label} contains invalid Unicode for canonical JSON"
+        ) from exc
     except (TypeError, ValueError) as exc:
         raise ValueError(f"{label} cannot be represented canonically: {exc}") from exc
     if raw != expected:

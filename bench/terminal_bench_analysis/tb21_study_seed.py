@@ -8,6 +8,9 @@ from collections.abc import Sequence
 
 TaskIdentity = tuple[str, str, str]
 
+# Internal hash-domain label; not an artifact schema version.
+TASK_SET_HASH_DOMAIN = "stella-tb21-task-set-v1"
+
 TASK_IDENTITIES: tuple[TaskIdentity, ...] = (
     (
         "adaptive-rejection-sampler",
@@ -464,7 +467,7 @@ def task_set_sha256(identities: Sequence[TaskIdentity]) -> str:
         for name, task_ref, checksum in sorted(identities)
     ]
     encoded = json.dumps(
-        {"schema": "stella-tb21-task-set-v1", "tasks": tasks},
+        {"schema": TASK_SET_HASH_DOMAIN, "tasks": tasks},
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=False,

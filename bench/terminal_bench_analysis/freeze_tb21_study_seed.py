@@ -14,6 +14,11 @@ import harbor
 from harbor.models.task.task import Task
 
 LEADERBOARD_JOB_ID = "fd8707bb-51e8-56fa-8e46-769a82a531ae"
+TASK_SET_HASH_DOMAIN = "stella-tb21-task-set-v1"
+EXPECTED_TRIAL_COUNT = 445
+PINNED_TASK_SET_SHA256 = (
+    "7e495afe0a86eaf572be1c2da2b9929c24e502adc888e550385d915cc0125ece"
+)
 CONTROL_SHA256 = {
     "manifest.json": "7963a7af2b306fd4b6e82963fdadf9374e701ec16f47b194300e2843c8002a76",
     "submission.json": (
@@ -78,6 +83,20 @@ TaskIdentity = tuple[str, str, str]
 
 def _sha256(raw: bytes) -> str:
     return hashlib.sha256(raw).hexdigest()
+
+
+def _task_set_sha256(identities: tuple[TaskIdentity, ...]) -> str:
+    tasks = [
+        {"task": name, "task_ref": task_ref, "task_checksum": checksum}
+        for name, task_ref, checksum in sorted(identities)
+    ]
+    encoded = json.dumps(
+        {"schema": TASK_SET_HASH_DOMAIN, "tasks": tasks},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return _sha256(encoded)
 
 
 def _reject_duplicate_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -159,11 +178,17 @@ def _manifest_trials(
         raise RuntimeError("manifest entries and submission trials must be arrays")
     if failures != []:
         raise RuntimeError("manifest contains failed downloads")
-    if len(entries) != 445 or len(submitted_ids) != 445:
-        raise RuntimeError("expected exactly 445 manifest entries and submitted trials")
+    if (
+        len(entries) != EXPECTED_TRIAL_COUNT
+        or len(submitted_ids) != EXPECTED_TRIAL_COUNT
+    ):
+        raise RuntimeError(
+            f"expected exactly {EXPECTED_TRIAL_COUNT} manifest entries and "
+            "submitted trials"
+        )
     if any(not isinstance(trial_id, str) for trial_id in submitted_ids):
         raise RuntimeError("submission trial IDs must all be strings")
-    if len(set(submitted_ids)) != 445:
+    if len(set(submitted_ids)) != EXPECTED_TRIAL_COUNT:
         raise RuntimeError("submission trial IDs are not unique")
 
     entry_ids: list[str] = []
@@ -232,7 +257,9 @@ def _manifest_trials(
             )
         identities.append((task_name, task_ref, task_checksum))
 
-    if len(set(entry_ids)) != 445 or set(entry_ids) != set(submitted_ids):
+    if len(set(entry_ids)) != EXPECTED_TRIAL_COUNT or set(entry_ids) != set(
+        submitted_ids
+    ):
         raise RuntimeError("manifest trials differ from the submitted trial allowlist")
     actual_trial_entries = {path.name for path in trials_dir.iterdir()}
     if actual_trial_entries != set(submitted_ids) or not all(
@@ -266,13 +293,20 @@ def _verify_local_dataset(
         (dataset_dir / name).is_dir() for name in expected_names
     ):
         raise RuntimeError("local dataset has extra or missing task directories")
-    for task_name, _task_ref, expected_checksum in identities:
+    locally_verified: list[TaskIdentity] = []
+    for task_name, task_ref, expected_checksum in identities:
         actual_checksum = Task(dataset_dir / task_name).checksum
         if actual_checksum != expected_checksum:
             raise RuntimeError(
                 f"Harbor task checksum differs for {task_name}: "
                 f"{actual_checksum} != {expected_checksum}"
             )
+        locally_verified.append((task_name, task_ref, actual_checksum))
+    if _task_set_sha256(tuple(locally_verified)) != PINNED_TASK_SET_SHA256:
+        raise RuntimeError(
+            "locally checksum-verified tasks differ from the pinned task identity "
+            "binding"
+        )
 
 
 def _source_bytes(identities: tuple[TaskIdentity, ...]) -> bytes:
@@ -295,6 +329,9 @@ from collections.abc import Sequence
 
 TaskIdentity = tuple[str, str, str]
 
+# Internal hash-domain label; not an artifact schema version.
+TASK_SET_HASH_DOMAIN = {json.dumps(TASK_SET_HASH_DOMAIN)}
+
 TASK_IDENTITIES: tuple[TaskIdentity, ...] = (
 {records})
 
@@ -306,7 +343,7 @@ def task_set_sha256(identities: Sequence[TaskIdentity]) -> str:
         for name, task_ref, checksum in sorted(identities)
     ]
     encoded = json.dumps(
-        {{"schema": "stella-tb21-task-set-v1", "tasks": tasks}},
+        {{"schema": TASK_SET_HASH_DOMAIN, "tasks": tasks}},
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=False,
