@@ -88,6 +88,8 @@ use stella_protocol::{AgentEvent, TaskItem, TaskStatus, ToolOutput};
 //   migrations  (crate-private) versioned upgrades + the fresh-file bootstrap
 //   cache_gaps  per-call cache-gap facts behind the `cache_expired_rewrite`
 //               counter (split out to keep this file under its size ratchet)
+//   cache_trend per-session cache trend — telemetry already persists these
+//               facts; this groups them by session for `stella stats`
 //   catalog     `catalog.db` — user-tier model catalog (slugs, pricing)
 //   journal     append-only per-session sidecar journal (crash-safe resume)
 //   notify      persist-until-read cross-session notifications
@@ -102,6 +104,7 @@ mod private_state_tests;
 mod quarantine_tests;
 
 pub mod cache_gaps;
+pub mod cache_trend;
 pub mod catalog;
 pub mod enterprise_telemetry;
 pub mod journal;
