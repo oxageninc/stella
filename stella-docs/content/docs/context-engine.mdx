@@ -27,6 +27,30 @@ Everything is on your disk, under `.stella/`:
 when Stella believed it: re-running `stella init` **supersedes** stale facts
 rather than deleting them, so "what did we believe then?" stays answerable.
 
+## Local-first today; share rules through Git
+
+The stores above are **workspace-local**. Stella does not currently aggregate
+memories, reflection logs, or telemetry into a hosted team graph, and it does
+not silently publish a learned pattern as organization policy.
+
+The shareable boundary is `.stella/rules/*.md`: commit a reviewed rule file to
+the repository and every contributor receives the same repository steering on
+their next session. `stella memory promote <id>` creates that local rule file
+after a memory has earned promotion; it does **not** stage, commit, push, or
+open a pull request.
+
+This distinction is intentional:
+
+- **Local observations** and personal preferences remain private by default.
+- **Repository rules** are durable, human-readable instructions that can be
+  reviewed, versioned, and reverted with ordinary Git workflows.
+- **Context retrieval** remains local and bounded to the current workspace and
+  task.
+
+For the current promotion command, see [`stella memory`](/docs/commands/memory).
+Any future team-level Context PR workflow should extend this Git-governed rule
+boundary rather than make private local telemetry a shared source of truth.
+
 ## Two injection points, one cache discipline
 
 Stella feeds context to the model at exactly two places, chosen so the
