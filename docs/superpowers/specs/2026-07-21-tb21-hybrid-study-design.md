@@ -1,6 +1,6 @@
 # Terminal-Bench 2.1 hybrid study design
 
-Status: approved direction; implementation pending written-spec review
+Status: approved for implementation
 
 Date: 2026-07-21
 
