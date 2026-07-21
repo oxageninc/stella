@@ -48,7 +48,7 @@ pub(crate) async fn run_raw_one_shot(
         .await?
     };
     let base_tools: &dyn ToolExecutor = match &mcp {
-        Some(set) => set,
+        Some(set) => set.as_ref(),
         None => &*registry,
     };
     let custom_tools = if process_free {
@@ -212,7 +212,7 @@ pub async fn run_goal_cmd(
     )
     .await?;
     let base_tools: &dyn ToolExecutor = match &mcp {
-        Some(set) => set,
+        Some(set) => set.as_ref(),
         None => &*registry,
     };
     let custom_tools = discover_custom_tools(cfg, true).await;
@@ -254,6 +254,7 @@ pub async fn run_goal_cmd(
             Some(presence.id()),
             registry_options.clone(),
             active_rules.clone(),
+            mcp.clone(),
         )
         .await
     } else {
@@ -468,6 +469,7 @@ async fn run_goal_pipeline_turn(
     session: Option<&str>,
     registry_options: stella_tools::RegistryOptions,
     active_rules: crate::rules::ResolvedRules,
+    mcp: Option<Arc<stella_mcp::McpToolSet>>,
 ) -> Result<(), String> {
     let turn_start = Instant::now();
     let execution = begin_execution(store, "goal", goal, cfg, session);
@@ -549,6 +551,7 @@ async fn run_goal_pipeline_turn(
             cfg,
             registry_options,
             active_rules.clone(),
+            mcp,
         )?;
         let no_recall = NoContextRecall;
         let recall: &dyn ContextRecallPort = &no_recall;
@@ -595,6 +598,10 @@ async fn run_goal_pipeline_turn(
                     .as_ref()
                     .map(|h| (h, &hook_runner as &dyn stella_core::hooks::HookRunner)),
                 candidate_workspaces: Some(&ws_ports.candidate_workspaces),
+                mcp_prefetch: ws_ports
+                    .mcp_prefetch
+                    .as_ref()
+                    .map(|p| p as &dyn McpPrefetchPort),
                 // Goal pipeline rounds run without an interactive steer tap.
                 steering: None,
             };

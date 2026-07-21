@@ -25,9 +25,9 @@ use stella_mcp::{McpConfig, McpServerConfig, McpToolSet};
 use stella_model::credential::ApiKey;
 use stella_model::provider::Provider;
 use stella_pipeline::{
-    AlwaysAbortGate, CmdOutcome, ContextRecallPort, NoContextRecall, Pipeline, PipelineConfig,
-    PipelinePorts, PipelineStatus, ProviderResolver, RepoStatusPort, RepoStructurePort,
-    StdioApprovalGate,
+    AlwaysAbortGate, CmdOutcome, ContextRecallPort, McpPrefetchPort, NoContextRecall, Pipeline,
+    PipelineConfig, PipelinePorts, PipelineStatus, ProviderResolver, RepoStatusPort,
+    RepoStructurePort, StdioApprovalGate,
 };
 use stella_protocol::event::BudgetMode;
 use stella_protocol::{AgentEvent, CompletionMessage, ModelRef, Role, ToolOutput};
@@ -124,7 +124,7 @@ async fn run_pipeline_one_shot(
     )
     .await?;
     let base_tools: &dyn ToolExecutor = match &mcp {
-        Some(set) => set,
+        Some(set) => set.as_ref(),
         None => &*registry,
     };
     let custom_tools = discover_custom_tools(cfg, format == OutputFormat::Text).await;
@@ -195,6 +195,7 @@ async fn run_pipeline_one_shot(
             cfg,
             registry_options,
             active_rules.clone(),
+            mcp.clone(),
         )?;
 
         let breaker = CircuitBreaker::new(Box::new(SystemClock::new()));
@@ -244,6 +245,10 @@ async fn run_pipeline_one_shot(
                 .as_ref()
                 .map(|h| (h, &hook_runner as &dyn stella_core::hooks::HookRunner)),
             candidate_workspaces: Some(&ws_ports.candidate_workspaces),
+            mcp_prefetch: ws_ports
+                .mcp_prefetch
+                .as_ref()
+                .map(|p| p as &dyn McpPrefetchPort),
             // Headless / fleet: no concurrent input channel to steer from.
             steering: None,
         };
@@ -437,7 +442,7 @@ pub async fn run_interactive(cfg: &Config, budget_limit: Option<f64>) -> Result<
         Box::new(|| {}),
     );
     let base_tools: &dyn ToolExecutor = match &mcp {
-        Some(set) => set,
+        Some(set) => set.as_ref(),
         None => &*registry,
     };
     let custom_tools = discover_custom_tools(cfg, true).await;
@@ -1134,7 +1139,7 @@ pub(crate) async fn connect_mcp(
     native: std::sync::Arc<dyn ToolExecutor>,
     usage: Option<stella_core::mcp_usage::McpUsageLedger>,
     print_diagnostics: bool,
-) -> Result<Option<McpToolSet>, String> {
+) -> Result<Option<Arc<McpToolSet>>, String> {
     let servers = match load_mcp_plan(cfg) {
         McpPlan::None => return Ok(None),
         McpPlan::Invalid(reason) => {
@@ -1163,7 +1168,10 @@ pub(crate) async fn connect_mcp(
             );
         }
     }
-    Ok(Some(set))
+    // Arc'd so a pipeline driver can share the same connected set into the
+    // Best-of-N candidate tool surface and orchestrator pre-fetch (issue
+    // #248 Phase 1) alongside its own `&dyn ToolExecutor` borrow.
+    Ok(Some(Arc::new(set)))
 }
 
 pub(crate) async fn discover_custom_tools(
