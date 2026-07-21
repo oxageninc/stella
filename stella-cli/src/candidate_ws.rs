@@ -270,7 +270,8 @@ impl GitCandidateWorkspaces {
         match populate_snapshot(&toplevel, &dir, &root_rel).await {
             Ok(overlay_untracked) => {
                 let ws_root = dir.join(&root_rel);
-                let registry = ToolRegistry::new_detected(ws_root.clone(), self.options).await;
+                let registry =
+                    ToolRegistry::new_detected(ws_root.clone(), self.options.clone()).await;
                 // Same governance as the session registry: workspace rules
                 // and the schema gate travel with the tree — best-of-N must
                 // not be a way around them. Applied while `registry` is still

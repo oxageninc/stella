@@ -11,24 +11,21 @@
 //! through the `ArtifactStore` into `.stella/artifacts/` — the single
 //! allowed writer — and every tool reports the citation-ready path.
 //!
-//! Video is an async, dollar-cost job behind the cost gate
-//! A tool call has no interactive confirmation
-//! surface, so `generate_video` runs the gate headless — deny by default,
-//! with the explicit `confirm_spend` input as the `--yes`-equivalent bypass
-//! the model passes only after the user approved the reported estimate. The
-//! submitted handle is persisted through the `JobStore` so a dropped session
-//! never orphans a paid job; `poll_video` reconciles it live against the
-//! provider (L-V3) and persists the finished artifact under the identity
-//! assigned at submit.
+//! Image and video submissions cross a host-owned spend gate before touching
+//! the provider. Tool arguments cannot approve spend; callers without an
+//! injected host gate deny by default. A submitted video handle is persisted
+//! through the `JobStore` so a dropped session never orphans a paid job;
+//! `poll_video` reconciles it live against the provider (L-V3) and persists
+//! the finished artifact under the identity assigned at submit.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::Value;
 use stella_media::{
-    ArtifactStore, DEFAULT_SVG_ATTEMPTS, DEFAULT_VIDEO_COST_THRESHOLD_USD, HeadlessCostGate,
-    ImageRequest, ImageSize, JobStore, MediaJobState, MediaKind, MediaProvider, SvgPipeline,
-    VideoRequest, evaluate_video_cost,
+    ArtifactStore, CostDecision, DEFAULT_SVG_ATTEMPTS, DenyMediaSpendGate, ImageRequest, ImageSize,
+    JobStore, MediaJobState, MediaKind, MediaProvider, MediaSpendGate, MediaSpendRequest,
+    SvgPipeline, VideoRequest,
 };
 use stella_protocol::tool::{ToolOutput, ToolSchema};
 
@@ -90,7 +87,46 @@ fn open_jobs(root: &std::path::Path) -> JobStore {
     JobStore::open(root.join(".stella").join("artifacts"))
 }
 
-pub struct GenerateImage(pub Arc<dyn MediaProvider>);
+fn spend_denied(request: &MediaSpendRequest) -> ToolOutput {
+    let estimate = request
+        .estimated_usd
+        .map_or_else(|| "unknown cost".to_string(), |usd| format!("${usd:.4}"));
+    ToolOutput::Error {
+        message: format!(
+            "media spend requires host approval: {} submission to {} ({estimate}; {})",
+            match request.kind {
+                MediaKind::Image => "image",
+                MediaKind::Video => "video",
+                MediaKind::Svg => "SVG",
+            },
+            request.provider_id,
+            request.detail
+        ),
+    }
+}
+
+pub struct GenerateImage {
+    provider: Arc<dyn MediaProvider>,
+    spend_gate: Arc<dyn MediaSpendGate>,
+}
+
+impl GenerateImage {
+    /// Construct with the secure deny-by-default host gate.
+    pub fn new(provider: Arc<dyn MediaProvider>) -> Self {
+        Self::with_spend_gate(provider, Arc::new(DenyMediaSpendGate))
+    }
+
+    /// Construct with an explicit gate owned by the host runtime.
+    pub fn with_spend_gate(
+        provider: Arc<dyn MediaProvider>,
+        spend_gate: Arc<dyn MediaSpendGate>,
+    ) -> Self {
+        Self {
+            provider,
+            spend_gate,
+        }
+    }
+}
 
 #[async_trait]
 impl Tool for GenerateImage {
@@ -148,7 +184,27 @@ impl Tool for GenerateImage {
             request.label = label.to_string();
         }
 
-        let artifact = match self.0.generate_image(request).await {
+        let capabilities = self.provider.capabilities();
+        let estimate = capabilities.estimate_image(request.n, request.size);
+        let spend_request = MediaSpendRequest::new(
+            MediaKind::Image,
+            self.provider.id(),
+            estimate.as_ref().map(|estimate| estimate.estimated_usd),
+            estimate.map_or_else(
+                || {
+                    format!(
+                        "{} image(s) at {} (cost unavailable)",
+                        request.n, request.size
+                    )
+                },
+                |estimate| estimate.detail,
+            ),
+        );
+        if self.spend_gate.authorize(&spend_request).await != CostDecision::Approve {
+            return spend_denied(&spend_request);
+        }
+
+        let artifact = match self.provider.generate_image(request).await {
             Ok(a) => a,
             Err(e) => {
                 return ToolOutput::Error {
@@ -175,7 +231,28 @@ impl Tool for GenerateImage {
     }
 }
 
-pub struct GenerateVideo(pub Arc<dyn MediaProvider>);
+pub struct GenerateVideo {
+    provider: Arc<dyn MediaProvider>,
+    spend_gate: Arc<dyn MediaSpendGate>,
+}
+
+impl GenerateVideo {
+    /// Construct with the secure deny-by-default host gate.
+    pub fn new(provider: Arc<dyn MediaProvider>) -> Self {
+        Self::with_spend_gate(provider, Arc::new(DenyMediaSpendGate))
+    }
+
+    /// Construct with an explicit gate owned by the host runtime.
+    pub fn with_spend_gate(
+        provider: Arc<dyn MediaProvider>,
+        spend_gate: Arc<dyn MediaSpendGate>,
+    ) -> Self {
+        Self {
+            provider,
+            spend_gate,
+        }
+    }
+}
 
 #[async_trait]
 impl Tool for GenerateVideo {
@@ -184,9 +261,8 @@ impl Tool for GenerateVideo {
             name: "generate_video".into(),
             description: "Submit an asynchronous text-to-video job with the configured BYOK \
                           video provider; returns the job id to check with poll_video. Video \
-                          costs real money: any job with a positive estimated cost is denied \
-                          unless `confirm_spend` is true — set it only after the user has \
-                          approved the estimate this tool reports."
+                          costs real money and requires approval from the host runtime before \
+                          provider submission."
                 .into(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -203,11 +279,6 @@ impl Tool for GenerateVideo {
                     "label": {
                         "type": "string",
                         "description": "Short human label for the artifact filename"
-                    },
-                    "confirm_spend": {
-                        "type": "boolean",
-                        "description": "Explicit, user-approved consent to spend the estimated \
-                                        cost (default false: the cost gate denies the job)"
                     }
                 },
                 "required": ["prompt"]
@@ -238,29 +309,21 @@ impl Tool for GenerateVideo {
             request.label = label.to_string();
         }
 
-        // The cost gate, headless: deny by default,
-        // `confirm_spend` is the explicit `--yes`-equivalent bypass. No rate
-        // card means no estimate, and an unpriced (free-tier) job is not
-        // gated — the same rule as `evaluate_video_cost`'s zero-cost path.
-        let confirm_spend = input
-            .get("confirm_spend")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        if let Some(estimate) = self.0.capabilities().estimate_video(duration_secs) {
-            let gate = HeadlessCostGate::new(confirm_spend);
-            if let Err(e) = evaluate_video_cost(&estimate, DEFAULT_VIDEO_COST_THRESHOLD_USD, &gate)
-            {
-                return ToolOutput::Error {
-                    message: format!(
-                        "{e} ({}). Ask the user to approve the spend, then retry with \
-                         `confirm_spend: true`.",
-                        estimate.detail
-                    ),
-                };
-            }
+        let estimate = self.provider.capabilities().estimate_video(duration_secs);
+        let spend_request = MediaSpendRequest::new(
+            MediaKind::Video,
+            self.provider.id(),
+            estimate.as_ref().map(|estimate| estimate.estimated_usd),
+            estimate.map_or_else(
+                || format!("{duration_secs}s video (cost unavailable)"),
+                |estimate| estimate.detail,
+            ),
+        );
+        if self.spend_gate.authorize(&spend_request).await != CostDecision::Approve {
+            return spend_denied(&spend_request);
         }
 
-        let job = match self.0.generate_video(request).await {
+        let job = match self.provider.generate_video(request).await {
             Ok(job) => job,
             Err(e) => {
                 return ToolOutput::Error {
@@ -493,8 +556,8 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use stella_media::{
-        MediaArtifact, MediaCapabilities, MediaError, MediaJob, MediaJobStatus, MediaKind,
-        VideoRequest,
+        CostDecision, MediaArtifact, MediaCapabilities, MediaError, MediaJob, MediaJobStatus,
+        MediaKind, MediaSpendGate, MediaSpendRequest, VideoRequest,
     };
 
     /// A deterministic in-memory provider: one fixed PNG-ish artifact, no
@@ -531,8 +594,66 @@ mod tests {
         }
     }
 
+    struct CountingImages {
+        submits: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl MediaProvider for CountingImages {
+        fn id(&self) -> &str {
+            "counting"
+        }
+
+        fn capabilities(&self) -> MediaCapabilities {
+            MediaCapabilities {
+                provider_id: "counting".into(),
+                image: true,
+                image_usd_each: Some(0.01),
+                ..Default::default()
+            }
+        }
+
+        async fn generate_image(&self, req: ImageRequest) -> Result<MediaArtifact, MediaError> {
+            self.submits.fetch_add(1, Ordering::SeqCst);
+            Ok(MediaArtifact {
+                kind: MediaKind::Image,
+                bytes: vec![0x89, b'P', b'N', b'G'],
+                extension: "png".into(),
+                label: req.label,
+                model: "counting-image-1".into(),
+                cost_usd: 0.01,
+            })
+        }
+
+        async fn generate_video(&self, _req: VideoRequest) -> Result<MediaJob, MediaError> {
+            Err(MediaError::Transport("not under test".into()))
+        }
+
+        async fn poll_video(&self, _job: &MediaJob) -> Result<MediaJobStatus, MediaError> {
+            Err(MediaError::Transport("not under test".into()))
+        }
+    }
+
+    struct ApproveSpendGate {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl MediaSpendGate for ApproveSpendGate {
+        async fn authorize(&self, _request: &MediaSpendRequest) -> CostDecision {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            CostDecision::Approve
+        }
+    }
+
+    fn approving_gate() -> Arc<dyn MediaSpendGate> {
+        Arc::new(ApproveSpendGate {
+            calls: AtomicUsize::new(0),
+        })
+    }
+
     fn tool() -> GenerateImage {
-        GenerateImage(Arc::new(FakeImages))
+        GenerateImage::with_spend_gate(Arc::new(FakeImages), approving_gate())
     }
 
     #[test]
@@ -540,6 +661,74 @@ mod tests {
         let schema = tool().schema();
         assert_eq!(schema.name, "generate_image");
         assert!(!schema.read_only);
+    }
+
+    #[tokio::test]
+    async fn image_without_a_host_gate_is_denied_before_submission() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = Arc::new(CountingImages {
+            submits: AtomicUsize::new(0),
+        });
+        let out = GenerateImage::new(provider.clone())
+            .execute(&serde_json::json!({"prompt": "a star"}), dir.path())
+            .await;
+        match out {
+            ToolOutput::Error { message } => {
+                assert!(message.contains("host approval"), "{message}");
+            }
+            ToolOutput::Ok { content } => panic!("the host gate must deny: {content}"),
+        }
+        assert_eq!(provider.submits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn approving_host_gate_allows_exactly_one_provider_submission() {
+        let provider = Arc::new(CountingImages {
+            submits: AtomicUsize::new(0),
+        });
+        let gate = Arc::new(ApproveSpendGate {
+            calls: AtomicUsize::new(0),
+        });
+        let backend = || MediaBackend {
+            image: provider.clone(),
+            video: None,
+        };
+
+        let denied_root = tempfile::tempdir().expect("tempdir");
+        let denied = crate::registry::ToolRegistry::with_backends_and_options(
+            denied_root.path().to_path_buf(),
+            None,
+            Some(backend()),
+            crate::registry::RegistryOptions {
+                media_requires_host_approval: false,
+                media_spend_gate: Some(gate.clone()),
+                ..Default::default()
+            },
+        );
+        let denied_out = denied
+            .execute("generate_image", &serde_json::json!({"prompt": "a star"}))
+            .await;
+        assert!(denied_out.is_error(), "{denied_out:?}");
+        assert_eq!(provider.submits.load(Ordering::SeqCst), 0);
+
+        let approved_root = tempfile::tempdir().expect("tempdir");
+        let approved = crate::registry::ToolRegistry::with_backends_and_options(
+            approved_root.path().to_path_buf(),
+            None,
+            Some(backend()),
+            crate::registry::RegistryOptions {
+                media_requires_host_approval: true,
+                media_spend_gate: Some(gate.clone()),
+                ..Default::default()
+            },
+        );
+        let approved_out = approved
+            .execute("generate_image", &serde_json::json!({"prompt": "a star"}))
+            .await;
+
+        assert!(!approved_out.is_error(), "{approved_out:?}");
+        assert_eq!(gate.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.submits.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -664,14 +853,11 @@ mod tests {
         JobStore::open(root.join(".stella").join("artifacts"))
     }
 
-    /// Submit through the tool with consent, so the poll tests exercise the
-    /// real persisted handle.
+    /// Submit through an approving host gate so poll tests exercise the real
+    /// persisted handle.
     async fn submit(fake: &Arc<FakeVideo>, root: &std::path::Path) {
-        let out = GenerateVideo(fake.clone())
-            .execute(
-                &serde_json::json!({"prompt": "a teaser", "confirm_spend": true}),
-                root,
-            )
+        let out = GenerateVideo::with_spend_gate(fake.clone(), approving_gate())
+            .execute(&serde_json::json!({"prompt": "a teaser"}), root)
             .await;
         assert!(matches!(out, ToolOutput::Ok { .. }), "{out:?}");
     }
@@ -680,26 +866,34 @@ mod tests {
     fn video_and_svg_schemas_are_mutating_and_named() {
         let fake = FakeVideo::new(Some(0.2), MediaJobState::Running);
         for (schema, name) in [
-            (GenerateVideo(fake.clone()).schema(), "generate_video"),
+            (
+                GenerateVideo::with_spend_gate(fake.clone(), approving_gate()).schema(),
+                "generate_video",
+            ),
             (PollVideo(fake).schema(), "poll_video"),
             (GenerateSvg.schema(), "generate_svg"),
         ] {
             assert_eq!(schema.name, name);
             assert!(!schema.read_only);
+            assert!(
+                schema.input_schema["properties"]
+                    .get("confirm_spend")
+                    .is_none(),
+                "model schemas must not expose spend authority"
+            );
         }
     }
 
     #[tokio::test]
-    async fn video_without_confirm_spend_is_denied_before_submission() {
+    async fn video_without_a_host_gate_is_denied_before_submission() {
         let dir = tempfile::tempdir().expect("tempdir");
         let fake = FakeVideo::new(Some(0.2), MediaJobState::Running);
-        let out = GenerateVideo(fake.clone())
+        let out = GenerateVideo::new(fake.clone())
             .execute(&serde_json::json!({"prompt": "a teaser"}), dir.path())
             .await;
         match out {
             ToolOutput::Error { message } => {
-                assert!(message.contains("cost gate"), "{message}");
-                assert!(message.contains("confirm_spend"), "{message}");
+                assert!(message.contains("host approval"), "{message}");
             }
             ToolOutput::Ok { content } => panic!("the gate must deny: {content}"),
         }
@@ -712,10 +906,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn video_with_confirm_spend_submits_and_persists_the_handle() {
+    async fn model_controlled_confirm_spend_cannot_authorize_video() {
         let dir = tempfile::tempdir().expect("tempdir");
         let fake = FakeVideo::new(Some(0.2), MediaJobState::Running);
-        let out = GenerateVideo(fake.clone())
+        let out = GenerateVideo::new(fake.clone())
             .execute(
                 &serde_json::json!({
                     "prompt": "a teaser", "duration_secs": 10,
@@ -725,31 +919,26 @@ mod tests {
             )
             .await;
         match out {
-            ToolOutput::Ok { content } => {
-                assert!(content.contains("vid-1"), "{content}");
-                assert!(content.contains("poll_video"), "{content}");
+            ToolOutput::Error { message } => {
+                assert!(message.contains("host approval"), "{message}");
             }
-            ToolOutput::Error { message } => panic!("expected success: {message}"),
+            ToolOutput::Ok { content } => {
+                panic!("model-controlled consent must not pass: {content}")
+            }
         }
-        let job = job_store(dir.path())
-            .get("vid-1")
-            .unwrap()
-            .expect("handle persisted for resume");
-        assert_eq!(job.label, "teaser");
-        assert!((job.estimated_cost_usd - 2.0).abs() < 1e-9);
+        assert_eq!(fake.submits.load(Ordering::SeqCst), 0);
+        assert!(job_store(dir.path()).list().unwrap().is_empty());
     }
 
     #[tokio::test]
-    async fn video_without_a_rate_card_is_not_gated() {
-        // No rate card → no estimate → the unpriced (free-tier) job passes
-        // without consent, matching `evaluate_video_cost`'s zero-cost rule.
+    async fn video_without_a_rate_card_still_requires_host_approval() {
         let dir = tempfile::tempdir().expect("tempdir");
         let fake = FakeVideo::new(None, MediaJobState::Running);
-        let out = GenerateVideo(fake.clone())
+        let out = GenerateVideo::new(fake.clone())
             .execute(&serde_json::json!({"prompt": "a teaser"}), dir.path())
             .await;
-        assert!(matches!(out, ToolOutput::Ok { .. }), "{out:?}");
-        assert_eq!(fake.submits.load(Ordering::SeqCst), 1);
+        assert!(matches!(out, ToolOutput::Error { .. }), "{out:?}");
+        assert_eq!(fake.submits.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

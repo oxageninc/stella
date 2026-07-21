@@ -696,6 +696,7 @@ mod tests {
             stella_tools::RegistryOptions {
                 bash: true,
                 web: false,
+                ..Default::default()
             },
         );
         enforce_workspace_rules(&registry, root.path(), &trusted_project_authority());

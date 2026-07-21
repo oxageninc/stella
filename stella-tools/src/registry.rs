@@ -142,7 +142,7 @@ pub struct StorageIndex {
 /// settings (`tools.bash: "on"` in any scope), never ambient. Every
 /// construction path (CLI session drivers, fleet workers, tests) threads a
 /// value through explicitly; there is no global.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Clone, Default)]
 pub struct RegistryOptions {
     /// Register the `bash` shell tool. Off by default everywhere: when off
     /// the model never sees the schema, and calling `bash` anyway returns
@@ -153,6 +153,11 @@ pub struct RegistryOptions {
     /// Off by default everywhere — network egress is opt-in exactly like
     /// the shell (settings `tools.web: "on"`).
     pub web: bool,
+    /// Host-owned media gate; `None` resolves to deny.
+    pub media_spend_gate: Option<Arc<dyn stella_media::MediaSpendGate>>,
+    /// Managed authority ceiling. `false` denies paid media even when a host
+    /// gate would approve; it can never select a permissive fallback.
+    pub media_requires_host_approval: bool,
 }
 
 impl ToolRegistry {
@@ -213,6 +218,10 @@ impl ToolRegistry {
         media_backend: Option<crate::media::MediaBackend>,
         options: RegistryOptions,
     ) -> Self {
+        let media_spend_gate = options
+            .media_spend_gate
+            .filter(|_| options.media_requires_host_approval)
+            .unwrap_or_else(|| Arc::new(stella_media::DenyMediaSpendGate));
         let citations: crate::memory::CitationLedger = Arc::default();
         let mcp_usage: stella_core::mcp_usage::McpUsageLedger = Arc::default();
         let task_board: crate::tasks::TaskBoardHandle = Arc::default();
@@ -302,9 +311,15 @@ impl ToolRegistry {
         // configured — BYOK end to end. The async video pair additionally
         // needs the key family to have a video adapter.
         if let Some(media) = media_backend {
-            entries.push(Arc::new(crate::media::GenerateImage(media.image)));
+            entries.push(Arc::new(crate::media::GenerateImage::with_spend_gate(
+                media.image,
+                media_spend_gate.clone(),
+            )));
             if let Some(video) = media.video {
-                entries.push(Arc::new(crate::media::GenerateVideo(video.clone())));
+                entries.push(Arc::new(crate::media::GenerateVideo::with_spend_gate(
+                    video.clone(),
+                    media_spend_gate,
+                )));
                 entries.push(Arc::new(crate::media::PollVideo(video)));
             }
         }
@@ -1527,6 +1542,7 @@ mod tests {
             RegistryOptions {
                 bash: true,
                 web: false,
+                ..Default::default()
             },
         );
         assert!(reg.schemas().iter().any(|s| s.name == "bash"));
@@ -1572,6 +1588,7 @@ mod tests {
             RegistryOptions {
                 bash: false,
                 web: true,
+                ..Default::default()
             },
         );
         let schemas = reg.schemas();
@@ -2537,6 +2554,7 @@ mod tests {
             RegistryOptions {
                 bash: true,
                 web: false,
+                ..Default::default()
             },
         );
         let bus = HookBus::new("sess");

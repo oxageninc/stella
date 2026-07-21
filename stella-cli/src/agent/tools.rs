@@ -250,5 +250,7 @@ pub(crate) fn registry_options(cfg: &Config) -> stella_tools::RegistryOptions {
     stella_tools::RegistryOptions {
         bash: cfg.tools_bash,
         web: cfg.tools_web,
+        media_requires_host_approval: cfg.authority.media_requires_host_approval,
+        ..Default::default()
     }
 }

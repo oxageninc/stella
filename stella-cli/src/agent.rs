@@ -1398,9 +1398,8 @@ pub fn run_tools_listing() -> Result<(), String> {
         std::env::current_dir().map_err(|e| format!("cannot determine workspace root: {e}"))?;
     tui::section_header("Stella tools");
 
-    // The listing mirrors a real session's surface, so the settings-driven
-    // switches (bash/web opt-ins) apply here exactly as they do at session
-    // start.
+    // The listing mirrors a real session's settings-driven tool switches
+    // (bash/web opt-ins).
     let settings = crate::settings::Settings::load(&workspace_root)?;
     let bash_enabled = settings.bash_tool_enabled();
     let web_enabled = settings.web_tools_enabled();
@@ -1409,6 +1408,7 @@ pub fn run_tools_listing() -> Result<(), String> {
         stella_tools::RegistryOptions {
             bash: bash_enabled,
             web: web_enabled,
+            ..Default::default()
         },
     );
     println!("  {}", "built-in:".dimmed());
