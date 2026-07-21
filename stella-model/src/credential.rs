@@ -272,6 +272,13 @@ impl CredentialsFile {
         self.data.credentials.get(provider_id).map(String::as_str)
     }
 
+    /// Every provider id currently stored, alphabetically (the underlying
+    /// map is a `BTreeMap`, so this is already sorted) — for `stella auth
+    /// list`, which enumerates the file rather than looking up one id.
+    pub fn provider_ids(&self) -> impl Iterator<Item = &str> {
+        self.data.credentials.keys().map(String::as_str)
+    }
+
     /// Set (or replace) `provider_id`'s key in memory. Call `save` to
     /// persist — kept separate so a caller can batch multiple sets into one
     /// write.
@@ -279,6 +286,12 @@ impl CredentialsFile {
         self.data
             .credentials
             .insert(provider_id.to_string(), value.into());
+    }
+
+    /// Remove `provider_id`'s key from memory, if present. Returns whether
+    /// an entry existed. Call `save` to persist.
+    pub fn remove(&mut self, provider_id: &str) -> bool {
+        self.data.credentials.remove(provider_id).is_some()
     }
 
     /// Write the current in-memory state to disk, creating parent
@@ -557,12 +570,45 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    // ---- empty (degrade-a-listing-command posture) -----------------------
+    // ---- remove / provider_ids / empty (stella auth set/remove/list) ----
+
+    #[test]
+    fn remove_reports_whether_an_entry_existed_and_drops_it() {
+        let path = temp_credentials_path("remove");
+        let _ = std::fs::remove_file(&path);
+        let mut file = CredentialsFile::load(&path).unwrap();
+        file.set("zai", "sk-zai-secret");
+
+        assert!(file.remove("zai"), "removing a present entry reports true");
+        assert_eq!(file.get("zai"), None);
+        assert!(
+            !file.remove("zai"),
+            "removing an already-absent entry reports false, not a panic"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn provider_ids_lists_every_stored_id_alphabetically() {
+        let path = temp_credentials_path("provider-ids");
+        let _ = std::fs::remove_file(&path);
+        let mut file = CredentialsFile::load(&path).unwrap();
+        file.set("zai", "sk-1");
+        file.set("anthropic", "sk-2");
+        file.set("openai", "sk-3");
+
+        let ids: Vec<&str> = file.provider_ids().collect();
+        assert_eq!(ids, vec!["anthropic", "openai", "zai"]);
+
+        let _ = std::fs::remove_file(&path);
+    }
 
     #[test]
     fn empty_file_has_no_entries_and_refuses_to_save() {
         let file = CredentialsFile::empty();
         assert_eq!(file.get("zai"), None);
+        assert_eq!(file.provider_ids().count(), 0);
         assert!(matches!(
             file.save().unwrap_err(),
             CredentialError::FileWrite { .. }
