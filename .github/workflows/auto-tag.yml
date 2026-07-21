@@ -235,6 +235,18 @@ jobs:
         run: |
           set -euo pipefail
 
+          # The previous step exits 0 early ("manifests already at ${version};
+          # nothing to sync") when the bump was a no-op — a step exiting 0 is
+          # a *success*, not a skip, so it doesn't stop this step from
+          # running. Without this guard, a no-op cycle would still dispatch a
+          # full ci run and then merge whatever bot/version-sync PR happens
+          # to be open — possibly a stale one left over from an earlier
+          # cycle. Bail out here if there's nothing open to merge.
+          if [ -z "$(gh pr list --head "${BRANCH}" --state open --json number --jq '.[0].number // empty')" ]; then
+            echo "no open ${BRANCH} PR — nothing to merge."
+            exit 0
+          fi
+
           latest_run_id() {
             gh run list --workflow=ci.yml --branch="${BRANCH}" \
               --event=workflow_dispatch --limit=1 --json databaseId \
