@@ -39,6 +39,7 @@ stella-pipeline = { path = "../stella-pipeline" }
 stella-tui = { path = "../stella-tui" }
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tokio = { workspace = true, features = ["sync"] }
 async-trait.workspace = true
 clap.workspace = true

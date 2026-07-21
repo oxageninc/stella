@@ -226,6 +226,7 @@ async fn run_pipeline_one_shot(
             repo: &ws_ports.repo_structure,
             repo_status: &ws_ports.repo_status,
             commands: &ws_ports.command_runner,
+            tests: &ws_ports.test_runner,
             approvals: if approval_capability == PipelineApprovalCapability::Stdio {
                 &stdio_gate
             } else {

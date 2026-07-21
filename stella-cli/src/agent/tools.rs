@@ -6,6 +6,7 @@
 //! filesystem/VCS/command ports.
 
 use super::*;
+use stella_pipeline::{TestInvocation, TestRunner};
 
 /// Repo-structure summary via `git ls-files` for the planner's split context.
 pub(crate) struct GitRepoStructure {
@@ -36,7 +37,7 @@ impl RepoStructurePort for GitRepoStructure {
 /// COMPLETE `git ls-files --others` listing and fingerprints each file itself
 /// (in-process, with real filesystem access), so a large untracked set is not
 /// silently clipped and a modification to an already-untracked file is
-/// detectable (its `len:mtime` fingerprint changes).
+/// detectable (its complete content hash changes).
 pub(crate) struct GitRepoStatus {
     pub(crate) root: std::path::PathBuf,
 }
@@ -80,23 +81,57 @@ impl RepoStatusPort for GitRepoStatus {
         }
         out
     }
+
+    async fn tracked_fingerprints(&self) -> std::collections::HashMap<String, String> {
+        let mut out = std::collections::HashMap::new();
+        let mut cmd = tokio::process::Command::new("git");
+        cmd.args([
+            "-c",
+            "core.quotePath=false",
+            "diff",
+            "--name-only",
+            "--relative",
+            "-z",
+            "HEAD",
+            "--",
+        ])
+        .current_dir(&self.root);
+        for var in stella_tools::exec::GIT_REPO_ENV_VARS {
+            cmd.env_remove(var);
+        }
+        let Ok(listing) = cmd.output().await else {
+            return out;
+        };
+        if !listing.status.success() {
+            return out;
+        }
+        for rel in String::from_utf8_lossy(&listing.stdout)
+            .split('\0')
+            .filter(|p| !p.is_empty())
+        {
+            let fingerprint =
+                fs_fingerprint(&self.root.join(rel)).unwrap_or_else(|| "deleted".to_string());
+            out.insert(rel.to_string(), fingerprint);
+        }
+        out
+    }
 }
 
-/// The pipeline's untracked-file fingerprint: `len:mtime_nanos` — changes
-/// whenever the file is written, without reading (and hashing) potentially
-/// large files on every snapshot. `None` when the file's metadata cannot be
-/// read (absent or unreadable). One definition, shared with the best-of-N
-/// candidate snapshot ports, so fingerprints from the real tree and a
-/// snapshot are comparable (the witness tamper watchlist depends on it).
+/// The pipeline's file fingerprint: SHA-256 over the complete bytes. Content
+/// hashes are required at the witness authority boundary: size+mtime can be
+/// restored after a same-length edit and would incorrectly credit a tampered
+/// witness. One definition is shared with candidate snapshots.
 pub(crate) fn fs_fingerprint(path: &std::path::Path) -> Option<String> {
-    let meta = std::fs::metadata(path).ok()?;
-    let mtime = meta
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    Some(format!("{}:{mtime}", meta.len()))
+    use std::fmt::Write as _;
+
+    use sha2::{Digest, Sha256};
+
+    let bytes = std::fs::read(path).ok()?;
+    let mut fingerprint = String::from("sha256:");
+    for byte in Sha256::digest(bytes) {
+        write!(&mut fingerprint, "{byte:02x}").ok()?;
+    }
+    Some(fingerprint)
 }
 
 /// The workspace-rooted pipeline ports every session driver constructs the
@@ -108,8 +143,8 @@ pub(crate) struct WorkspacePorts {
     pub(crate) repo_structure: GitRepoStructure,
     pub(crate) repo_status: GitRepoStatus,
     pub(crate) command_runner: ShellCommandRunner,
-    /// Inert unless `candidates > 1` — the pipeline never calls it on
-    /// single-shot runs.
+    pub(crate) test_runner: TypedTestRunner,
+    /// Used for best-of-N and for candidate-local authored witnesses at N=1.
     pub(crate) candidate_workspaces: crate::candidate_ws::GitCandidateWorkspaces,
 }
 
@@ -135,6 +170,7 @@ pub(crate) fn workspace_ports(
         repo_structure: GitRepoStructure { root: root.clone() },
         repo_status: GitRepoStatus { root: root.clone() },
         command_runner: ShellCommandRunner { root: root.clone() },
+        test_runner: TypedTestRunner { root: root.clone() },
         candidate_workspaces: crate::candidate_ws::GitCandidateWorkspaces::new(
             root,
             registry_options,
@@ -144,9 +180,25 @@ pub(crate) fn workspace_ports(
     }
 }
 
-/// Runs shell commands for the verification ladder (flip oracle tests, diff).
+/// Runs fixed shell diagnostics for diff gathering. Test commands use the
+/// separate typed runner below and never cross this shell boundary.
 pub(crate) struct ShellCommandRunner {
     pub(crate) root: std::path::PathBuf,
+}
+
+/// Workspace-rooted typed test runner. Unlike [`ShellCommandRunner`], it
+/// passes an enumerable argv directly to the OS and never invokes a shell.
+pub(crate) struct TypedTestRunner {
+    pub(crate) root: std::path::PathBuf,
+}
+
+#[async_trait::async_trait]
+impl TestRunner for TypedTestRunner {
+    async fn run_test(&self, invocation: &TestInvocation) -> CmdOutcome {
+        let mut cmd = tokio::process::Command::new(&invocation.program);
+        cmd.args(&invocation.args).current_dir(&self.root);
+        run_command(cmd).await
+    }
 }
 
 #[async_trait::async_trait]
@@ -155,60 +207,64 @@ impl CommandRunner for ShellCommandRunner {
         let mut cmd = tokio::process::Command::new("bash");
         cmd.arg("-c").arg(command);
         cmd.current_dir(&self.root);
-        cmd.stdout(std::process::Stdio::piped());
-        cmd.stderr(std::process::Stdio::piped());
-        #[cfg(unix)]
-        unsafe {
-            cmd.pre_exec(|| {
-                libc::setsid();
-                Ok(())
-            });
-        }
-        let child = match cmd.spawn() {
-            Ok(c) => c,
-            Err(e) => {
-                return CmdOutcome {
-                    exit_code: -1,
-                    stdout_tail: String::new(),
-                    stderr_tail: format!("failed to spawn: {e}"),
-                };
-            }
-        };
-        #[cfg(unix)]
-        let pid = child.id().unwrap_or(0) as i32;
+        run_command(cmd).await
+    }
+}
 
-        let timeout = Duration::from_secs(300);
-        let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
-            Ok(Ok(output)) => output,
-            Ok(Err(e)) => {
-                return CmdOutcome {
-                    exit_code: -1,
-                    stdout_tail: String::new(),
-                    stderr_tail: format!("command failed: {e}"),
-                };
-            }
-            Err(_) => {
-                #[cfg(unix)]
-                unsafe {
-                    if pid > 0 {
-                        libc::kill(-pid, libc::SIGKILL);
-                    }
+async fn run_command(mut cmd: tokio::process::Command) -> CmdOutcome {
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    #[cfg(unix)]
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    let child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            return CmdOutcome {
+                exit_code: -1,
+                stdout_tail: String::new(),
+                stderr_tail: format!("failed to spawn: {e}"),
+            };
+        }
+    };
+    #[cfg(unix)]
+    let pid = child.id().unwrap_or(0) as i32;
+
+    let timeout = Duration::from_secs(300);
+    let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
+        Ok(Ok(output)) => output,
+        Ok(Err(e)) => {
+            return CmdOutcome {
+                exit_code: -1,
+                stdout_tail: String::new(),
+                stderr_tail: format!("command failed: {e}"),
+            };
+        }
+        Err(_) => {
+            #[cfg(unix)]
+            unsafe {
+                if pid > 0 {
+                    libc::kill(-pid, libc::SIGKILL);
                 }
-                return CmdOutcome {
-                    exit_code: -1,
-                    stdout_tail: String::new(),
-                    stderr_tail: format!("command timed out after {}s", timeout.as_secs()),
-                };
             }
-        };
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        CmdOutcome {
-            exit_code: output.status.code().unwrap_or(-1),
-            stdout_tail: truncate_tail(&stdout, 100_000),
-            stderr_tail: truncate_tail(&stderr, 20_000),
+            return CmdOutcome {
+                exit_code: -1,
+                stdout_tail: String::new(),
+                stderr_tail: format!("command timed out after {}s", timeout.as_secs()),
+            };
         }
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    CmdOutcome {
+        exit_code: output.status.code().unwrap_or(-1),
+        stdout_tail: truncate_tail(&stdout, 100_000),
+        stderr_tail: truncate_tail(&stderr, 20_000),
     }
 }
 
@@ -291,6 +347,91 @@ mod tests {
         CostDecision, ImageRequest, MediaArtifact, MediaCapabilities, MediaError, MediaJob,
         MediaJobStatus, MediaKind, MediaProvider, MediaSpendGate, MediaSpendRequest, VideoRequest,
     };
+
+    #[test]
+    fn witness_fingerprint_hashes_complete_bytes_not_size_and_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("witness.rs");
+        std::fs::write(&path, b"aaaa").unwrap();
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let before = fs_fingerprint(&path).unwrap();
+
+        std::fs::write(&path, b"bbbb").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        let after = fs_fingerprint(&path).unwrap();
+
+        assert_ne!(
+            before, after,
+            "same-length, same-mtime edits must be detected"
+        );
+    }
+
+    #[tokio::test]
+    async fn repo_status_hashes_tracked_working_tree_mutations() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        std::fs::write(dir.path().join("src.rs"), "before\n").unwrap();
+        git(&["add", "src.rs"]);
+        git(&[
+            "-c",
+            "user.name=test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "base",
+        ]);
+        std::fs::write(dir.path().join("src.rs"), "after\n").unwrap();
+
+        let files = GitRepoStatus {
+            root: dir.path().to_path_buf(),
+        }
+        .tracked_fingerprints()
+        .await;
+        assert_eq!(
+            files.get("src.rs"),
+            fs_fingerprint(&dir.path().join("src.rs")).as_ref()
+        );
+    }
+
+    #[tokio::test]
+    async fn typed_test_runner_never_interprets_redirection_in_an_argument() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("must-not-exist");
+        let runner = TypedTestRunner {
+            root: dir.path().to_path_buf(),
+        };
+        let outcome = runner
+            .run_test(&stella_pipeline::TestInvocation {
+                program: "printf".into(),
+                args: vec![format!("owned > {}", target.display())],
+            })
+            .await;
+
+        assert!(outcome.passed());
+        assert!(
+            !target.exists(),
+            "argv content must never become shell syntax"
+        );
+    }
 
     struct FixedOperationId(&'static str);
 

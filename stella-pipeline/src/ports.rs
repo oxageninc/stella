@@ -12,7 +12,7 @@
 //! not: a way to pick which provider a role resolved to
 //! ([`ProviderResolver`]), the surrounding context/repo material that shapes
 //! triage and planning ([`ContextRecallPort`], [`RepoStructurePort`]), and
-//! the deterministic verification substrate ([`CommandRunner`],
+//! the deterministic verification substrate ([`TestRunner`], [`CommandRunner`],
 //! [`ApprovalGate`]). None of these belong inside the step-driver.
 
 use async_trait::async_trait;
@@ -102,13 +102,21 @@ pub trait RepoStructurePort: Send + Sync {
 #[async_trait]
 pub trait RepoStatusPort: Send + Sync {
     /// Untracked files as `path -> fingerprint`, where the fingerprint changes
-    /// whenever the file's content does (e.g. `len:mtime_nanos`). Complete and
+    /// whenever the file's content does (a complete content hash). Complete and
     /// never truncated. Empty when the workspace is not a git repo or on any
     /// failure — the guard then rests on the tracked `git diff` alone.
     async fn untracked_fingerprints(&self) -> std::collections::HashMap<String, String>;
+
+    /// Tracked paths currently changed from the workspace baseline, with a
+    /// complete content fingerprint (or a deletion sentinel). Witness
+    /// authoring compares before/after maps so existing production edits can
+    /// never enter an accepted witness artifact.
+    async fn tracked_fingerprints(&self) -> std::collections::HashMap<String, String> {
+        std::collections::HashMap::new()
+    }
 }
 
-/// The outcome of running one shell command through [`CommandRunner`]. Output
+/// The outcome of running one local process through a pipeline runner. Output
 /// is pre-truncated by the runner (middle-out, L-S3) into head+tail tails —
 /// the pipeline never needs the full stream, only exit status and enough
 /// text to summarize evidence.
@@ -124,6 +132,17 @@ pub struct CmdOutcome {
     pub stderr_tail: String,
 }
 
+/// One test process invocation after the untrusted command text has crossed
+/// the pipeline's strict parser. `program` and `args` are passed directly to a
+/// process builder; neither field is ever interpreted by a shell.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TestInvocation {
+    /// A known test runner executable (for example `cargo` or `pytest`).
+    pub program: String,
+    /// The exact argument vector supplied to the test runner.
+    pub args: Vec<String>,
+}
+
 impl CmdOutcome {
     /// Whether the command succeeded (exit code 0). The single place the
     /// pipeline decides pass/fail for a command — never string-sniffing the
@@ -133,12 +152,9 @@ impl CmdOutcome {
     }
 }
 
-/// Runs one shell command for the deterministic verification ladder (L-E11):
-/// the flip oracle's test command (before and after execute) and the diff
-/// command that measures what the turn touched. Injected so the ladder's
-/// evidence gathering is testable with scripted outcomes and so
-/// `stella-pipeline` never shells out itself (the real process-group /
-/// timeout / signal handling lives in `stella-tools`, L-S1).
+/// Runs host-authored diagnostic commands such as fixed git diff probes.
+/// Model/user test text never crosses this port; it is parsed into a
+/// [`TestInvocation`] and sent through [`TestRunner`] instead.
 #[async_trait]
 pub trait CommandRunner: Send + Sync {
     /// Run `cmd` to completion and report its outcome. Implementations must
@@ -146,6 +162,15 @@ pub trait CommandRunner: Send + Sync {
     /// `exit_code` with the reason in `stderr_tail`, never an `Err`, so the
     /// ladder always has evidence to reason over.
     async fn run(&self, cmd: &str) -> CmdOutcome;
+}
+
+/// Runs only already-validated [`TestInvocation`] values. Kept separate from
+/// [`CommandRunner`] so model-authored test text can never reach the diagnostic
+/// shell used for fixed git inspection commands.
+#[async_trait]
+pub trait TestRunner: Send + Sync {
+    /// Spawn `invocation.program` with `invocation.args` directly.
+    async fn run_test(&self, invocation: &TestInvocation) -> CmdOutcome;
 }
 
 /// One file the winning best-of-N candidate changed, as applied to the real
@@ -197,8 +222,10 @@ pub trait CandidateWorkspace: Send + Sync {
     /// The tool executor rooted at this workspace: every engine-turn tool
     /// call (read/edit/shell) lands in the snapshot, never in the real tree.
     fn tools(&self) -> &dyn stella_core::ToolExecutor;
-    /// Runs the verification ladder's test/diff commands inside the snapshot.
+    /// Runs host-authored diagnostic commands inside the snapshot.
     fn commands(&self) -> &dyn CommandRunner;
+    /// Typed test-process runner rooted at this workspace.
+    fn tests(&self) -> &dyn TestRunner;
     /// Untracked-file fingerprints of the snapshot, mirroring the real
     /// tree's semantics (the tamper watchlist and zero-diff guard must keep
     /// working unchanged inside a candidate).
@@ -216,11 +243,9 @@ pub trait CandidateWorkspace: Send + Sync {
     async fn remove(&self);
 }
 
-/// Best-of-N candidate isolation (L-E7): snapshots the current working-tree
-/// state into one isolated [`CandidateWorkspace`] per candidate. Only wired
-/// when a real git tree exists; the pipeline never calls it on single-shot
-/// runs (`candidates <= 1`), and degrades multi-candidate runs to the shared
-/// tree — loudly — when it is absent.
+/// Candidate isolation (L-E7): snapshots the current working-tree state into
+/// one isolated [`CandidateWorkspace`] per candidate. Best-of-N uses it when
+/// available; authored witnesses require it even for one candidate.
 #[async_trait]
 pub trait CandidateWorkspacePort: Send + Sync {
     /// Snapshot the current tree state into a fresh isolated workspace.

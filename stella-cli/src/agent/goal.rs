@@ -574,6 +574,7 @@ async fn run_goal_pipeline_turn(
                 repo: &ws_ports.repo_structure,
                 repo_status: &ws_ports.repo_status,
                 commands: &ws_ports.command_runner,
+                tests: &ws_ports.test_runner,
                 approvals: &HEADLESS_APPROVAL_GATE,
                 sleeper: &TokioSleeper,
                 hooks: cfg

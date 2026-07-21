@@ -8,9 +8,8 @@
 //!    checkout of the user's tree;
 //! 2. the uncommitted tracked delta overlaid via `git diff --binary HEAD`
 //!    applied inside the shadow;
-//! 3. untracked, non-ignored files copied in with mtimes preserved (the
-//!    pipeline's fingerprints are `len:mtime`, so a copy that bumped mtime
-//!    would read as witness tampering in every candidate);
+//! 3. untracked, non-ignored files copied in byte-for-byte (the pipeline uses
+//!    complete content hashes for witness integrity);
 //! 4. one baseline commit sealed in the shadow's PRIVATE index (detached
 //!    HEAD — no ref of the user's repo moves).
 //!
@@ -52,14 +51,14 @@ use std::sync::Arc;
 use stella_fleet::git::{GitCli, SystemGitCli};
 use stella_pipeline::ports::{
     AdoptedChange, CandidateWorkspace, CandidateWorkspacePort, CommandRunner, RepoStatusPort,
-    WorkspaceError,
+    TestRunner, WorkspaceError,
 };
 use stella_protocol::FileChangeKind;
 
 use stella_tools::custom::{CustomTool, CustomToolSet};
 use stella_tools::{RegistryOptions, ToolRegistry};
 
-use crate::agent::{GitRepoStatus, ShellCommandRunner, fs_fingerprint};
+use crate::agent::{GitRepoStatus, ShellCommandRunner, TypedTestRunner, fs_fingerprint};
 
 /// The commit identity for snapshot plumbing commits (which exist only
 /// inside the shadow and are discarded with it) — the user's repo may have
@@ -124,9 +123,7 @@ async fn git_stdout_to_file(repo: &Path, args: &[&str], out: &Path) -> Result<()
 }
 
 /// Copy `src` to `dst` (creating parents), preserving the modification time.
-/// The pipeline fingerprints untracked files as `len:mtime` and the witness
-/// tamper watchlist is recorded against the REAL tree — a copy that bumped
-/// mtime would make every candidate read its witness as tampered.
+/// Copy one untracked overlay file while preserving its filesystem metadata.
 async fn copy_preserving_mtime(src: &Path, dst: &Path) -> std::io::Result<()> {
     if let Some(parent) = dst.parent() {
         tokio::fs::create_dir_all(parent).await?;
@@ -292,6 +289,9 @@ impl GitCandidateWorkspaces {
                     commands: ShellCommandRunner {
                         root: ws_root.clone(),
                     },
+                    tests: TypedTestRunner {
+                        root: ws_root.clone(),
+                    },
                     repo_status: SnapshotRepoStatus {
                         inner: GitRepoStatus {
                             root: ws_root.clone(),
@@ -410,8 +410,8 @@ async fn populate_snapshot(
 /// untracked fingerprints, would read every witness file as deleted. This
 /// port reports the union: the shadow's own untracked files (the
 /// candidate's new work) plus the overlay set, fingerprinted from the
-/// shadow's filesystem — copies preserve len+mtime, so an untouched overlay
-/// file matches its real-tree fingerprint exactly, an edited one differs,
+/// shadow's filesystem — content hashes make an untouched overlay match the
+/// real-tree fingerprint exactly, while an edited one differs,
 /// and a deleted one is absent: the same semantics the real tree shows.
 struct SnapshotRepoStatus {
     inner: GitRepoStatus,
@@ -434,6 +434,10 @@ impl RepoStatusPort for SnapshotRepoStatus {
         }
         map
     }
+
+    async fn tracked_fingerprints(&self) -> HashMap<String, String> {
+        self.inner.tracked_fingerprints().await
+    }
 }
 
 /// One live candidate shadow — see the module docs for the lifecycle.
@@ -446,6 +450,7 @@ pub(crate) struct GitCandidateWorkspace {
     /// owned so the boxed workspace can hand out `&dyn ToolExecutor`.
     tools: CustomToolSet<'static>,
     commands: ShellCommandRunner,
+    tests: TypedTestRunner,
     repo_status: SnapshotRepoStatus,
 }
 
@@ -552,6 +557,10 @@ impl CandidateWorkspace for GitCandidateWorkspace {
 
     fn commands(&self) -> &dyn CommandRunner {
         &self.commands
+    }
+
+    fn tests(&self) -> &dyn TestRunner {
+        &self.tests
     }
 
     fn repo_status(&self) -> &dyn RepoStatusPort {
@@ -746,7 +755,7 @@ mod tests {
         );
 
         // Fingerprint parity: the snapshot reports the overlay untracked file
-        // with the REAL tree's fingerprint (len+mtime preserved), so the
+        // with the REAL tree's complete content hash, so the
         // witness tamper watchlist keeps working inside candidates.
         let real = GitRepoStatus { root: root.clone() }
             .untracked_fingerprints()

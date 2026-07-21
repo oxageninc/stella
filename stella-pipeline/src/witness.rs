@@ -12,8 +12,8 @@
 //! The witness is deliberately **visible to the worker**: iterating against a
 //! failing test is where convergence comes from, and a test file on disk is
 //! discoverable by any worker with a shell anyway. Integrity comes instead
-//! from *tamper exclusion* — the fingerprints (size + mtime, not content
-//! hashes) of the files the witness turn created are snapshotted, and a
+//! from *tamper exclusion* — complete content hashes of the one test artifact
+//! the witness turn created are snapshotted, and a
 //! flip is only credited if those fingerprints are unchanged at verify
 //! time ([`tampered_paths`]). A worker that edits or
 //! deletes the witness loses the deterministic flip credit and the evidence
@@ -30,25 +30,198 @@
 
 use std::collections::HashMap;
 
-use crate::ports::RecalledFrame;
+use crate::ports::{RecalledFrame, TestInvocation};
 
 /// The marker line the witness author must end its reply with. Scanned
 /// case-insensitively by [`parse_witness_command`]; the LAST occurrence wins
 /// (the model may quote the marker while reasoning before its final answer).
 pub const TEST_COMMAND_MARKER: &str = "TEST_COMMAND:";
 
+/// Why a model- or user-authored test command was not accepted as a typed
+/// test invocation.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum TestInvocationError {
+    /// The command was empty or contained unbalanced quoting.
+    #[error("the test command is empty or has invalid quoting")]
+    InvalidSyntax,
+    /// Shell control syntax is never valid at this boundary.
+    #[error("shell operators, redirection, and expansion are not allowed in test commands")]
+    ShellSyntax,
+    /// Only explicit test-runner forms are accepted.
+    #[error("unsupported test command `{0}`")]
+    Unsupported(String),
+}
+
+/// A witness author crossed the one-new-test-file boundary.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum WitnessArtifactError {
+    /// Existing tracked content was changed or removed.
+    #[error("witness author modified tracked file(s): {}", .0.join(", "))]
+    TrackedMutation(Vec<String>),
+    /// The untracked delta was not exactly one newly created test artifact.
+    #[error("witness author must create exactly one new test file; changed: {}", .0.join(", "))]
+    InvalidArtifact(Vec<String>),
+}
+
+/// Parse a deliberately small test-command vocabulary into an enumerable
+/// program plus argv. This is quote-aware only to preserve arguments with
+/// spaces; it is not a shell parser and rejects every shell control surface.
+pub fn parse_test_invocation(command: &str) -> Result<TestInvocation, TestInvocationError> {
+    let words = split_test_words(command)?;
+    let (program, args) = words
+        .split_first()
+        .ok_or(TestInvocationError::InvalidSyntax)?;
+    let allowed = match program.as_str() {
+        "cargo" => {
+            matches!(args.first().map(String::as_str), Some("test"))
+                || matches!(
+                    (
+                        args.first().map(String::as_str),
+                        args.get(1).map(String::as_str)
+                    ),
+                    (Some("nextest"), Some("run"))
+                )
+        }
+        "pnpm" | "npm" | "yarn" | "bun" => {
+            matches!(args.first().map(String::as_str), Some("test"))
+        }
+        "pytest" => true,
+        "python" | "python3" => matches!(
+            (
+                args.first().map(String::as_str),
+                args.get(1).map(String::as_str)
+            ),
+            (Some("-m"), Some("pytest"))
+        ),
+        "go" | "dotnet" => matches!(args.first().map(String::as_str), Some("test")),
+        _ => false,
+    };
+    if !allowed {
+        return Err(TestInvocationError::Unsupported(command.to_string()));
+    }
+    Ok(TestInvocation {
+        program: program.clone(),
+        args: args.to_vec(),
+    })
+}
+
+fn split_test_words(command: &str) -> Result<Vec<String>, TestInvocationError> {
+    if command.contains("$(") || command.contains('`') || command.contains('\n') {
+        return Err(TestInvocationError::ShellSyntax);
+    }
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut started = false;
+    let mut single = false;
+    let mut double = false;
+    let mut chars = command.chars();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\'' if !double => {
+                single = !single;
+                started = true;
+            }
+            '"' if !single => {
+                double = !double;
+                started = true;
+            }
+            '\\' if !single => {
+                let Some(escaped) = chars.next() else {
+                    return Err(TestInvocationError::InvalidSyntax);
+                };
+                current.push(escaped);
+                started = true;
+            }
+            '&' | '|' | ';' | '<' | '>' if !single && !double => {
+                return Err(TestInvocationError::ShellSyntax);
+            }
+            c if c.is_whitespace() && !single && !double => {
+                if started {
+                    words.push(std::mem::take(&mut current));
+                    started = false;
+                }
+            }
+            c => {
+                current.push(c);
+                started = true;
+            }
+        }
+    }
+    if single || double {
+        return Err(TestInvocationError::InvalidSyntax);
+    }
+    if started {
+        words.push(current);
+    }
+    Ok(words)
+}
+
+/// Validate the witness author's complete working-tree delta and return the
+/// content-hash baseline for the one accepted test artifact.
+pub fn validate_witness_artifact(
+    tracked_before: &HashMap<String, String>,
+    tracked_after: &HashMap<String, String>,
+    untracked_before: &HashMap<String, String>,
+    untracked_after: &HashMap<String, String>,
+) -> Result<HashMap<String, String>, WitnessArtifactError> {
+    let tracked = changed_paths(tracked_before, tracked_after);
+    if !tracked.is_empty() {
+        return Err(WitnessArtifactError::TrackedMutation(tracked));
+    }
+    let changed = changed_paths(untracked_before, untracked_after);
+    let accepted = match changed.as_slice() {
+        [path]
+            if !untracked_before.contains_key(path)
+                && untracked_after.contains_key(path)
+                && is_test_path(path) =>
+        {
+            path
+        }
+        _ => return Err(WitnessArtifactError::InvalidArtifact(changed)),
+    };
+    Ok(HashMap::from([(
+        accepted.clone(),
+        untracked_after[accepted].clone(),
+    )]))
+}
+
+fn changed_paths(before: &HashMap<String, String>, after: &HashMap<String, String>) -> Vec<String> {
+    let mut paths: Vec<String> = before
+        .keys()
+        .chain(after.keys())
+        .filter(|path| before.get(*path) != after.get(*path))
+        .cloned()
+        .collect();
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+fn is_test_path(path: &str) -> bool {
+    let normalized = path.replace('\\', "/").to_ascii_lowercase();
+    let name = normalized.rsplit('/').next().unwrap_or(&normalized);
+    normalized
+        .split('/')
+        .any(|part| matches!(part, "test" | "tests" | "__tests__" | "spec" | "specs"))
+        || name.starts_with("test_")
+        || name.contains("_test.")
+        || name.contains(".test.")
+        || name.contains(".spec.")
+        || name.contains("witness")
+}
+
 /// A validated witness: the flip-oracle command plus the fingerprint
-/// watchlist of the files the witness turn created/modified (the tamper
+/// hash of the one new test artifact the witness turn created (the tamper
 /// baseline for [`tampered_paths`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Witness {
-    /// The shell command the flip oracle tracks (already observed failing
-    /// once by the time the pipeline constructs this).
+    /// The user-facing command the flip oracle names in evidence.
     pub command: String,
-    /// `path -> fingerprint` of every untracked file the witness turn
-    /// created or modified. Empty when the witness edited only tracked files
-    /// (the prompt forbids it, but a disobedient author degrades to "no
-    /// watchlist", never to a false tamper alarm).
+    /// Parsed process invocation used for every baseline/final test run.
+    pub invocation: TestInvocation,
+    /// `path -> fingerprint` for the one accepted, newly created test file.
+    /// Tracked edits, non-test files, and edits to pre-existing untracked
+    /// files are rejected before candidate execution.
     pub files: HashMap<String, String>,
 }
 
@@ -69,7 +242,7 @@ pub fn witness_prompt(goal: &str, recall: &[RecalledFrame], repo_structure: &str
          behavior), not because of a typo, a missing import, or a harness error.\n\
          - Prefer the narrowest runnable command (one test/module, not the whole suite).\n\
          - End your reply with exactly one line:\n\
-         TEST_COMMAND: <the shell command that runs your test>\n",
+         TEST_COMMAND: <a direct test command such as cargo test or pytest>\n",
     );
     if !repo_structure.trim().is_empty() {
         s.push_str("\n## Repository structure\n");
@@ -210,6 +383,47 @@ mod tests {
         assert_eq!(parse_witness_command("TEST_COMMAND:   ``  "), None);
     }
 
+    #[test]
+    fn test_invocation_rejects_shell_operators_and_redirection() {
+        for command in [
+            "cargo test -p x && touch owned",
+            "cargo test -p x || true",
+            "cargo test -p x; touch owned",
+            "cargo test -p x | tee results",
+            "cargo test -p x > results",
+            "cargo test -p x 2> results",
+            "cargo test -p x < input",
+            "cargo test -p $(touch owned)",
+            "cargo test -p `touch owned`",
+        ] {
+            assert!(
+                parse_test_invocation(command).is_err(),
+                "shell syntax must be rejected: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_invocation_parses_only_known_test_programs_into_argv() {
+        assert_eq!(
+            parse_test_invocation("cargo test -p 'my crate' witness -- --exact").unwrap(),
+            TestInvocation {
+                program: "cargo".into(),
+                args: vec![
+                    "test".into(),
+                    "-p".into(),
+                    "my crate".into(),
+                    "witness".into(),
+                    "--".into(),
+                    "--exact".into(),
+                ],
+            }
+        );
+        assert!(parse_test_invocation("sh -c 'cargo test'").is_err());
+        assert!(parse_test_invocation("python helper.py").is_err());
+        assert!(parse_test_invocation("cargo build").is_err());
+    }
+
     // ---- witness_watchlist ------------------------------------------------
 
     #[test]
@@ -225,6 +439,58 @@ mod tests {
         assert_eq!(list.get("tests/witness.rs"), Some(&"w1".to_string()));
         assert_eq!(list.get("edited_test.rs"), Some(&"new".to_string()));
         assert!(!list.contains_key("stale.txt"));
+    }
+
+    #[test]
+    fn accepted_witness_is_exactly_one_new_test_artifact() {
+        let accepted = validate_witness_artifact(
+            &fps(&[("src/lib.rs", "prod-v1")]),
+            &fps(&[("src/lib.rs", "prod-v1")]),
+            &HashMap::new(),
+            &fps(&[("tests/authority_witness.rs", "sha256:whole-file")]),
+        )
+        .unwrap();
+        assert_eq!(
+            accepted,
+            fps(&[("tests/authority_witness.rs", "sha256:whole-file")])
+        );
+    }
+
+    #[test]
+    fn witness_artifact_rejects_tracked_production_edits() {
+        let error = validate_witness_artifact(
+            &fps(&[("src/lib.rs", "prod-v1")]),
+            &fps(&[("src/lib.rs", "prod-v2")]),
+            &HashMap::new(),
+            &fps(&[("tests/authority_witness.rs", "test")]),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("tracked"));
+        assert!(error.to_string().contains("src/lib.rs"));
+    }
+
+    #[test]
+    fn witness_artifact_rejects_non_test_and_pre_existing_mutations() {
+        let non_test = validate_witness_artifact(
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &fps(&[
+                ("tests/authority_witness.rs", "test"),
+                ("README.md", "note"),
+            ]),
+        )
+        .unwrap_err();
+        assert!(non_test.to_string().contains("README.md"));
+
+        let existing = validate_witness_artifact(
+            &HashMap::new(),
+            &HashMap::new(),
+            &fps(&[("tests/authority_witness.rs", "old")]),
+            &fps(&[("tests/authority_witness.rs", "new")]),
+        )
+        .unwrap_err();
+        assert!(existing.to_string().contains("new test file"));
     }
 
     // ---- tampered_paths ----------------------------------------------------

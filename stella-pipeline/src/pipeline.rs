@@ -61,7 +61,7 @@ use crate::plan::{PlanStep, build_planner_prompt, parse_plan, plan_repair_prompt
 use crate::ports::{
     ApprovalGate, CandidateWorkspace, CandidateWorkspacePort, CommandRunner, ContextRecallPort,
     ProviderResolver, RecalledFrame, RepoStatusPort, RepoStructurePort, ScopeDecision,
-    WorkspaceError,
+    TestInvocation, TestRunner, WorkspaceError,
 };
 use crate::scope::{ScopeEstimate, apply_trim, build_proposal, needs_scope_review};
 use crate::triage::{TaskClass, classify_triage_response, resolve_task_class, triage_prompt};
@@ -71,11 +71,12 @@ use crate::verify::{
     judge_prompt, ladder_decision, model_verdict_evidence, parse_judge_response,
 };
 use crate::witness::{
-    Witness, parse_witness_command, tampered_paths, witness_prompt, witness_repair_prompt,
-    witness_watchlist,
+    Witness, parse_test_invocation, parse_witness_command, tampered_paths,
+    validate_witness_artifact, witness_prompt, witness_repair_prompt,
 };
 mod run_error;
 mod stage_budget;
+mod task5;
 use run_error::RoleResolveError;
 pub use run_error::{PipelineError, PipelineRunError};
 use stage_budget::{PipelineBudgetAbort, aborted_before_execute, budget_abort, record_and_tick};
@@ -106,8 +107,10 @@ pub struct PipelinePorts<'a> {
     /// Untracked-file snapshots for the zero-diff guard (`git diff` can't see
     /// untracked files; this makes new/modified untracked files visible).
     pub repo_status: &'a dyn RepoStatusPort,
-    /// Runs the verification ladder's test and diff commands (L-E11).
+    /// Runs fixed diagnostic diff commands.
     pub commands: &'a dyn CommandRunner,
+    /// Runs validated test invocations directly, without a shell.
+    pub tests: &'a dyn TestRunner,
     /// The interactive scope-review gate (L-E5).
     pub approvals: &'a dyn ApprovalGate,
     /// The delay port for retry backoff — the same testability seam
@@ -119,10 +122,8 @@ pub struct PipelinePorts<'a> {
     /// the exact pre-hooks pipeline; the CLI passes its settings-chain hooks
     /// so `PreToolUse` gating also covers the default `stella run` path.
     pub hooks: Option<(&'a Hooks, &'a dyn HookRunner)>,
-    /// Best-of-N candidate isolation (L-E7): one snapshot of the current
-    /// tree state per candidate, winner-only adoption. Never consulted on a
-    /// single-shot run (`candidates <= 1`); a multi-candidate run without it
-    /// degrades to the historical shared-tree behavior with a loud warning.
+    /// Candidate isolation (L-E7): one snapshot per candidate and passing-only
+    /// adoption. Also required for authored witnesses at `candidates = 1`.
     pub candidate_workspaces: Option<&'a dyn CandidateWorkspacePort>,
     /// Step-boundary steering for the EXECUTE engine only — mid-turn user
     /// messages injected as the model's next observation (`stella_core`'s
@@ -393,6 +394,7 @@ impl CandidateState {
 #[derive(Clone, Copy)]
 struct CandidateSurface<'c> {
     commands: &'c dyn CommandRunner,
+    tests: &'c dyn TestRunner,
     repo_status: &'c dyn RepoStatusPort,
 }
 
@@ -407,6 +409,7 @@ pub struct Pipeline<'a> {
     repo: &'a dyn RepoStructurePort,
     repo_status: &'a dyn RepoStatusPort,
     commands: &'a dyn CommandRunner,
+    tests: &'a dyn TestRunner,
     approvals: &'a dyn ApprovalGate,
     sleeper: &'a dyn Sleeper,
     hooks: Option<(&'a Hooks, &'a dyn HookRunner)>,
@@ -414,6 +417,7 @@ pub struct Pipeline<'a> {
     steering: Option<&'a dyn stella_core::ports::TurnSteering>,
     events: UnboundedSender<AgentEvent>,
     config: PipelineConfig,
+    configured_test: Result<Option<TestInvocation>, crate::witness::TestInvocationError>,
 }
 
 impl<'a> Pipeline<'a> {
@@ -423,6 +427,11 @@ impl<'a> Pipeline<'a> {
         events: UnboundedSender<AgentEvent>,
         config: PipelineConfig,
     ) -> Self {
+        let configured_test = config
+            .test_command
+            .as_deref()
+            .map(parse_test_invocation)
+            .transpose();
         Self {
             router: ports.router,
             providers: ports.providers,
@@ -431,6 +440,7 @@ impl<'a> Pipeline<'a> {
             repo: ports.repo,
             repo_status: ports.repo_status,
             commands: ports.commands,
+            tests: ports.tests,
             approvals: ports.approvals,
             sleeper: ports.sleeper,
             hooks: ports.hooks,
@@ -438,6 +448,7 @@ impl<'a> Pipeline<'a> {
             steering: ports.steering,
             events,
             config,
+            configured_test,
         }
     }
 
@@ -453,6 +464,12 @@ impl<'a> Pipeline<'a> {
         budget: &mut BudgetGuard,
     ) -> Result<PipelineOutcome, PipelineRunError> {
         let mut total_cost = 0.0f64;
+        if let Err(error) = &self.configured_test {
+            return Err(PipelineRunError::new(
+                PipelineError::InvalidTestCommand(error.to_string()),
+                total_cost,
+            ));
+        }
         if messages.is_empty() {
             messages.push(CompletionMessage::system(DEFAULT_SYSTEM_PROMPT));
         }
@@ -530,73 +547,68 @@ impl<'a> Pipeline<'a> {
             None => None,
         };
 
-        // --- 4.5. Witness authoring (L-E11 front half). ---------------------
-        // After scope review (never author a witness for a plan the user may
-        // abort), before the candidate loop (one witness is the shared
-        // yardstick every candidate is measured by).
-        let witness = match self
-            .witness_stage(goal, &frames, task_class, budget, &mut total_cost)
-            .await
-        {
-            Ok(witness) => witness,
-            Err(abort) => {
-                return Ok(aborted_before_execute(
-                    &self.events,
-                    task_class,
-                    total_cost,
-                    &abort.reason,
-                ));
-            }
-        };
-
-        // --- 5. Execute + verify (single-shot or best-of-N). ---------------
-        let worker = match self.resolve_provider(Role::Worker) {
-            Ok(w) => w,
-            Err(e) => {
-                return Err(PipelineRunError::new(e.into_pipeline_error(), total_cost));
-            }
-        };
-        if let Some(fb) = &worker.fallback {
-            self.emit_fallback(fb);
-        }
-        let worker_model_label = worker.model_ref.to_string();
-
+        // --- 5. Witness + execute + verify (single-shot or best-of-N). ------
         let n = self.config.candidate_count();
         let base_messages = messages.clone();
+        let authored_witness = self.config.test_command.is_none()
+            && self.config.witness_writer
+            && task_class.verifies_unconditionally();
         // Single-shot (the default) runs directly over the session ports —
-        // zero snapshot/adoption machinery, zero extra git operations.
+        // zero snapshot/adoption machinery only when the user supplied the
+        // test invocation (or witness authoring is otherwise disabled).
+        // Authored witnesses always require a disposable candidate, even at
+        // N=1, so authoring can never mutate the session tree.
         // Best-of-N runs every candidate in an isolated snapshot of the
         // current tree state and adopts only the winner's changes (L-E7).
-        let best = if n == 1 {
+        let (best, worker_model_label) = if n == 1 && !authored_witness {
+            let worker = match self.resolve_provider(Role::Worker) {
+                Ok(worker) => worker,
+                Err(error) => {
+                    return Err(PipelineRunError::new(
+                        error.into_pipeline_error(),
+                        total_cost,
+                    ));
+                }
+            };
+            if let Some(fallback) = &worker.fallback {
+                self.emit_fallback(fallback);
+            }
+            let worker_model_label = worker.model_ref.to_string();
             let mut single = self
                 .run_shared_candidates(
                     goal,
                     &base_messages,
                     plan.as_deref(),
                     task_class,
-                    witness.as_ref(),
+                    None,
                     &worker,
                     1,
                     budget,
                     &mut total_cost,
                 )
                 .await;
-            single
+            let best = single
                 .pop()
-                .expect("run_shared_candidates returns one result per requested candidate")
+                .expect("run_shared_candidates returns one result per requested candidate");
+            (best, Some(worker_model_label))
         } else {
-            self.run_best_of_n(
-                goal,
-                &base_messages,
-                plan.as_deref(),
-                task_class,
-                witness.as_ref(),
-                &worker,
-                n,
-                budget,
-                &mut total_cost,
-            )
-            .await
+            match self
+                .run_best_of_n(
+                    goal,
+                    &base_messages,
+                    plan.as_deref(),
+                    task_class,
+                    n,
+                    &frames,
+                    authored_witness,
+                    budget,
+                    &mut total_cost,
+                )
+                .await
+            {
+                Ok(result) => result,
+                Err(cause) => return Err(PipelineRunError::new(cause, total_cost)),
+            }
         };
 
         // Adopt the winning candidate's trajectory.
@@ -630,7 +642,7 @@ impl<'a> Pipeline<'a> {
         };
         match &status {
             PipelineStatus::Completed => self.emit(AgentEvent::Complete {
-                model: worker_model_label,
+                model: worker_model_label.unwrap_or_default(),
                 cost_usd: total_cost,
             }),
             PipelineStatus::VerificationFailed { verdict } => {
@@ -850,6 +862,7 @@ impl<'a> Pipeline<'a> {
         }
         let surface = CandidateSurface {
             commands: self.commands,
+            tests: self.tests,
             repo_status: self.repo_status,
         };
         let mut results: Vec<CandidateResult> = Vec::with_capacity(n as usize);
@@ -886,13 +899,24 @@ impl<'a> Pipeline<'a> {
         base_messages: &[CompletionMessage],
         plan: Option<&[PlanStep]>,
         task_class: TaskClass,
-        witness: Option<&Witness>,
-        worker: &ResolvedRole<'a>,
         n: u32,
+        frames: &[RecalledFrame],
+        author_witness: bool,
         budget: &mut BudgetGuard,
         total: &mut f64,
-    ) -> CandidateResult {
+    ) -> Result<(CandidateResult, Option<String>), PipelineError> {
         let Some(port) = self.candidate_workspaces else {
+            if author_witness {
+                return Ok((
+                    CandidateResult::aborted(
+                        base_messages.to_vec(),
+                        "authored witness requires candidate isolation, but no candidate \
+                         workspace port is available"
+                            .to_string(),
+                    ),
+                    None,
+                ));
+            }
             // No isolation port (non-git workspace, or a caller that never
             // wired one): the historical shared-tree behavior, made loud —
             // candidates see each other's residue and losers' edits stay on
@@ -902,29 +926,40 @@ impl<'a> Pipeline<'a> {
                  {n} candidates will run sequentially in the shared working tree, and losing \
                  candidates' file changes will not be rolled back"
             ));
+            let worker = self
+                .resolve_provider(Role::Worker)
+                .map_err(RoleResolveError::into_pipeline_error)?;
+            if let Some(fallback) = &worker.fallback {
+                self.emit_fallback(fallback);
+            }
+            let label = worker.model_ref.to_string();
             let candidates = self
                 .run_shared_candidates(
                     goal,
                     base_messages,
                     plan,
                     task_class,
-                    witness,
-                    worker,
+                    None,
+                    &worker,
                     n,
                     budget,
                     total,
                 )
                 .await;
             let best_idx = best_index(&candidates);
-            return candidates
-                .into_iter()
-                .nth(best_idx)
-                .expect("best_index returns an in-range index");
+            return Ok((
+                candidates
+                    .into_iter()
+                    .nth(best_idx)
+                    .expect("best_index returns an in-range index"),
+                Some(label),
+            ));
         };
 
         let mut candidates: Vec<CandidateResult> = Vec::with_capacity(n as usize);
         let mut workspaces: Vec<Option<Box<dyn CandidateWorkspace>>> =
             Vec::with_capacity(n as usize);
+        let mut worker: Option<ResolvedRole<'a>> = None;
         for i in 0..n {
             let ws = match port.create().await {
                 Ok(ws) => ws,
@@ -942,6 +977,47 @@ impl<'a> Pipeline<'a> {
                 }
             };
             let result = {
+                let surface = CandidateSurface {
+                    commands: ws.commands(),
+                    tests: ws.tests(),
+                    repo_status: ws.repo_status(),
+                };
+                let witness = if author_witness {
+                    match self
+                        .witness_stage(goal, frames, ws.tools(), surface, budget, total)
+                        .await
+                    {
+                        Ok(witness) => witness,
+                        Err(reason) => {
+                            candidates
+                                .push(CandidateResult::aborted(base_messages.to_vec(), reason));
+                            workspaces.push(Some(ws));
+                            continue;
+                        }
+                    }
+                } else {
+                    None
+                };
+                if worker.is_none() {
+                    match self.resolve_provider(Role::Worker) {
+                        Ok(resolved) => {
+                            if let Some(fallback) = &resolved.fallback {
+                                self.emit_fallback(fallback);
+                            }
+                            worker = Some(resolved);
+                        }
+                        Err(error) => {
+                            ws.remove().await;
+                            for workspace in workspaces.into_iter().flatten() {
+                                workspace.remove().await;
+                            }
+                            return Err(error.into_pipeline_error());
+                        }
+                    }
+                }
+                let worker = worker
+                    .as_ref()
+                    .expect("worker resolution is populated before candidate execution");
                 let mut engine = Engine::with_sleeper(
                     worker.provider,
                     ws.tools(),
@@ -954,16 +1030,12 @@ impl<'a> Pipeline<'a> {
                 if let Some(steering) = self.steering {
                     engine = engine.with_steering(steering);
                 }
-                let surface = CandidateSurface {
-                    commands: ws.commands(),
-                    repo_status: ws.repo_status(),
-                };
                 self.run_candidate(
                     goal,
                     base_messages,
                     plan,
                     task_class,
-                    witness,
+                    witness.as_ref(),
                     &engine,
                     surface,
                     budget,
@@ -981,7 +1053,12 @@ impl<'a> Pipeline<'a> {
         let mut adopt_failure: Option<WorkspaceError> = None;
         for (i, ws) in workspaces.into_iter().enumerate() {
             let Some(ws) = ws else { continue };
-            if i == best_idx && candidates[best_idx].aborted.is_none() {
+            if i == best_idx
+                && candidates[best_idx]
+                    .verdict
+                    .as_ref()
+                    .is_some_and(|verdict| verdict.passed)
+            {
                 match ws.adopt().await {
                     Ok(adopted) => {
                         // Surface the adopted paths on the event stream: the
@@ -1011,7 +1088,10 @@ impl<'a> Pipeline<'a> {
         if let Some(e) = adopt_failure {
             best.aborted = Some(e.to_string());
         }
-        best
+        let label = worker
+            .as_ref()
+            .map(|resolved| resolved.model_ref.to_string());
+        Ok((best, label))
     }
 
     // ------------------------------------------------------------------
@@ -1043,10 +1123,10 @@ impl<'a> Pipeline<'a> {
         // modified), and a seeded observation would be a fabricated one.
         let mut oracle = FlipOracle::new();
         if task_class.verifies_unconditionally()
-            && let Some(cmd) = effective_test_command(&self.config, witness)
+            && let Some(cmd) = self.effective_test_command(witness)
         {
-            let pre = surface.commands.run(cmd).await;
-            oracle.observe(cmd, pre.passed());
+            let pre = surface.tests.run_test(cmd.invocation).await;
+            oracle.observe(cmd.command, pre.passed());
         }
 
         // Snapshot untracked files (with content fingerprints) BEFORE
@@ -1168,13 +1248,13 @@ impl<'a> Pipeline<'a> {
         self.emit(AgentEvent::Stage {
             name: StageKind::Verify,
         });
-        let effective_cmd = effective_test_command(&self.config, witness);
+        let effective_cmd = self.effective_test_command(witness);
         loop {
             let (touched_tests_passed, test_tail) = self
                 .observe_touched_tests(surface, effective_cmd, &mut state.oracle)
                 .await;
             // Tamper exclusion: a flip is credited only while the witness
-            // files' fingerprints (size + mtime) match what the witness
+            // artifact's complete content hash matches what the witness
             // author wrote. A
             // tampered witness degrades the flip to inconclusive — the judge
             // then decides, told exactly which paths were touched — it never
@@ -1342,18 +1422,38 @@ impl<'a> Pipeline<'a> {
     async fn observe_touched_tests(
         &self,
         surface: CandidateSurface<'_>,
-        cmd: Option<&str>,
+        cmd: Option<EffectiveTestCommand<'_>>,
         oracle: &mut FlipOracle,
     ) -> (Option<bool>, String) {
         match cmd {
             Some(cmd) => {
-                let post = surface.commands.run(cmd).await;
+                let post = surface.tests.run_test(cmd.invocation).await;
                 let passed = post.passed();
-                oracle.observe(cmd, passed);
+                oracle.observe(cmd.command, passed);
                 (Some(passed), post.stderr_tail)
             }
             None => (None, String::new()),
         }
+    }
+
+    fn effective_test_command<'c>(
+        &'c self,
+        witness: Option<&'c Witness>,
+    ) -> Option<EffectiveTestCommand<'c>> {
+        if let Ok(Some(invocation)) = &self.configured_test {
+            return self
+                .config
+                .test_command
+                .as_deref()
+                .map(|command| EffectiveTestCommand {
+                    command,
+                    invocation,
+                });
+        }
+        witness.map(|w| EffectiveTestCommand {
+            command: &w.command,
+            invocation: &w.invocation,
+        })
     }
 
     /// Spend one revision: run [`Pipeline::revise_turn`] with the failure
@@ -1426,140 +1526,6 @@ impl<'a> Pipeline<'a> {
             name: StageKind::Verify,
         });
         Ok((dl, dt))
-    }
-
-    // ------------------------------------------------------------------
-    // Stage: witness authoring (L-E11 front half)
-    // ------------------------------------------------------------------
-
-    /// Author the witness test when nothing else arms the flip oracle: one
-    /// engine turn (with tools — the author writes a real test file) whose
-    /// reply names a `TEST_COMMAND:`, checked to actually FAIL on the current
-    /// code (a passing "witness" witnesses nothing; one bounded repair retry,
-    /// then discard). Returns `None` — degrading verification to the model
-    /// judge, exactly as if no test command existed — whenever any part
-    /// doesn't hold; the witness stage can slow a run down but never fail it.
-    ///
-    /// Witness ≠ worker: the author rides the judge's resolution (the test
-    /// that defines "done" comes from the same independent role that enforces
-    /// it), falling back to the worker's model only when no judge resolves.
-    async fn witness_stage(
-        &self,
-        goal: &str,
-        frames: &[RecalledFrame],
-        task_class: TaskClass,
-        budget: &mut BudgetGuard,
-        total: &mut f64,
-    ) -> Result<Option<Witness>, PipelineBudgetAbort> {
-        if self.config.test_command.is_some()
-            || !self.config.witness_writer
-            || !task_class.verifies_unconditionally()
-        {
-            return Ok(None);
-        }
-        self.emit(AgentEvent::Stage {
-            name: StageKind::Witness,
-        });
-        let resolved = match self
-            .resolve_provider(Role::Judge)
-            .or_else(|_| self.resolve_provider(Role::Worker))
-        {
-            Ok(r) => r,
-            Err(_) => return Ok(None),
-        };
-        if let Some(fb) = &resolved.fallback {
-            self.emit_fallback(fb);
-        }
-
-        // Snapshot BEFORE the author runs: the fingerprint delta afterwards
-        // is the tamper watchlist (observed, never the author's own claims).
-        let before = self.repo_status.untracked_fingerprints().await;
-        let structure = self.repo.structure_summary().await;
-        let mut engine = Engine::with_sleeper(
-            resolved.provider,
-            self.tools,
-            self.config.engine.clone(),
-            self.sleeper,
-        );
-        if let Some((hooks, runner)) = self.hooks {
-            engine = engine.with_hooks(hooks, runner);
-        }
-
-        let mut messages = vec![
-            CompletionMessage::system(WITNESS_SYSTEM_PROMPT),
-            CompletionMessage::user(witness_prompt(goal, frames, &structure)),
-        ];
-        let mut file_changes = 0u32;
-        let text = match self
-            .run_engine_turn(&engine, &mut messages, budget, &mut file_changes)
-            .await
-        {
-            TurnOutcome::Completed { text, cost_usd } => {
-                *total += cost_usd;
-                text
-            }
-            TurnOutcome::Aborted { reason, cost_usd } => {
-                *total += cost_usd;
-                if let Some(abort) = budget_abort(budget.evaluate()) {
-                    return Err(abort);
-                }
-                self.warn(format!(
-                    "witness author turn aborted ({reason}); verification falls back to the \
-                     model judge"
-                ));
-                return Ok(None);
-            }
-        };
-        let Some(mut command) = parse_witness_command(&text) else {
-            self.warn(
-                "witness author produced no TEST_COMMAND line; verification falls back to \
-                 the model judge"
-                    .to_string(),
-            );
-            return Ok(None);
-        };
-
-        // The witness must fail on the unmodified code — only a fail→pass
-        // flip of it will count (L-E11). One bounded repair retry (the L-V2
-        // pattern), then discard; never loop.
-        if self.commands.run(&command).await.passed() {
-            messages.push(CompletionMessage::user(witness_repair_prompt(&command)));
-            let repaired = match self
-                .run_engine_turn(&engine, &mut messages, budget, &mut file_changes)
-                .await
-            {
-                TurnOutcome::Completed { text, cost_usd } => {
-                    *total += cost_usd;
-                    text
-                }
-                TurnOutcome::Aborted { reason, cost_usd } => {
-                    *total += cost_usd;
-                    if let Some(abort) = budget_abort(budget.evaluate()) {
-                        return Err(abort);
-                    }
-                    self.warn(format!(
-                        "witness repair turn aborted ({reason}); verification falls back to \
-                         the model judge"
-                    ));
-                    return Ok(None);
-                }
-            };
-            command = parse_witness_command(&repaired).unwrap_or(command);
-            if self.commands.run(&command).await.passed() {
-                self.warn(
-                    "witness test still passes on the unmodified code after one repair — \
-                     discarded; verification falls back to the model judge"
-                        .to_string(),
-                );
-                return Ok(None);
-            }
-        }
-
-        let after = self.repo_status.untracked_fingerprints().await;
-        Ok(Some(Witness {
-            command,
-            files: witness_watchlist(&before, &after),
-        }))
     }
 
     // ------------------------------------------------------------------
@@ -1905,14 +1871,10 @@ fn best_index(candidates: &[CandidateResult]) -> usize {
 
 /// The flip oracle's command for this run: an explicit `--test-command`
 /// always wins; otherwise the witness author's (when one was validated).
-fn effective_test_command<'c>(
-    config: &'c PipelineConfig,
-    witness: Option<&'c Witness>,
-) -> Option<&'c str> {
-    config
-        .test_command
-        .as_deref()
-        .or(witness.map(|w| w.command.as_str()))
+#[derive(Clone, Copy)]
+struct EffectiveTestCommand<'c> {
+    command: &'c str,
+    invocation: &'c TestInvocation,
 }
 
 /// Assemble the volatile recall+goal user message that rides *after* the

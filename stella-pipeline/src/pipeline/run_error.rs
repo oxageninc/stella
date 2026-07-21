@@ -5,6 +5,9 @@ use stella_protocol::ModelRef;
 /// [`super::PipelineStatus::Aborted`], which is a normal outcome).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum PipelineError {
+    /// A user-supplied test command did not fit the typed test vocabulary.
+    #[error("invalid test command: {0}")]
+    InvalidTestCommand(String),
     /// A plan crossed the scope-review thresholds while running headless with
     /// no approval bypass configured (L-E5): never silently auto-approve.
     #[error(

@@ -21,6 +21,7 @@ use tokio::sync::mpsc;
 
 use crate::ports::{
     AdoptedChange, AutoApproveGate, CmdOutcome, NoContextRecall, NoRepoStatus, NoRepoStructure,
+    TestInvocation, TestRunner,
 };
 
 // ---- test doubles ---------------------------------------------------
@@ -55,6 +56,8 @@ impl RepoStatusPort for FakeRepoStatus {
 struct SeqRepoStatus {
     snapshots: std::sync::Mutex<VecDeque<HashMap<String, String>>>,
     last: std::sync::Mutex<HashMap<String, String>>,
+    tracked_snapshots: std::sync::Mutex<VecDeque<HashMap<String, String>>>,
+    tracked_last: std::sync::Mutex<HashMap<String, String>>,
 }
 impl SeqRepoStatus {
     fn new(snapshots: Vec<Vec<(&str, &str)>>) -> Self {
@@ -70,7 +73,24 @@ impl SeqRepoStatus {
         Self {
             snapshots: std::sync::Mutex::new(mapped),
             last: std::sync::Mutex::new(HashMap::new()),
+            tracked_snapshots: std::sync::Mutex::new(VecDeque::new()),
+            tracked_last: std::sync::Mutex::new(HashMap::new()),
         }
+    }
+
+    fn with_tracked(mut self, snapshots: Vec<Vec<(&str, &str)>>) -> Self {
+        self.tracked_snapshots = std::sync::Mutex::new(
+            snapshots
+                .into_iter()
+                .map(|files| {
+                    files
+                        .into_iter()
+                        .map(|(p, fp)| (p.to_string(), fp.to_string()))
+                        .collect()
+                })
+                .collect(),
+        );
+        self
     }
 }
 #[async_trait]
@@ -83,6 +103,17 @@ impl RepoStatusPort for SeqRepoStatus {
                 next
             }
             None => self.last.lock().unwrap().clone(),
+        }
+    }
+
+    async fn tracked_fingerprints(&self) -> HashMap<String, String> {
+        let mut q = self.tracked_snapshots.lock().unwrap();
+        match q.pop_front() {
+            Some(next) => {
+                *self.tracked_last.lock().unwrap() = next.clone();
+                next
+            }
+            None => self.tracked_last.lock().unwrap().clone(),
         }
     }
 }
@@ -202,6 +233,17 @@ impl CommandRunner for ScriptedRunner {
                 stderr_tail: String::new(),
             };
         }
+        CmdOutcome {
+            exit_code: 0,
+            stdout_tail: String::new(),
+            stderr_tail: String::new(),
+        }
+    }
+}
+
+#[async_trait]
+impl TestRunner for ScriptedRunner {
+    async fn run_test(&self, _invocation: &TestInvocation) -> CmdOutcome {
         let passed = self
             .test_results
             .lock()
@@ -243,6 +285,12 @@ impl CommandRunner for NeverRunner {
         panic!("the session CommandRunner must not serve isolated candidates (got `{cmd}`)");
     }
 }
+#[async_trait]
+impl TestRunner for NeverRunner {
+    async fn run_test(&self, invocation: &TestInvocation) -> CmdOutcome {
+        panic!("the session TestRunner must not serve isolated candidates (got {invocation:?})");
+    }
+}
 struct NeverRepoStatus;
 #[async_trait]
 impl RepoStatusPort for NeverRepoStatus {
@@ -257,7 +305,7 @@ struct FakeWorkspace {
     id: usize,
     tools: EmptyTools,
     commands: ScriptedRunner,
-    repo_status: NoRepoStatus,
+    repo_status: SeqRepoStatus,
     adopt_result: Result<Vec<AdoptedChange>, WorkspaceError>,
     log: Arc<std::sync::Mutex<Vec<String>>>,
 }
@@ -273,10 +321,15 @@ impl FakeWorkspace {
             id,
             tools: EmptyTools,
             commands: ScriptedRunner::new(test_results, "@@ -1 +1 @@\n-a\n+b"),
-            repo_status: NoRepoStatus,
+            repo_status: SeqRepoStatus::new(vec![]),
             adopt_result,
             log,
         }
+    }
+
+    fn with_repo_status(mut self, repo_status: SeqRepoStatus) -> Self {
+        self.repo_status = repo_status;
+        self
     }
 }
 
@@ -286,6 +339,9 @@ impl CandidateWorkspace for FakeWorkspace {
         &self.tools
     }
     fn commands(&self) -> &dyn CommandRunner {
+        &self.commands
+    }
+    fn tests(&self) -> &dyn TestRunner {
         &self.commands
     }
     fn repo_status(&self) -> &dyn RepoStatusPort {
@@ -446,6 +502,7 @@ async fn single_task_with_a_flip_submits_fast_and_skips_the_judge() {
             repo: &repo,
             repo_status: &repo_status,
             commands: &runner,
+            tests: &runner,
             approvals: &approvals,
             sleeper: &sleeper,
             hooks: None,
@@ -522,6 +579,7 @@ async fn a_queued_steer_is_injected_into_the_execute_turn() {
             repo: &repo,
             repo_status: &repo_status,
             commands: &runner,
+            tests: &runner,
             approvals: &approvals,
             sleeper: &sleeper,
             hooks: None,
@@ -590,6 +648,7 @@ async fn misclassified_lookup_that_touches_files_still_gets_verified() {
             repo: &repo,
             repo_status: &repo_status,
             commands: &runner,
+            tests: &runner,
             approvals: &approvals,
             sleeper: &sleeper,
             hooks: None,
@@ -648,6 +707,7 @@ async fn clean_lookup_skips_plan_verify_and_judge() {
             repo: &repo,
             repo_status: &repo_status,
             commands: &runner,
+            tests: &runner,
             approvals: &approvals,
             sleeper: &sleeper,
             hooks: None,
@@ -713,6 +773,7 @@ async fn paid_headless_scope_review_error_retains_settled_cost() {
             repo: &repo,
             repo_status: &repo_status,
             commands: &runner,
+            tests: &runner,
             approvals: &approvals,
             sleeper: &sleeper,
             hooks: None,
@@ -768,6 +829,7 @@ async fn user_abort_at_scope_review_is_a_clean_abort() {
             repo: &repo,
             repo_status: &repo_status,
             commands: &runner,
+            tests: &runner,
             approvals: &approvals,
             sleeper: &sleeper,
             hooks: None,
@@ -837,6 +899,7 @@ async fn gather_diff_counts_real_new_file_lines_and_excludes_pre_existing() {
             repo: &repo,
             repo_status: &repo_status,
             commands: &runner,
+            tests: &runner,
             approvals: &approvals,
             sleeper: &sleeper,
             hooks: None,
@@ -849,6 +912,7 @@ async fn gather_diff_counts_real_new_file_lines_and_excludes_pre_existing() {
 
     let surface = CandidateSurface {
         commands: &runner,
+        tests: &runner,
         repo_status: &repo_status,
     };
     // No baseline → the file is this turn's; its real 5000 lines count.
@@ -906,47 +970,25 @@ async fn witness_authored_command_arms_the_flip_oracle_and_submits_fast() {
     // triage → "single"; witness author turn → marker line; worker → done.
     let provider = ScriptedProvider::new(vec![
         text_result("single"),
-        text_result("wrote the test.\nTEST_COMMAND: run-witness"),
+        text_result("wrote the test.\nTEST_COMMAND: cargo test witness"),
         text_result("done"),
     ]);
-    let resolver = OneProvider(&provider);
     // Test-command pops: witness fail-check (fail), per-candidate baseline
     // (fail), post-execute observation (pass) → a genuine flip.
-    let runner = ScriptedRunner::new(vec![false, false, true], "@@ -1 +1 @@\n-old\n+new");
-    let tools = EmptyTools;
-    let recall = NoContextRecall;
-    let repo = NoRepoStructure;
-    let repo_status = NoRepoStatus;
-    let approvals = AutoApproveGate;
-    let sleeper = NoopSleeper;
-    let router = router();
-    let (tx, mut rx) = mpsc::unbounded_channel();
-
-    let pipeline = Pipeline::new(
-        PipelinePorts {
-            router: &router,
-            providers: &resolver,
-            tools: &tools,
-            recall: &recall,
-            repo: &repo,
-            repo_status: &repo_status,
-            commands: &runner,
-            approvals: &approvals,
-            sleeper: &sleeper,
-            hooks: None,
-            candidate_workspaces: None,
-            steering: None,
-        },
-        tx,
+    let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let workspace =
+        FakeWorkspace::new(0, vec![false, false, true], Ok(vec![]), log.clone()).with_repo_status(
+            SeqRepoStatus::new(vec![vec![], vec![("tests/witness.rs", "w1")]]),
+        );
+    let port = FakeWorkspacePort::new(vec![Ok(workspace)], log);
+    let (outcome, events, _) = run_isolated(
+        &provider,
+        &port,
         PipelineConfig::default(),
-    );
-
-    let mut messages = vec![CompletionMessage::system("sys")];
-    let mut budget = BudgetGuard::new(BudgetMode::Off, None, None);
-    let outcome = pipeline
-        .run("Fix the retry bug", &mut messages, &mut budget)
-        .await
-        .expect("run succeeds");
+        "Fix the retry bug",
+    )
+    .await;
+    let outcome = outcome.expect("run succeeds");
 
     assert_eq!(outcome.status, PipelineStatus::Completed);
     let verdict = outcome.verdict.expect("verified");
@@ -957,84 +999,45 @@ async fn witness_authored_command_arms_the_flip_oracle_and_submits_fast() {
         verdict.summary
     );
     assert!(
-        verdict.summary.contains("run-witness"),
+        verdict.summary.contains("cargo test witness"),
         "the evidence names the witness command: {}",
         verdict.summary
     );
 
-    let s = stages(&drain(&mut rx));
+    let s = stages(&events);
     assert!(s.contains(&StageKind::Witness), "witness stage emitted");
     assert!(!s.contains(&StageKind::Judge), "judge skipped on the flip");
 }
 
 /// A witness whose test passes on the unmodified code proves nothing: one
-/// bounded repair retry, and if it still passes the witness is discarded —
-/// the run degrades to model-judge verification instead of failing.
+/// bounded repair retry, and if it still passes the contaminated candidate is
+/// discarded rather than letting author-written files reach adoption.
 #[tokio::test]
-async fn a_witness_that_never_fails_is_discarded_and_the_judge_verifies() {
+async fn a_witness_that_never_fails_aborts_and_removes_the_candidate() {
     let provider = ScriptedProvider::new(vec![
         text_result("single"),
-        text_result("TEST_COMMAND: always-green"),
+        text_result("TEST_COMMAND: cargo test always-green"),
         // The repair attempt also yields a command that passes.
-        text_result("TEST_COMMAND: still-green"),
-        text_result("done"),                  // worker
-        text_result("PASS matches the goal"), // judge (no flip evidence)
+        text_result("TEST_COMMAND: cargo test still-green"),
     ]);
-    let resolver = OneProvider(&provider);
     // Pops: witness check (pass), repair check (pass) → discard. Then no
     // test command exists for the candidate, so no further pops.
-    let runner = ScriptedRunner::new(vec![true, true], "@@ -1 +1 @@\n-a\n+b");
-    let tools = EmptyTools;
-    let recall = NoContextRecall;
-    let repo = NoRepoStructure;
-    let repo_status = NoRepoStatus;
-    let approvals = AutoApproveGate;
-    let sleeper = NoopSleeper;
-    let router = router();
-    let (tx, mut rx) = mpsc::unbounded_channel();
-
-    let pipeline = Pipeline::new(
-        PipelinePorts {
-            router: &router,
-            providers: &resolver,
-            tools: &tools,
-            recall: &recall,
-            repo: &repo,
-            repo_status: &repo_status,
-            commands: &runner,
-            approvals: &approvals,
-            sleeper: &sleeper,
-            hooks: None,
-            candidate_workspaces: None,
-            steering: None,
-        },
-        tx,
+    let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let workspace =
+        FakeWorkspace::new(0, vec![true, true], Ok(vec![]), log.clone()).with_repo_status(
+            SeqRepoStatus::new(vec![vec![], vec![("tests/witness.rs", "w1")]]),
+        );
+    let port = FakeWorkspacePort::new(vec![Ok(workspace)], log.clone());
+    let (outcome, _, _) = run_isolated(
+        &provider,
+        &port,
         PipelineConfig::default(),
-    );
-
-    let mut messages = vec![CompletionMessage::system("sys")];
-    let mut budget = BudgetGuard::new(BudgetMode::Off, None, None);
-    let outcome = pipeline
-        .run("Fix the retry bug", &mut messages, &mut budget)
-        .await
-        .expect("run succeeds");
-
-    assert_eq!(outcome.status, PipelineStatus::Completed);
-    let verdict = outcome.verdict.expect("verified");
-    assert!(verdict.passed);
-    assert!(
-        !verdict.deterministic,
-        "no flip → the model judge decided, not the ladder"
-    );
-    let events = drain(&mut rx);
-    assert!(
-        events.iter().any(|e| matches!(
-            e,
-            AgentEvent::Error { message, retryable: true } if message.contains("witness")
-        )),
-        "the discarded witness is warned about, never silent"
-    );
-    assert!(stages(&events).contains(&StageKind::Judge));
+        "Fix the retry bug",
+    )
+    .await;
+    let outcome = outcome.expect("invalid witness is a truthful abort");
+    assert!(matches!(outcome.status, PipelineStatus::Aborted { .. }));
+    assert_eq!(*log.lock().unwrap(), vec!["create", "remove:0"]);
 }
 
 /// Tamper exclusion: the worker modified the witness test file after it
@@ -1044,14 +1047,12 @@ async fn a_witness_that_never_fails_is_discarded_and_the_judge_verifies() {
 async fn a_tampered_witness_file_excludes_the_flip_from_evidence() {
     let provider = ScriptedProvider::new(vec![
         text_result("single"),
-        text_result("TEST_COMMAND: run-witness"),
+        text_result("TEST_COMMAND: cargo test witness"),
         text_result("done"),                     // worker
         text_result("FAIL the test was edited"), // judge on tampered evidence
     ]);
-    let resolver = OneProvider(&provider);
     // witness check (fail), baseline (fail), post-execute (pass) → the
     // oracle flips — but the tamper check below must void the credit.
-    let runner = ScriptedRunner::new(vec![false, false, true], "@@ -1 +1 @@\n-a\n+b");
     // untracked_fingerprints call order: witness-before (empty),
     // witness-after (test authored at w1 → watchlist), candidate
     // untracked_before, gather_diff after execute, tamper check — where
@@ -1063,43 +1064,16 @@ async fn a_tampered_witness_file_excludes_the_flip_from_evidence() {
         vec![("tests/witness.rs", "w1")],
         vec![("tests/witness.rs", "w2")],
     ]);
-    let tools = EmptyTools;
-    let recall = NoContextRecall;
-    let repo = NoRepoStructure;
-    let approvals = AutoApproveGate;
-    let sleeper = NoopSleeper;
-    let router = router();
-    let (tx, mut rx) = mpsc::unbounded_channel();
-
     let config = PipelineConfig {
         max_revisions: 0, // judge FAIL ends the run — keeps the script short
         ..PipelineConfig::default()
     };
-    let pipeline = Pipeline::new(
-        PipelinePorts {
-            router: &router,
-            providers: &resolver,
-            tools: &tools,
-            recall: &recall,
-            repo: &repo,
-            repo_status: &repo_status,
-            commands: &runner,
-            approvals: &approvals,
-            sleeper: &sleeper,
-            hooks: None,
-            candidate_workspaces: None,
-            steering: None,
-        },
-        tx,
-        config,
-    );
-
-    let mut messages = vec![CompletionMessage::system("sys")];
-    let mut budget = BudgetGuard::new(BudgetMode::Off, None, None);
-    let outcome = pipeline
-        .run("Fix the retry bug", &mut messages, &mut budget)
-        .await
-        .expect("run succeeds");
+    let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let workspace = FakeWorkspace::new(0, vec![false, false, true], Ok(vec![]), log.clone())
+        .with_repo_status(repo_status);
+    let port = FakeWorkspacePort::new(vec![Ok(workspace)], log);
+    let (outcome, events, _) = run_isolated(&provider, &port, config, "Fix the retry bug").await;
+    let outcome = outcome.expect("run succeeds");
 
     let verdict = outcome.verdict.expect("verified");
     assert!(!verdict.passed, "the judge failed the tampered work");
@@ -1108,7 +1082,7 @@ async fn a_tampered_witness_file_excludes_the_flip_from_evidence() {
         "a tampered flip must never submit fast — it degrades to the judge"
     );
     assert!(
-        stages(&drain(&mut rx)).contains(&StageKind::Judge),
+        stages(&events).contains(&StageKind::Judge),
         "tamper forces the model judge instead of SubmitFast"
     );
 }
@@ -1153,6 +1127,7 @@ async fn second_consecutive_red_verification_gets_judge_guidance() {
             repo: &repo,
             repo_status: &repo_status,
             commands: &runner,
+            tests: &runner,
             approvals: &approvals,
             sleeper: &sleeper,
             hooks: None,
@@ -1221,6 +1196,7 @@ async fn run_isolated(
             repo: &repo,
             repo_status: &repo_status,
             commands: &commands,
+            tests: &commands,
             approvals: &approvals,
             sleeper: &sleeper,
             hooks: None,
@@ -1238,7 +1214,7 @@ async fn run_isolated(
 
 fn isolated_config(n: u32) -> PipelineConfig {
     PipelineConfig {
-        test_command: Some("run-tests".into()),
+        test_command: Some("cargo test".into()),
         // A red first candidate must fail immediately, not revise — keeps
         // the scripts to one worker turn per candidate.
         max_revisions: 0,
@@ -1346,6 +1322,7 @@ async fn single_shot_never_touches_the_candidate_workspace_port() {
             repo: &repo,
             repo_status: &repo_status,
             commands: &runner,
+            tests: &runner,
             approvals: &approvals,
             sleeper: &sleeper,
             hooks: None,
@@ -1354,7 +1331,7 @@ async fn single_shot_never_touches_the_candidate_workspace_port() {
         },
         tx,
         PipelineConfig {
-            test_command: Some("run-tests".into()),
+            test_command: Some("cargo test".into()),
             ..PipelineConfig::default()
         },
     );
@@ -1499,6 +1476,7 @@ async fn best_of_n_without_a_port_degrades_to_the_shared_tree_with_a_warning() {
             repo: &repo,
             repo_status: &repo_status,
             commands: &runner,
+            tests: &runner,
             approvals: &approvals,
             sleeper: &sleeper,
             hooks: None,
@@ -1528,3 +1506,4 @@ async fn best_of_n_without_a_port_degrades_to_the_shared_tree_with_a_warning() {
 }
 
 mod task4;
+mod task5;

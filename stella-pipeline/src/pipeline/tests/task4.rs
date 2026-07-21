@@ -40,6 +40,7 @@ async fn red_final_verdict_is_verification_failed_not_completed() {
             repo: &repo,
             repo_status: &repo_status,
             commands: &runner,
+            tests: &runner,
             approvals: &approvals,
             sleeper: &sleeper,
             hooks: None,
@@ -118,6 +119,7 @@ async fn enforced_budget_breach_in_triage_stops_before_the_next_paid_stage() {
             repo: &repo,
             repo_status: &repo_status,
             commands: &runner,
+            tests: &runner,
             approvals: &approvals,
             sleeper: &sleeper,
             hooks: None,
@@ -155,7 +157,7 @@ async fn enforced_budget_breach_in_triage_stops_before_the_next_paid_stage() {
 async fn post_witness_worker_routing_error_retains_prior_stage_cost() {
     let provider = ScriptedProvider::new(vec![
         text_result("single"),
-        text_result("TEST_COMMAND: run-witness"),
+        text_result("TEST_COMMAND: cargo test witness"),
     ]);
     let resolver = FirstTwoProviderLookups {
         provider: &provider,
@@ -166,6 +168,11 @@ async fn post_witness_worker_routing_error_retains_prior_stage_cost() {
     let recall = NoContextRecall;
     let repo = NoRepoStructure;
     let repo_status = NoRepoStatus;
+    let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let workspace = FakeWorkspace::new(0, vec![false], Ok(vec![]), log.clone()).with_repo_status(
+        SeqRepoStatus::new(vec![vec![], vec![("tests/witness.rs", "sha256:test")]]),
+    );
+    let candidate_workspaces = FakeWorkspacePort::new(vec![Ok(workspace)], log);
     let approvals = AutoApproveGate;
     let sleeper = NoopSleeper;
     let router = router();
@@ -179,10 +186,11 @@ async fn post_witness_worker_routing_error_retains_prior_stage_cost() {
             repo: &repo,
             repo_status: &repo_status,
             commands: &runner,
+            tests: &runner,
             approvals: &approvals,
             sleeper: &sleeper,
             hooks: None,
-            candidate_workspaces: None,
+            candidate_workspaces: Some(&candidate_workspaces),
             steering: None,
         },
         tx,
