@@ -144,10 +144,11 @@ async fn run_pipeline_one_shot(
     let (tx, rx) = mpsc::unbounded_channel::<AgentEvent>();
     let renderer = spawn_renderer(rx, format, execution.clone(), cfg.provider.id.to_string());
 
-    // Role wiring from `agent_engine_config`: per-role model pins (triage/
-    // judge), their adapters, and per-role request overrides. Notices are
-    // stderr diagnostics — stdout may be machine-readable JSON.
-    let wiring = resolve_engine_wiring(cfg, &model_ref);
+    // Role wiring from `agent_engine_config`: per-role model pins (worker/
+    // triage/judge), their adapters, and per-role request overrides. Notices
+    // are stderr diagnostics — stdout may be machine-readable JSON.
+    let configured = crate::config::discover_configured_providers();
+    let wiring = resolve_engine_wiring(cfg, &model_ref, &configured);
     for notice in &wiring.notices {
         eprintln!("  ! {notice}");
     }
@@ -195,19 +196,18 @@ async fn run_pipeline_one_shot(
         let router = Router::new(wiring.pins.clone(), wiring.profiles.clone(), breaker);
 
         let is_text = format == OutputFormat::Text;
-        // Stdio approval requires a text-safe renderer plus two terminal
-        // handles: stdin must accept the decision and stdout must present the
-        // prompt. Redirected text is still rendered as text, but is headless
-        // and fails closed at scope review.
-        let approval_capability =
-            if is_text && std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
-                PipelineApprovalCapability::Stdio
-            } else {
-                PipelineApprovalCapability::Unavailable
-            };
-        let mut pipeline_config =
-            pipeline_config_for_approval_capability(cfg, approval_capability, test_command);
-        pipeline_config.role_overrides = wiring.role_overrides.clone();
+        let pipeline_config = PipelineConfig {
+            engine: pipeline_engine_config_for(cfg, &wiring.worker_model),
+            role_overrides: wiring.role_overrides.clone(),
+            headless: !is_text,
+            headless_bypass_scope_review: !is_text,
+            // `--test-command` arms the deterministic verify ladder: the
+            // fail→pass flip oracle and SubmitFast/Revise decisions all key
+            // off it. Left unset, every verification escalates to the model
+            // judge.
+            test_command: test_command.map(str::to_string),
+            ..Default::default()
+        };
 
         let stdio_gate = StdioApprovalGate;
         let no_recall = NoContextRecall;
