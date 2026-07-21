@@ -62,6 +62,33 @@ pub fn status_for(
     }
 }
 
+/// The [`ProviderConfig`] to resolve `id` against for display purposes: a
+/// built-in (with any settings.json override applied), a settings-defined
+/// custom provider, or — for an id that matches neither (e.g. a key stored
+/// via `stella auth set` ahead of the provider being declared in
+/// settings.json) — a minimal synthesized one using the same
+/// `<ID>_API_KEY` convention `config::custom_provider` falls back to.
+pub fn provider_config_for(id: &str, settings: &Settings) -> ProviderConfig {
+    if let Some(p) = config::PROVIDERS.iter().find(|p| p.id == id) {
+        return config::effective_builtin(p, settings);
+    }
+    if let Some(entry) = settings.providers.get(id)
+        && let Ok(p) = config::custom_provider(id, entry)
+    {
+        return p;
+    }
+    ProviderConfig {
+        id: Box::leak(id.to_string().into_boxed_str()),
+        env_var: Box::leak(config::derived_env_var(id).into_boxed_str()),
+        env_var_aliases: &[],
+        display_name: Box::leak(id.to_string().into_boxed_str()),
+        default_model: "",
+        base_url: "",
+        dialect: config::Dialect::OpenaiCompatible,
+        seeded: false,
+    }
+}
+
 /// A one-line summary of which project `.env*` files contributed which
 /// variable NAMES (never values) — the same information `STELLA_ENV_DEBUG`
 /// prints to stderr, but surfaced unconditionally in `stella config` rather
@@ -266,5 +293,22 @@ mod tests {
     #[test]
     fn env_files_summary_is_none_when_nothing_loaded() {
         assert!(env_files_summary(&Loaded::default()).is_none());
+    }
+
+    // ---- provider_config_for: unknown-id fallback for `stella auth list` ---
+
+    #[test]
+    fn provider_config_for_unknown_id_derives_the_conventional_env_var() {
+        let settings = Settings::default();
+        let p = provider_config_for("my-custom-gateway", &settings);
+        assert_eq!(p.id, "my-custom-gateway");
+        assert_eq!(p.env_var, "MY_CUSTOM_GATEWAY_API_KEY");
+    }
+
+    #[test]
+    fn provider_config_for_known_builtin_uses_its_real_env_var() {
+        let settings = Settings::default();
+        let p = provider_config_for("anthropic", &settings);
+        assert_eq!(p.env_var, "ANTHROPIC_API_KEY");
     }
 }
