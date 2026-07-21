@@ -201,16 +201,11 @@ async fn run_pipeline_one_shot(
         let router = Router::new(wiring.pins.clone(), wiring.profiles.clone(), breaker);
 
         let is_text = format == OutputFormat::Text;
-        // Stdio approval requires a text-safe renderer plus two terminal
-        // handles: stdin must accept the decision and stdout must present the
-        // prompt. Redirected text is still rendered as text, but is headless
-        // and fails closed at scope review.
-        let approval_capability =
-            if is_text && std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
-                PipelineApprovalCapability::Stdio
-            } else {
-                PipelineApprovalCapability::Unavailable
-            };
+        let approval_capability = approval_capability_for(
+            is_text,
+            std::io::stdin().is_terminal(),
+            std::io::stdout().is_terminal(),
+        );
         let mut pipeline_config = pipeline_config_for_approval_capability(
             cfg,
             approval_capability,
