@@ -918,6 +918,7 @@ impl ZaiProvider {
                 status,
                 retry_after_ms,
                 &body,
+                &self.model,
             ));
         }
 

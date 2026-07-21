@@ -559,6 +559,7 @@ impl Provider for OpenAiProvider {
                 status,
                 retry_after_ms,
                 &body,
+                &self.model,
             ));
         }
 
