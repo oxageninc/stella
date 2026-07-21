@@ -41,34 +41,68 @@ RED was established before implementation:
   worker is still resolved after paid witness authoring so settled cost is
   retained on routing failure.
 
+Review follow-up also used RED-first regressions:
+
+- Witness, worker, and revision hooks initially recorded the session workspace
+  as their process directory. They now all record the disposable candidate
+  root, while deliberately distinct session tools and status ports remain
+  untouched.
+- A candidate mutated after verification was initially adoptable. Final
+  verification now seals an immutable private commit; both the pre-adoption
+  drift check and adoption itself reject any live-tree divergence, and adoption
+  applies the exact baseline-to-seal bytes.
+- A post-baseline witness mutation initially reached a passing model judge. It
+  now hard-fails before judge evaluation and can never be overridden.
+- Symlink/hardlink witness regressions initially crossed the artifact boundary.
+  Witness identity now requires a regular, single-link file and fingerprints
+  bytes, type, mode, link count, and symlink target.
+- The real candidate status wrapper initially returned no artifact identity
+  even though its lower-level adapter supported one. A real Git-worktree RED
+  regression now proves candidate-local witness identities are forwarded and
+  match the candidate delta fingerprint.
+- `src/witness_backdoor.rs`, language-mismatched witnesses, absolute/parent
+  paths, runner retarget flags (including after `--`), quoted operators,
+  Unicode whitespace/lookalikes, environment prefixes, and path executables
+  were initially accepted by one or more permissive paths. The typed parser,
+  test-shape check, and invocation-to-language check now reject them.
+- The runner-locality test initially inherited Git repository pointer
+  variables. Child test processes now run with candidate `PWD`/cwd and all
+  Git repository pointer variables explicitly removed.
+- Raw diagnostic command strings initially exposed a shell-capable boundary.
+  A closed `DiagnosticInvocation` enum now maps only to direct fixed Git argv;
+  a metacharacter-bearing untracked path remains a literal argument.
+
 ## Implementation notes
 
 - `TestInvocation` and `TestRunner` form a typed, shell-free test boundary.
   The CLI adapter launches the known program with its explicit argv and a
-  workspace root. `ShellCommandRunner` remains separate for fixed diagnostic
-  diff probes.
+  candidate workspace root. Fixed Git diff probes use a separate closed
+  `DiagnosticInvocation` vocabulary and direct process execution.
 - Configured test commands are parsed before the first paid pipeline stage.
   Witness commands are parsed immediately after authoring or repair.
 - The accepted command vocabulary is intentionally narrow: Cargo test and
   nextest, common JavaScript package test runners, pytest, Go test, and .NET
   test.
-- Witness validation compares complete tracked and untracked before/after
-  maps and accepts exactly one newly created test-shaped artifact.
-- Both session and candidate repo-status adapters hash complete bytes. Tracked
-  deletions receive a sentinel so they remain visible.
+- Witness validation compares complete tracked and untracked before/after maps,
+  accepts exactly one newly created language-compatible test artifact, and
+  validates its filesystem identity through `symlink_metadata`.
+- Both session and candidate repo-status adapters hash complete bytes plus file
+  identity metadata. Tracked deletions receive a sentinel so they remain
+  visible.
 - Every authored witness gets a candidate-local authoring pass. Its baseline,
-  worker execution, revision loop, tamper checks, and final verification reuse
-  that candidate's tools, status ports, and typed test runner.
-- Adoption is gated on `verdict.passed`. Every other workspace is removed;
-  the existing recovery exception for a passing winner whose adoption itself
-  conflicts remains intact.
+  worker execution, revision loop, hooks, tamper checks, and final verification
+  reuse that candidate's cwd, tools, status ports, and typed test runner.
+- Adoption is gated on `verdict.passed`, an unchanged verified seal, and the
+  immutable sealed commit. Every other workspace is removed; the existing
+  recovery exception for a passing winner whose adoption itself conflicts
+  remains intact.
 - Task-specific production and test modules keep the existing pipeline files
   below their size ratchets.
 
 ## Verification
 
-- `cargo test -p stella-pipeline`: 123 unit tests and 4 replay tests passed.
-- `cargo test -p stella-cli`: 329 tests passed, including all 10 candidate
+- `cargo test -p stella-pipeline`: 129 unit tests and 4 replay tests passed.
+- `cargo test -p stella-cli`: 333 tests passed, including all 11 candidate
   workspace tests and the typed-runner/fingerprint regressions.
 - `cargo clippy --workspace --all-targets -- -D warnings`: passed.
 - `cargo fmt --all -- --check`: passed.
@@ -78,7 +112,7 @@ RED was established before implementation:
 ## Self-review
 
 - Searched all pipeline command execution sites and confirmed test observations
-  use `TestRunner`; only diagnostic diff commands retain the shell runner.
+  use `TestRunner`; fixed diagnostics use only the closed direct-Git runner.
 - Reviewed every candidate exit path. Isolation failures, witness failures,
   worker-routing failures, red verification, and non-winning candidates all
   clean up without adoption.
@@ -89,4 +123,8 @@ RED was established before implementation:
 
 ## Concerns
 
-No known correctness concerns remain in Task 5 scope. No push was performed.
+The invocation boundary prevents command retargeting and shell interpretation,
+but accepted test suites are repository code and are not an OS-level sandbox.
+They can still perform arbitrary actions available to the Stella process. A
+separate sandbox/container boundary would be required to constrain hostile test
+code itself. No push was performed.

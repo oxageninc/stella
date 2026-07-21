@@ -59,9 +59,9 @@ use crate::candidate::{
 };
 use crate::plan::{PlanStep, build_planner_prompt, parse_plan, plan_repair_prompt};
 use crate::ports::{
-    ApprovalGate, CandidateWorkspace, CandidateWorkspacePort, CommandRunner, ContextRecallPort,
-    ProviderResolver, RecalledFrame, RepoStatusPort, RepoStructurePort, ScopeDecision,
-    TestInvocation, TestRunner, WorkspaceError,
+    ApprovalGate, CandidateWorkspace, CandidateWorkspacePort, ContextRecallPort,
+    DiagnosticInvocation, DiagnosticRunner, ProviderResolver, RecalledFrame, RepoStatusPort,
+    RepoStructurePort, ScopeDecision, TestInvocation, TestRunner, WorkspaceError,
 };
 use crate::scope::{ScopeEstimate, apply_trim, build_proposal, needs_scope_review};
 use crate::triage::{TaskClass, classify_triage_response, resolve_task_class, triage_prompt};
@@ -72,7 +72,8 @@ use crate::verify::{
 };
 use crate::witness::{
     Witness, parse_test_invocation, parse_witness_command, tampered_paths,
-    validate_witness_artifact, witness_prompt, witness_repair_prompt,
+    validate_witness_artifact, validate_witness_identity, validate_witness_invocation,
+    witness_prompt, witness_repair_prompt,
 };
 mod run_error;
 mod stage_budget;
@@ -80,6 +81,7 @@ mod task5;
 use run_error::RoleResolveError;
 pub use run_error::{PipelineError, PipelineRunError};
 use stage_budget::{PipelineBudgetAbort, aborted_before_execute, budget_abort, record_and_tick};
+use task5::BoundHookRunner;
 /// Minimal fallback when the caller supplies no stable system prefix.
 const DEFAULT_SYSTEM_PROMPT: &str =
     "You are a precise, careful software engineering agent. Make the smallest correct change.";
@@ -107,8 +109,8 @@ pub struct PipelinePorts<'a> {
     /// Untracked-file snapshots for the zero-diff guard (`git diff` can't see
     /// untracked files; this makes new/modified untracked files visible).
     pub repo_status: &'a dyn RepoStatusPort,
-    /// Runs fixed diagnostic diff commands.
-    pub commands: &'a dyn CommandRunner,
+    /// Runs closed, typed diagnostic invocations.
+    pub diagnostics: &'a dyn DiagnosticRunner,
     /// Runs validated test invocations directly, without a shell.
     pub tests: &'a dyn TestRunner,
     /// The interactive scope-review gate (L-E5).
@@ -201,9 +203,9 @@ pub struct PipelineConfig {
     /// by `max_revisions` (at most `max_revisions - 1` guidance calls per
     /// candidate).
     pub distress_guidance: bool,
-    /// The command that reports what the turn changed (default `git diff`),
-    /// used for the diff-size budget and the zero-diff guard. `None` skips it.
-    pub diff_command: Option<String>,
+    /// The closed diagnostic that reports what the turn changed. `None`
+    /// disables diff-size and zero-diff inspection.
+    pub diff_diagnostic: Option<DiagnosticInvocation>,
     /// The diff-size budget in changed lines: a diff at or under this is
     /// "small enough" to trust deterministic evidence without a judge (L-E11).
     pub diff_budget_lines: u32,
@@ -230,7 +232,7 @@ impl Default for PipelineConfig {
             test_command: None,
             witness_writer: true,
             distress_guidance: true,
-            diff_command: Some("git diff".to_string()),
+            diff_diagnostic: Some(DiagnosticInvocation::GitDiff),
             diff_budget_lines: 400,
             max_revisions: 2,
             candidates: None,
@@ -393,9 +395,12 @@ impl CandidateState {
 /// so the candidate phases thread one value instead of two borrows.
 #[derive(Clone, Copy)]
 struct CandidateSurface<'c> {
-    commands: &'c dyn CommandRunner,
+    diagnostics: &'c dyn DiagnosticRunner,
     tests: &'c dyn TestRunner,
     repo_status: &'c dyn RepoStatusPort,
+    cwd: Option<&'c str>,
+    hook_runner: Option<&'c dyn HookRunner>,
+    workspace: Option<&'c dyn CandidateWorkspace>,
 }
 
 /// The staged orchestrator. Holds only borrowed ports + an owned event sender
@@ -408,7 +413,7 @@ pub struct Pipeline<'a> {
     recall: &'a dyn ContextRecallPort,
     repo: &'a dyn RepoStructurePort,
     repo_status: &'a dyn RepoStatusPort,
-    commands: &'a dyn CommandRunner,
+    diagnostics: &'a dyn DiagnosticRunner,
     tests: &'a dyn TestRunner,
     approvals: &'a dyn ApprovalGate,
     sleeper: &'a dyn Sleeper,
@@ -439,7 +444,7 @@ impl<'a> Pipeline<'a> {
             recall: ports.recall,
             repo: ports.repo,
             repo_status: ports.repo_status,
-            commands: ports.commands,
+            diagnostics: ports.diagnostics,
             tests: ports.tests,
             approvals: ports.approvals,
             sleeper: ports.sleeper,
@@ -861,9 +866,12 @@ impl<'a> Pipeline<'a> {
             engine = engine.with_steering(steering);
         }
         let surface = CandidateSurface {
-            commands: self.commands,
+            diagnostics: self.diagnostics,
             tests: self.tests,
             repo_status: self.repo_status,
+            cwd: None,
+            hook_runner: None,
+            workspace: None,
         };
         let mut results: Vec<CandidateResult> = Vec::with_capacity(n as usize);
         for _ in 0..n {
@@ -977,10 +985,19 @@ impl<'a> Pipeline<'a> {
                 }
             };
             let result = {
+                let bound_hook_runner = self.hooks.map(|(_, runner)| BoundHookRunner {
+                    inner: runner,
+                    cwd: ws.root(),
+                });
                 let surface = CandidateSurface {
-                    commands: ws.commands(),
+                    diagnostics: ws.diagnostics(),
                     tests: ws.tests(),
                     repo_status: ws.repo_status(),
+                    cwd: Some(ws.root()),
+                    hook_runner: bound_hook_runner
+                        .as_ref()
+                        .map(|runner| runner as &dyn HookRunner),
+                    workspace: Some(ws.as_ref()),
                 };
                 let witness = if author_witness {
                     match self
@@ -1021,11 +1038,11 @@ impl<'a> Pipeline<'a> {
                 let mut engine = Engine::with_sleeper(
                     worker.provider,
                     ws.tools(),
-                    self.config.engine.clone(),
+                    self.engine_config_for(surface),
                     self.sleeper,
                 );
                 if let Some((hooks, runner)) = self.hooks {
-                    engine = engine.with_hooks(hooks, runner);
+                    engine = engine.with_hooks(hooks, surface.hook_runner.unwrap_or(runner));
                 }
                 if let Some(steering) = self.steering {
                     engine = engine.with_steering(steering);
@@ -1250,16 +1267,20 @@ impl<'a> Pipeline<'a> {
         });
         let effective_cmd = self.effective_test_command(witness);
         loop {
+            if let Some(workspace) = surface.workspace
+                && let Err(error) = workspace.seal().await
+            {
+                return CandidateResult::aborted(
+                    state.messages,
+                    format!("candidate could not be sealed for verification: {error}"),
+                );
+            }
             let (touched_tests_passed, test_tail) = self
                 .observe_touched_tests(surface, effective_cmd, &mut state.oracle)
                 .await;
-            // Tamper exclusion: a flip is credited only while the witness
-            // artifact's complete content hash matches what the witness
-            // author wrote. A
-            // tampered witness degrades the flip to inconclusive — the judge
-            // then decides, told exactly which paths were touched — it never
-            // silently passes and never hard-fails work that may still be
-            // correct.
+            // Tamper exclusion is an authority boundary, not evidence for a
+            // model to weigh. Any post-baseline witness mutation hard-fails
+            // the candidate before a judge can override it.
             let tampered = match witness {
                 Some(w) if !w.files.is_empty() => {
                     let current = surface.repo_status.untracked_fingerprints().await;
@@ -1267,8 +1288,34 @@ impl<'a> Pipeline<'a> {
                 }
                 _ => Vec::new(),
             };
+            if !tampered.is_empty() {
+                return CandidateResult::aborted(
+                    state.messages,
+                    format!(
+                        "witness artifact changed after its accepted baseline: {}",
+                        tampered.join(", ")
+                    ),
+                );
+            }
+            if let Some(workspace) = surface.workspace {
+                match workspace.sealed_is_unchanged().await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return CandidateResult::aborted(
+                            state.messages,
+                            "candidate worktree changed after verification".to_string(),
+                        );
+                    }
+                    Err(error) => {
+                        return CandidateResult::aborted(
+                            state.messages,
+                            format!("could not validate the verified candidate seal: {error}"),
+                        );
+                    }
+                }
+            }
             let inputs = LadderInputs {
-                flip_achieved: state.oracle.is_flipped() && tampered.is_empty(),
+                flip_achieved: state.oracle.is_flipped(),
                 touched_tests_passed,
                 diff_lines: state.diff_lines,
                 diff_budget: self.config.diff_budget_lines,
@@ -1293,14 +1340,7 @@ impl<'a> Pipeline<'a> {
                 }
                 LadderDecision::Revise => {
                     // Deterministic failure (touched tests red) — no judge.
-                    let mut evidence = deterministic_fail_evidence(&test_tail);
-                    if !tampered.is_empty() {
-                        evidence.summary.push_str(&format!(
-                            "; witness test file(s) were modified after authoring — restore \
-                             them, the flip is not credited while they differ: {}",
-                            tampered.join(", ")
-                        ));
-                    }
+                    let evidence = deterministic_fail_evidence(&test_tail);
                     self.emit(AgentEvent::JudgeVerdict {
                         passed: false,
                         evidence: evidence.clone(),
@@ -1348,20 +1388,13 @@ impl<'a> Pipeline<'a> {
                 LadderDecision::ModelJudge => {
                     // Inconclusive — escalate to the model judge (judge ≠
                     // worker; a judge-call failure falls back to a heuristic).
-                    let mut evidence_summary = format!(
+                    let evidence_summary = format!(
                         "flip_achieved={}; touched_tests={:?}; diff_lines={} (budget {})",
                         inputs.flip_achieved,
                         inputs.touched_tests_passed,
                         state.diff_lines,
                         self.config.diff_budget_lines,
                     );
-                    if !tampered.is_empty() {
-                        evidence_summary.push_str(&format!(
-                            "; witness test file(s) modified by the worker after authoring — \
-                             flip evidence EXCLUDED: {}",
-                            tampered.join(", ")
-                        ));
-                    }
                     let verdict = match self
                         .judge(
                             goal,
@@ -1742,14 +1775,13 @@ impl<'a> Pipeline<'a> {
     /// unmeasurable in lines). Counting real lines — not a flat 1 per file —
     /// is what keeps a large untracked file from slipping under the diff budget
     /// and taking `SubmitFast`. A single file's numstat is one line, so this is
-    /// safe against the CommandRunner's output truncation.
+    /// safe against the diagnostic runner's output truncation.
     async fn untracked_added_lines(&self, surface: CandidateSurface<'_>, path: &str) -> u32 {
         let out = surface
-            .commands
-            .run(&format!(
-                "git diff --no-index --numstat -- /dev/null {}",
-                shell_single_quote(path)
-            ))
+            .diagnostics
+            .run_diagnostic(&DiagnosticInvocation::UntrackedNumstat {
+                path: path.to_string(),
+            })
             .await;
         out.stdout_tail
             .lines()
@@ -1775,13 +1807,13 @@ impl<'a> Pipeline<'a> {
         surface: CandidateSurface<'_>,
         untracked_before: &HashMap<String, String>,
     ) -> (u32, String) {
-        let Some(cmd) = &self.config.diff_command else {
+        let Some(diagnostic) = &self.config.diff_diagnostic else {
             return (0, String::new());
         };
-        let out = surface.commands.run(cmd).await;
+        let out = surface.diagnostics.run_diagnostic(diagnostic).await;
         let mut lines = count_diff_lines(&out.stdout_tail);
         let mut text = out.stdout_tail;
-        if cmd.trim_start().starts_with("git diff") {
+        if matches!(diagnostic, DiagnosticInvocation::GitDiff) {
             let after = surface.repo_status.untracked_fingerprints().await;
             // Created (absent before) OR modified (fingerprint changed) this
             // turn — never an untouched dirty file.
@@ -1923,13 +1955,6 @@ fn count_diff_lines(diff: &str) -> u32 {
                 || (l.starts_with('-') && !l.starts_with("---"))
         })
         .count() as u32
-}
-
-/// POSIX single-quote a shell argument so an untracked file path (which the
-/// user, not the pipeline, named) can never break out of the `git diff`
-/// command string. Embedded single quotes become the standard `'\''`.
-fn shell_single_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', r"'\''"))
 }
 
 #[cfg(test)]

@@ -17,11 +17,12 @@
 //! shared machine state other sessions rely on, so it is banned outright —
 //! no `git stash` appears anywhere in this module, and every command that
 //! runs against the real repo is read-only except the final winner-adoption
-//! `git apply` (worktree only, no `--index`). Adoption diffs the shadow's
-//! final state against its baseline commit and applies the result in one
-//! `git apply`, which verifies every preimage before writing anything — a
-//! file the user edited mid-run fails the whole adoption loudly, naming the
-//! paths, instead of half-applying.
+//! `git apply` (worktree only, no `--index`). Final verification first seals
+//! the shadow in a private commit. Adoption requires the shadow to remain
+//! byte-identical to that seal, diffs the immutable baseline against that
+//! exact verified commit, and applies the result in one `git apply`. The
+//! worker cannot race verification with adoption, and a file the user edited
+//! mid-run fails the whole adoption loudly instead of half-applying.
 //!
 //! # What a candidate's engine can reach
 //!
@@ -44,13 +45,14 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use std::sync::Arc;
 use stella_fleet::git::{GitCli, SystemGitCli};
 use stella_pipeline::ports::{
-    AdoptedChange, CandidateWorkspace, CandidateWorkspacePort, CommandRunner, RepoStatusPort,
+    AdoptedChange, CandidateWorkspace, CandidateWorkspacePort, DiagnosticRunner, RepoStatusPort,
     TestRunner, WorkspaceError,
 };
 use stella_protocol::FileChangeKind;
@@ -58,7 +60,9 @@ use stella_protocol::FileChangeKind;
 use stella_tools::custom::{CustomTool, CustomToolSet};
 use stella_tools::{RegistryOptions, ToolRegistry};
 
-use crate::agent::{GitRepoStatus, ShellCommandRunner, TypedTestRunner, fs_fingerprint};
+use crate::agent::{
+    GitDiagnosticRunner, GitRepoStatus, TypedTestRunner, fs_artifact_identity, fs_fingerprint,
+};
 
 /// The commit identity for snapshot plumbing commits (which exist only
 /// inside the shadow and are discarded with it) — the user's repo may have
@@ -265,7 +269,7 @@ impl GitCandidateWorkspaces {
 
         // From here on every failure must tear the shadow down.
         match populate_snapshot(&toplevel, &dir, &root_rel).await {
-            Ok(overlay_untracked) => {
+            Ok((overlay_untracked, baseline)) => {
                 let ws_root = dir.join(&root_rel);
                 let registry =
                     ToolRegistry::new_detected(ws_root.clone(), self.options.clone()).await;
@@ -285,8 +289,11 @@ impl GitCandidateWorkspaces {
                 Ok(GitCandidateWorkspace {
                     toplevel,
                     dir: dir.clone(),
+                    root: ws_root.display().to_string(),
+                    baseline,
+                    sealed: Mutex::new(None),
                     tools,
-                    commands: ShellCommandRunner {
+                    diagnostics: GitDiagnosticRunner {
                         root: ws_root.clone(),
                     },
                     tests: TypedTestRunner {
@@ -324,7 +331,7 @@ async fn populate_snapshot(
     toplevel: &Path,
     dir: &Path,
     root_rel: &Path,
-) -> Result<Vec<String>, String> {
+) -> Result<(Vec<String>, String), String> {
     // 1. The uncommitted tracked delta — staged and unstaged both (`git diff
     //    HEAD` sees the union), `--binary` so non-text files survive.
     let patch_file = std::env::temp_dir().join(format!(
@@ -400,7 +407,8 @@ async fn populate_snapshot(
         "stella: candidate baseline snapshot",
     ]);
     git(dir, &commit_args).await?;
-    Ok(overlay)
+    let baseline = git(dir, &["rev-parse", "HEAD"]).await?.trim().to_string();
+    Ok((overlay, baseline))
 }
 
 /// The snapshot's untracked view. Inside the shadow, files that were
@@ -438,6 +446,10 @@ impl RepoStatusPort for SnapshotRepoStatus {
     async fn tracked_fingerprints(&self) -> HashMap<String, String> {
         self.inner.tracked_fingerprints().await
     }
+
+    async fn artifact_identity(&self, path: &str) -> Option<stella_pipeline::ArtifactIdentity> {
+        fs_artifact_identity(&self.ws_root.join(path))
+    }
 }
 
 /// One live candidate shadow — see the module docs for the lifecycle.
@@ -446,10 +458,17 @@ pub(crate) struct GitCandidateWorkspace {
     toplevel: PathBuf,
     /// The shadow worktree directory.
     dir: PathBuf,
+    /// Workspace root under the shadow (the session root may be a subdir of
+    /// the repository toplevel).
+    root: String,
+    /// Immutable baseline commit representing the session tree at creation.
+    baseline: String,
+    /// Latest candidate commit whose exact bytes were verified.
+    sealed: Mutex<Option<String>>,
     /// The candidate's tool surface: snapshot-rooted registry + custom tools,
     /// owned so the boxed workspace can hand out `&dyn ToolExecutor`.
     tools: CustomToolSet<'static>,
-    commands: ShellCommandRunner,
+    diagnostics: GitDiagnosticRunner,
     tests: TypedTestRunner,
     repo_status: SnapshotRepoStatus,
 }
@@ -460,21 +479,12 @@ impl GitCandidateWorkspace {
         &self.dir
     }
 
-    /// Winner-only adoption: seal the shadow's final state as a commit, diff
-    /// baseline→final, and apply that patch to the REAL tree in one atomic
-    /// `git apply` — no `--index`, so the user's index is untouched and the
-    /// adopted files land exactly as uncommitted working-tree changes.
-    async fn adopt_inner(&self) -> Result<Vec<AdoptedChange>, WorkspaceError> {
-        let fail = |reason: String, paths: Vec<String>| WorkspaceError::Adopt {
+    async fn seal_inner(&self) -> Result<(), WorkspaceError> {
+        let fail = |reason: String| WorkspaceError::Seal {
             reason,
-            paths,
             workspace: self.dir.display().to_string(),
         };
-        // Blanket add: the same private-worktree justification as the
-        // baseline commit in `populate_snapshot`.
-        git(&self.dir, &["add", "-A"])
-            .await
-            .map_err(|e| fail(e, Vec::new()))?;
+        git(&self.dir, &["add", "-A"]).await.map_err(fail)?;
         let mut commit_args: Vec<&str> = SNAPSHOT_IDENT.to_vec();
         commit_args.extend([
             "commit",
@@ -483,14 +493,65 @@ impl GitCandidateWorkspace {
             "--no-gpg-sign",
             "-q",
             "-m",
-            "stella: candidate result",
+            "stella: candidate verified snapshot",
         ]);
-        git(&self.dir, &commit_args)
+        git(&self.dir, &commit_args).await.map_err(fail)?;
+        let sealed = git(&self.dir, &["rev-parse", "HEAD"])
             .await
-            .map_err(|e| fail(e, Vec::new()))?;
+            .map_err(fail)?
+            .trim()
+            .to_string();
+        *self.sealed.lock().unwrap() = Some(sealed);
+        Ok(())
+    }
 
-        // Baseline is the first parent of the sealed result commit — the
-        // shadow's history is exactly [baseline, result] by construction.
+    async fn sealed_unchanged_inner(&self) -> Result<bool, WorkspaceError> {
+        let fail = |reason: String| WorkspaceError::Seal {
+            reason,
+            workspace: self.dir.display().to_string(),
+        };
+        let sealed = self
+            .sealed
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| fail("candidate has no verified seal".to_string()))?;
+        let head = git(&self.dir, &["rev-parse", "HEAD"]).await.map_err(fail)?;
+        let status = git(
+            &self.dir,
+            &["status", "--porcelain", "--untracked-files=all"],
+        )
+        .await
+        .map_err(fail)?;
+        Ok(head.trim() == sealed && status.is_empty())
+    }
+
+    /// Winner-only adoption: diff the immutable baseline→verified seal and
+    /// apply that patch to the REAL tree in one atomic
+    /// `git apply` — no `--index`, so the user's index is untouched and the
+    /// adopted files land exactly as uncommitted working-tree changes.
+    async fn adopt_inner(&self) -> Result<Vec<AdoptedChange>, WorkspaceError> {
+        let fail = |reason: String, paths: Vec<String>| WorkspaceError::Adopt {
+            reason,
+            paths,
+            workspace: self.dir.display().to_string(),
+        };
+        let sealed = self
+            .sealed
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| fail("candidate has no verified seal".to_string(), Vec::new()))?;
+        if !self
+            .sealed_unchanged_inner()
+            .await
+            .map_err(|error| fail(error.to_string(), Vec::new()))?
+        {
+            return Err(fail(
+                "candidate worktree changed after verification".to_string(),
+                Vec::new(),
+            ));
+        }
         let names = git(
             &self.dir,
             &[
@@ -498,8 +559,8 @@ impl GitCandidateWorkspace {
                 "--name-status",
                 "--no-renames",
                 "-z",
-                "HEAD~1",
-                "HEAD",
+                &self.baseline,
+                &sealed,
             ],
         )
         .await
@@ -517,7 +578,7 @@ impl GitCandidateWorkspace {
         let all_paths = || changes.iter().map(|c| c.path.clone()).collect::<Vec<_>>();
         git_stdout_to_file(
             &self.dir,
-            &["diff", "--binary", "--no-renames", "HEAD~1", "HEAD"],
+            &["diff", "--binary", "--no-renames", &self.baseline, &sealed],
             &patch_file,
         )
         .await
@@ -551,12 +612,16 @@ impl GitCandidateWorkspace {
 
 #[async_trait]
 impl CandidateWorkspace for GitCandidateWorkspace {
+    fn root(&self) -> &str {
+        &self.root
+    }
+
     fn tools(&self) -> &dyn stella_core::ToolExecutor {
         &self.tools
     }
 
-    fn commands(&self) -> &dyn CommandRunner {
-        &self.commands
+    fn diagnostics(&self) -> &dyn DiagnosticRunner {
+        &self.diagnostics
     }
 
     fn tests(&self) -> &dyn TestRunner {
@@ -565,6 +630,14 @@ impl CandidateWorkspace for GitCandidateWorkspace {
 
     fn repo_status(&self) -> &dyn RepoStatusPort {
         &self.repo_status
+    }
+
+    async fn seal(&self) -> Result<(), WorkspaceError> {
+        self.seal_inner().await
+    }
+
+    async fn sealed_is_unchanged(&self) -> Result<bool, WorkspaceError> {
+        self.sealed_unchanged_inner().await
     }
 
     async fn adopt(&self) -> Result<Vec<AdoptedChange>, WorkspaceError> {
@@ -767,6 +840,26 @@ mod tests {
             "overlay fingerprints must match the real tree's"
         );
 
+        std::fs::create_dir_all(ws.dir().join("tests")).unwrap();
+        std::fs::write(
+            ws.dir().join("tests/witness.rs"),
+            "#[test] fn witness() {}\n",
+        )
+        .unwrap();
+        let witness_fingerprint = ws
+            .repo_status()
+            .untracked_fingerprints()
+            .await
+            .remove("tests/witness.rs")
+            .expect("new witness is visible in the candidate delta");
+        let identity = ws
+            .repo_status()
+            .artifact_identity("tests/witness.rs")
+            .await
+            .expect("candidate status exposes the no-follow artifact identity");
+        assert!(identity.is_regular_single_link());
+        assert_eq!(identity.fingerprint, witness_fingerprint);
+
         // The real tree, index, stash, and HEAD are untouched by creation.
         assert_eq!(tree_state(&root), before);
 
@@ -874,6 +967,7 @@ mod tests {
                 &serde_json::json!({"path": "protected/store.txt", "content": "no\n"}),
             )
             .await;
+        ws.seal().await.unwrap();
         let adopted = ws.adopt().await.unwrap();
         let landed = root.join("protected/store.txt").exists();
         ws.remove().await;
@@ -925,6 +1019,7 @@ mod tests {
                 &serde_json::json!({"path": "protected/ignored.txt", "content": "no\n"}),
             )
             .await;
+        ws.seal().await.unwrap();
         let adopted = ws.adopt().await.unwrap();
         let landed = root.join("protected/ignored.txt").exists();
         ws.remove().await;
@@ -962,6 +1057,7 @@ mod tests {
         std::fs::write(winner.dir().join("tracked.txt"), "base\ndirty\nwinner\n").unwrap();
         std::fs::write(winner.dir().join("winner.txt"), "new\n").unwrap();
         std::fs::remove_file(winner.dir().join("untracked.txt")).unwrap();
+        winner.seal().await.unwrap();
 
         let (_, before_cached, before_stash, before_head) = tree_state(&root);
         loser.remove().await;
@@ -998,6 +1094,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn post_verification_worktree_drift_is_rejected_and_never_adopted() {
+        let root = scaffold("sealed-drift");
+        let before = tree_state(&root);
+        let port = GitCandidateWorkspaces::new(
+            root.clone(),
+            RegistryOptions::default(),
+            Vec::new(),
+            crate::rules::ResolvedRules::default(),
+        );
+        let ws = port.create_workspace().await.unwrap();
+        std::fs::write(ws.dir().join("verified.txt"), "verified bytes\n").unwrap();
+
+        ws.seal()
+            .await
+            .expect("candidate state seals before verification");
+        assert!(ws.sealed_is_unchanged().await.unwrap());
+        std::fs::write(
+            ws.dir().join("verified.txt"),
+            "mutated after verification\n",
+        )
+        .unwrap();
+
+        let error = ws.adopt().await.expect_err("drift must reject adoption");
+        assert!(
+            error.to_string().contains("changed after verification"),
+            "{error}"
+        );
+        assert!(!root.join("verified.txt").exists());
+        assert_eq!(
+            tree_state(&root),
+            before,
+            "real tree remains byte-identical"
+        );
+
+        ws.remove().await;
+        assert_no_candidate_worktrees(&root);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
     async fn a_mid_run_user_edit_fails_adoption_atomically_naming_the_path() {
         let root = scaffold("conflict");
         let port = GitCandidateWorkspaces::new(
@@ -1010,6 +1146,7 @@ mod tests {
 
         std::fs::write(ws.dir().join("tracked.txt"), "base\ndirty\ncandidate\n").unwrap();
         std::fs::write(ws.dir().join("second.txt"), "must not land\n").unwrap();
+        ws.seal().await.unwrap();
         // The user edits the same file while the candidate runs.
         std::fs::write(root.join("tracked.txt"), "base\nuser-edit\n").unwrap();
 

@@ -6,7 +6,9 @@
 //! filesystem/VCS/command ports.
 
 use super::*;
-use stella_pipeline::{TestInvocation, TestRunner};
+use stella_pipeline::{
+    ArtifactKind, DiagnosticInvocation, DiagnosticRunner, TestInvocation, TestRunner,
+};
 
 /// Repo-structure summary via `git ls-files` for the planner's split context.
 pub(crate) struct GitRepoStructure {
@@ -33,7 +35,7 @@ impl RepoStructurePort for GitRepoStructure {
 }
 
 /// Untracked-file fingerprints for the pipeline's zero-diff guard. Unlike the
-/// pipeline's `CommandRunner` (whose output is truncated), this captures the
+/// pipeline's diagnostic runner (whose output is truncated), this captures the
 /// COMPLETE `git ls-files --others` listing and fingerprints each file itself
 /// (in-process, with real filesystem access), so a large untracked set is not
 /// silently clipped and a modification to an already-untracked file is
@@ -115,6 +117,10 @@ impl RepoStatusPort for GitRepoStatus {
         }
         out
     }
+
+    async fn artifact_identity(&self, path: &str) -> Option<stella_pipeline::ArtifactIdentity> {
+        fs_artifact_identity(&self.root.join(path))
+    }
 }
 
 /// The pipeline's file fingerprint: SHA-256 over the complete bytes. Content
@@ -122,16 +128,59 @@ impl RepoStatusPort for GitRepoStatus {
 /// restored after a same-length edit and would incorrectly credit a tampered
 /// witness. One definition is shared with candidate snapshots.
 pub(crate) fn fs_fingerprint(path: &std::path::Path) -> Option<String> {
+    fs_artifact_identity(path).map(|identity| identity.fingerprint)
+}
+
+pub(crate) fn fs_artifact_identity(
+    path: &std::path::Path,
+) -> Option<stella_pipeline::ArtifactIdentity> {
     use std::fmt::Write as _;
 
     use sha2::{Digest, Sha256};
 
-    let bytes = std::fs::read(path).ok()?;
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    let kind = if metadata.file_type().is_file() {
+        ArtifactKind::Regular
+    } else if metadata.file_type().is_symlink() {
+        ArtifactKind::Symlink
+    } else {
+        ArtifactKind::Other
+    };
+    #[cfg(unix)]
+    let (mode, link_count) = {
+        use std::os::unix::fs::MetadataExt;
+        (metadata.mode(), metadata.nlink())
+    };
+    #[cfg(not(unix))]
+    let (mode, link_count) = (u32::from(metadata.permissions().readonly()), 1);
+    let payload = match kind {
+        ArtifactKind::Regular => std::fs::read(path).ok()?,
+        ArtifactKind::Symlink => std::fs::read_link(path)
+            .ok()?
+            .to_string_lossy()
+            .as_bytes()
+            .to_vec(),
+        ArtifactKind::Other => Vec::new(),
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(match kind {
+        ArtifactKind::Regular => b"regular".as_slice(),
+        ArtifactKind::Symlink => b"symlink".as_slice(),
+        ArtifactKind::Other => b"other".as_slice(),
+    });
+    hasher.update(mode.to_le_bytes());
+    hasher.update(link_count.to_le_bytes());
+    hasher.update(payload);
     let mut fingerprint = String::from("sha256:");
-    for byte in Sha256::digest(bytes) {
+    for byte in hasher.finalize() {
         write!(&mut fingerprint, "{byte:02x}").ok()?;
     }
-    Some(fingerprint)
+    Some(stella_pipeline::ArtifactIdentity {
+        fingerprint,
+        kind,
+        mode,
+        link_count,
+    })
 }
 
 /// The workspace-rooted pipeline ports every session driver constructs the
@@ -142,7 +191,7 @@ pub(crate) fn fs_fingerprint(path: &std::path::Path) -> Option<String> {
 pub(crate) struct WorkspacePorts {
     pub(crate) repo_structure: GitRepoStructure,
     pub(crate) repo_status: GitRepoStatus,
-    pub(crate) command_runner: ShellCommandRunner,
+    pub(crate) diagnostic_runner: GitDiagnosticRunner,
     pub(crate) test_runner: TypedTestRunner,
     /// Used for best-of-N and for candidate-local authored witnesses at N=1.
     pub(crate) candidate_workspaces: crate::candidate_ws::GitCandidateWorkspaces,
@@ -169,7 +218,7 @@ pub(crate) fn workspace_ports(
     WorkspacePorts {
         repo_structure: GitRepoStructure { root: root.clone() },
         repo_status: GitRepoStatus { root: root.clone() },
-        command_runner: ShellCommandRunner { root: root.clone() },
+        diagnostic_runner: GitDiagnosticRunner { root: root.clone() },
         test_runner: TypedTestRunner { root: root.clone() },
         candidate_workspaces: crate::candidate_ws::GitCandidateWorkspaces::new(
             root,
@@ -180,14 +229,14 @@ pub(crate) fn workspace_ports(
     }
 }
 
-/// Runs fixed shell diagnostics for diff gathering. Test commands use the
-/// separate typed runner below and never cross this shell boundary.
-pub(crate) struct ShellCommandRunner {
+/// Workspace-rooted closed Git diagnostics. Every variant maps to fixed argv;
+/// paths remain literal arguments and no shell is involved.
+pub(crate) struct GitDiagnosticRunner {
     pub(crate) root: std::path::PathBuf,
 }
 
-/// Workspace-rooted typed test runner. Unlike [`ShellCommandRunner`], it
-/// passes an enumerable argv directly to the OS and never invokes a shell.
+/// Workspace-rooted typed test runner. It passes an enumerable argv directly
+/// to the OS and never invokes a shell.
 pub(crate) struct TypedTestRunner {
     pub(crate) root: std::path::PathBuf,
 }
@@ -195,18 +244,37 @@ pub(crate) struct TypedTestRunner {
 #[async_trait::async_trait]
 impl TestRunner for TypedTestRunner {
     async fn run_test(&self, invocation: &TestInvocation) -> CmdOutcome {
-        let mut cmd = tokio::process::Command::new(&invocation.program);
-        cmd.args(&invocation.args).current_dir(&self.root);
-        run_command(cmd).await
+        run_command(test_process(invocation, &self.root)).await
     }
 }
 
+fn test_process(invocation: &TestInvocation, root: &std::path::Path) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new(&invocation.program);
+    cmd.args(&invocation.args)
+        .current_dir(root)
+        .env("PWD", root);
+    for var in stella_tools::exec::GIT_REPO_ENV_VARS {
+        cmd.env_remove(var);
+    }
+    cmd
+}
+
 #[async_trait::async_trait]
-impl CommandRunner for ShellCommandRunner {
-    async fn run(&self, command: &str) -> CmdOutcome {
-        let mut cmd = tokio::process::Command::new("bash");
-        cmd.arg("-c").arg(command);
-        cmd.current_dir(&self.root);
+impl DiagnosticRunner for GitDiagnosticRunner {
+    async fn run_diagnostic(&self, invocation: &DiagnosticInvocation) -> CmdOutcome {
+        let mut cmd = tokio::process::Command::new("git");
+        match invocation {
+            DiagnosticInvocation::GitDiff => {
+                cmd.args(["diff"]);
+            }
+            DiagnosticInvocation::UntrackedNumstat { path } => {
+                cmd.args(["diff", "--no-index", "--numstat", "--", "/dev/null", path]);
+            }
+        }
+        cmd.current_dir(&self.root).env("PWD", &self.root);
+        for var in stella_tools::exec::GIT_REPO_ENV_VARS {
+            cmd.env_remove(var);
+        }
         run_command(cmd).await
     }
 }
@@ -371,6 +439,40 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn witness_identity_rejects_symlinks_hardlinks_and_hashes_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("witness.rs");
+        let hardlink = dir.path().join("hardlink.rs");
+        let symlink = dir.path().join("symlink.rs");
+        std::fs::write(&file, "test bytes\n").unwrap();
+
+        let before = fs_artifact_identity(&file).unwrap();
+        assert_eq!(before.kind, ArtifactKind::Regular);
+        assert!(before.is_regular_single_link());
+
+        std::fs::hard_link(&file, &hardlink).unwrap();
+        let linked = fs_artifact_identity(&file).unwrap();
+        assert!(!linked.is_regular_single_link());
+        assert_eq!(linked.link_count, 2);
+
+        std::os::unix::fs::symlink(&file, &symlink).unwrap();
+        let symlinked = fs_artifact_identity(&symlink).unwrap();
+        assert_eq!(symlinked.kind, ArtifactKind::Symlink);
+        assert!(!symlinked.is_regular_single_link());
+        assert_ne!(symlinked.fingerprint, linked.fingerprint);
+
+        std::fs::remove_file(&hardlink).unwrap();
+        let mut permissions = std::fs::metadata(&file).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&file, permissions).unwrap();
+        let executable = fs_artifact_identity(&file).unwrap();
+        assert_ne!(before.fingerprint, executable.fingerprint);
+    }
+
     #[tokio::test]
     async fn repo_status_hashes_tracked_working_tree_mutations() {
         let dir = tempfile::tempdir().unwrap();
@@ -431,6 +533,52 @@ mod tests {
             !target.exists(),
             "argv content must never become shell syntax"
         );
+    }
+
+    #[tokio::test]
+    async fn typed_test_runner_binds_candidate_pwd_and_scrubs_git_repo_pointers() {
+        let dir = tempfile::tempdir().unwrap();
+        let invocation = TestInvocation {
+            program: "sh".into(),
+            args: vec!["-c".into(), "printf '%s' \"$PWD\"".into()],
+        };
+        let command = test_process(&invocation, dir.path());
+        let configured_env: std::collections::HashMap<_, _> = command.as_std().get_envs().collect();
+        for var in stella_tools::exec::GIT_REPO_ENV_VARS {
+            assert_eq!(configured_env.get(std::ffi::OsStr::new(var)), Some(&None));
+        }
+        let runner = TypedTestRunner {
+            root: dir.path().to_path_buf(),
+        };
+        let outcome = runner.run_test(&invocation).await;
+
+        assert!(outcome.passed(), "{}", outcome.stderr_tail);
+        let expected = dir.path().canonicalize().unwrap();
+        assert_eq!(
+            std::path::Path::new(&outcome.stdout_tail)
+                .canonicalize()
+                .unwrap(),
+            expected
+        );
+    }
+
+    #[tokio::test]
+    async fn diagnostic_runner_passes_untracked_paths_as_literal_git_argv() {
+        let dir = tempfile::tempdir().unwrap();
+        let odd = "odd;touch owned.txt";
+        std::fs::write(dir.path().join(odd), "one\ntwo\n").unwrap();
+        let runner = GitDiagnosticRunner {
+            root: dir.path().to_path_buf(),
+        };
+
+        let outcome = runner
+            .run_diagnostic(&DiagnosticInvocation::UntrackedNumstat {
+                path: odd.to_string(),
+            })
+            .await;
+
+        assert!(outcome.stdout_tail.contains(odd), "{}", outcome.stdout_tail);
+        assert!(!dir.path().join("owned.txt").exists());
     }
 
     struct FixedOperationId(&'static str);

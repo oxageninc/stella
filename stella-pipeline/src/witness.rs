@@ -12,14 +12,12 @@
 //! The witness is deliberately **visible to the worker**: iterating against a
 //! failing test is where convergence comes from, and a test file on disk is
 //! discoverable by any worker with a shell anyway. Integrity comes instead
-//! from *tamper exclusion* — complete content hashes of the one test artifact
-//! the witness turn created are snapshotted, and a
-//! flip is only credited if those fingerprints are unchanged at verify
-//! time ([`tampered_paths`]). A worker that edits or
-//! deletes the witness loses the deterministic flip credit and the evidence
-//! reaching the judge names the tampered paths. This mirrors how SWE-bench
-//! itself scores (the scored test patch is applied outside the worker's
-//! diff), at a fraction of the machinery of actually hiding a file.
+//! from *tamper exclusion* — the complete filesystem identity of the one test
+//! artifact the witness turn created is snapshotted. A flip is only credited
+//! when its bytes, type, mode, link count, and path remain unchanged at verify
+//! time ([`tampered_paths`]). A worker that edits, replaces, links, renames, or
+//! deletes the witness hard-fails the candidate; a model judge cannot override
+//! that authority violation.
 //!
 //! # The pure/orchestration split
 //!
@@ -30,7 +28,7 @@
 
 use std::collections::HashMap;
 
-use crate::ports::{RecalledFrame, TestInvocation};
+use crate::ports::{ArtifactIdentity, RecalledFrame, TestInvocation};
 
 /// The marker line the witness author must end its reply with. Scanned
 /// case-insensitively by [`parse_witness_command`]; the LAST occurrence wins
@@ -61,6 +59,13 @@ pub enum WitnessArtifactError {
     /// The untracked delta was not exactly one newly created test artifact.
     #[error("witness author must create exactly one new test file; changed: {}", .0.join(", "))]
     InvalidArtifact(Vec<String>),
+    /// The test file's language does not match the selected typed runner.
+    #[error("witness artifact `{path}` does not match test runner `{program}`")]
+    InvocationMismatch { path: String, program: String },
+    /// The path was not a regular, single-link file matching the fingerprint
+    /// captured in the repo-status delta.
+    #[error("witness artifact `{0}` has an unsafe or unstable filesystem identity")]
+    InvalidIdentity(String),
 }
 
 /// Parse a deliberately small test-command vocabulary into an enumerable
@@ -99,6 +104,7 @@ pub fn parse_test_invocation(command: &str) -> Result<TestInvocation, TestInvoca
     if !allowed {
         return Err(TestInvocationError::Unsupported(command.to_string()));
     }
+    validate_local_args(program, args)?;
     Ok(TestInvocation {
         program: program.clone(),
         args: args.to_vec(),
@@ -106,7 +112,26 @@ pub fn parse_test_invocation(command: &str) -> Result<TestInvocation, TestInvoca
 }
 
 fn split_test_words(command: &str) -> Result<Vec<String>, TestInvocationError> {
-    if command.contains("$(") || command.contains('`') || command.contains('\n') {
+    if command.contains("$(")
+        || command.contains('`')
+        || command.chars().any(|ch| {
+            matches!(
+                ch,
+                '&' | '|'
+                    | ';'
+                    | '<'
+                    | '>'
+                    | '\n'
+                    | '\r'
+                    | '\u{ff06}'
+                    | '\u{ff5c}'
+                    | '\u{ff1b}'
+                    | '\u{ff1c}'
+                    | '\u{ff1e}'
+            ) || (ch.is_whitespace() && !matches!(ch, ' ' | '\t'))
+                || ch.is_control()
+        })
+    {
         return Err(TestInvocationError::ShellSyntax);
     }
     let mut words = Vec::new();
@@ -156,6 +181,41 @@ fn split_test_words(command: &str) -> Result<Vec<String>, TestInvocationError> {
     Ok(words)
 }
 
+fn validate_local_args(program: &str, args: &[String]) -> Result<(), TestInvocationError> {
+    let forbidden_flags: &[&str] = match program {
+        "cargo" => &["--manifest-path", "--config", "-C", "--target-dir"],
+        "pnpm" | "npm" | "yarn" | "bun" => &[
+            "--prefix",
+            "--dir",
+            "--cwd",
+            "-C",
+            "--userconfig",
+            "--globalconfig",
+            "--script-shell",
+        ],
+        "pytest" | "python" | "python3" => &["--rootdir", "--confcutdir", "-c", "--basetemp"],
+        "go" => &["-C", "-exec", "-toolexec", "-overlay", "-modfile"],
+        "dotnet" => &["--test-adapter-path", "--settings"],
+        _ => &[],
+    };
+    for arg in args {
+        let normalized = arg.replace('\\', "/");
+        let windows_absolute = normalized.as_bytes().get(1) == Some(&b':')
+            && normalized.as_bytes().get(2) == Some(&b'/');
+        if std::path::Path::new(arg).is_absolute()
+            || windows_absolute
+            || normalized.split('/').any(|component| component == "..")
+        {
+            return Err(TestInvocationError::ShellSyntax);
+        }
+        let flag = arg.split_once('=').map_or(arg.as_str(), |(flag, _)| flag);
+        if forbidden_flags.contains(&flag) {
+            return Err(TestInvocationError::ShellSyntax);
+        }
+    }
+    Ok(())
+}
+
 /// Validate the witness author's complete working-tree delta and return the
 /// content-hash baseline for the one accepted test artifact.
 pub fn validate_witness_artifact(
@@ -185,6 +245,57 @@ pub fn validate_witness_artifact(
     )]))
 }
 
+/// Require the accepted test file's language to match the typed runner that
+/// will execute it. This prevents an unrelated executable artifact from
+/// riding beside a harmless test command.
+pub fn validate_witness_invocation(
+    path: &str,
+    invocation: &TestInvocation,
+) -> Result<(), WitnessArtifactError> {
+    let extension = path
+        .rsplit_once('.')
+        .map(|(_, extension)| extension.to_ascii_lowercase())
+        .unwrap_or_default();
+    let matches = match invocation.program.as_str() {
+        "cargo" => extension == "rs",
+        "pytest" | "python" | "python3" => extension == "py",
+        "pnpm" | "npm" | "yarn" | "bun" => {
+            matches!(
+                extension.as_str(),
+                "js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs"
+            )
+        }
+        "go" => extension == "go",
+        "dotnet" => extension == "cs",
+        _ => false,
+    };
+    if matches {
+        Ok(())
+    } else {
+        Err(WitnessArtifactError::InvocationMismatch {
+            path: path.to_string(),
+            program: invocation.program.clone(),
+        })
+    }
+}
+
+/// Pin the accepted delta entry to a no-follow filesystem identity.
+pub fn validate_witness_identity(
+    path: &str,
+    expected_fingerprint: &str,
+    identity: Option<&ArtifactIdentity>,
+) -> Result<(), WitnessArtifactError> {
+    match identity {
+        Some(identity)
+            if identity.is_regular_single_link()
+                && identity.fingerprint == expected_fingerprint =>
+        {
+            Ok(())
+        }
+        _ => Err(WitnessArtifactError::InvalidIdentity(path.to_string())),
+    }
+}
+
 fn changed_paths(before: &HashMap<String, String>, after: &HashMap<String, String>) -> Vec<String> {
     let mut paths: Vec<String> = before
         .keys()
@@ -200,19 +311,25 @@ fn changed_paths(before: &HashMap<String, String>, after: &HashMap<String, Strin
 fn is_test_path(path: &str) -> bool {
     let normalized = path.replace('\\', "/").to_ascii_lowercase();
     let name = normalized.rsplit('/').next().unwrap_or(&normalized);
-    normalized
+    let recognized_dir = normalized
         .split('/')
-        .any(|part| matches!(part, "test" | "tests" | "__tests__" | "spec" | "specs"))
-        || name.starts_with("test_")
-        || name.contains("_test.")
-        || name.contains(".test.")
-        || name.contains(".spec.")
-        || name.contains("witness")
+        .any(|part| matches!(part, "test" | "tests" | "__tests__" | "spec" | "specs"));
+    let extension = name.rsplit_once('.').map(|(_, ext)| ext).unwrap_or("");
+    match extension {
+        "rs" => recognized_dir || name.contains("_test."),
+        "py" => recognized_dir || name.starts_with("test_") || name.contains("_test."),
+        "js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs" => {
+            recognized_dir || name.contains(".test.") || name.contains(".spec.")
+        }
+        "go" => recognized_dir || name.ends_with("_test.go"),
+        "cs" => recognized_dir || name.ends_with("tests.cs"),
+        _ => false,
+    }
 }
 
-/// A validated witness: the flip-oracle command plus the fingerprint
-/// hash of the one new test artifact the witness turn created (the tamper
-/// baseline for [`tampered_paths`]).
+/// A validated witness: the flip-oracle command plus the filesystem-identity
+/// fingerprint of the one new test artifact the witness turn created (the
+/// tamper baseline for [`tampered_paths`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Witness {
     /// The user-facing command the flip oracle names in evidence.
@@ -267,7 +384,7 @@ pub fn witness_prompt(goal: &str, recall: &[RecalledFrame], repo_structure: &str
 /// The one bounded repair retry (the L-V2 pattern): the authored test passed
 /// on the *unmodified* code, so it witnesses nothing. Sent into the same
 /// witness thread; a second failure to produce a failing test discards the
-/// witness (the pipeline degrades to judge-based verification, never loops).
+/// witness (the pipeline continues without a witness, never loops).
 pub fn witness_repair_prompt(command: &str) -> String {
     format!(
         "Your witness test PASSED on the current, unmodified code — it proves nothing, \
@@ -281,7 +398,7 @@ pub fn witness_repair_prompt(command: &str) -> String {
 /// Extract the witness command from the author's reply: the LAST
 /// `TEST_COMMAND:` line (case-insensitive), stripped of surrounding
 /// whitespace and backticks. `None` when no non-empty command is found — the
-/// caller treats that like a failed witness stage (degrade, never guess).
+/// caller treats that like a failed witness stage (continue without it, never guess).
 pub fn parse_witness_command(text: &str) -> Option<String> {
     let mut found: Option<String> = None;
     for line in text.lines() {
@@ -321,8 +438,8 @@ pub fn witness_watchlist(
 /// Tamper check: which watchlisted witness files are no longer byte-identical
 /// (fingerprint changed) or gone (deleted / moved out of the untracked set)
 /// at verify time. Non-empty means the deterministic flip must NOT be
-/// credited — the evidence degrades to inconclusive and the judge is told
-/// which paths were touched. Sorted for deterministic evidence text.
+/// credited — the candidate hard-fails before judge evaluation. Sorted for
+/// deterministic error text.
 pub fn tampered_paths(
     watchlist: &HashMap<String, String>,
     current: &HashMap<String, String>,
@@ -395,6 +512,9 @@ mod tests {
             "cargo test -p x < input",
             "cargo test -p $(touch owned)",
             "cargo test -p `touch owned`",
+            "cargo test 'quoted;operator'",
+            "cargo\u{00a0}test",
+            "cargo test filter\u{ff1b}touch",
         ] {
             assert!(
                 parse_test_invocation(command).is_err(),
@@ -422,6 +542,30 @@ mod tests {
         assert!(parse_test_invocation("sh -c 'cargo test'").is_err());
         assert!(parse_test_invocation("python helper.py").is_err());
         assert!(parse_test_invocation("cargo build").is_err());
+    }
+
+    #[test]
+    fn test_invocation_cannot_escape_or_retarget_the_candidate() {
+        for command in [
+            "env RUSTFLAGS=-Dwarnings cargo test",
+            "/usr/bin/cargo test",
+            "cargo test /tmp/outside.rs",
+            "cargo test ../outside",
+            "cargo test --manifest-path ../outside/Cargo.toml",
+            "cargo test --config=../outside.toml",
+            "cargo test -- --manifest-path ../outside/Cargo.toml",
+            "pnpm test --dir ../outside",
+            "npm test --prefix=/tmp/outside",
+            "go test -exec /tmp/executor",
+            "go test -- -exec ../executor",
+            "pytest --rootdir ../outside",
+            "dotnet test --test-adapter-path ../outside",
+        ] {
+            assert!(
+                parse_test_invocation(command).is_err(),
+                "candidate escape must be rejected: {command}"
+            );
+        }
     }
 
     // ---- witness_watchlist ------------------------------------------------
@@ -454,6 +598,18 @@ mod tests {
             accepted,
             fps(&[("tests/authority_witness.rs", "sha256:whole-file")])
         );
+    }
+
+    #[test]
+    fn witness_artifact_language_matches_the_typed_runner() {
+        let cargo = parse_test_invocation("cargo test authority_witness").unwrap();
+        let pytest = parse_test_invocation("pytest tests/test_authority.py").unwrap();
+        let npm = parse_test_invocation("npm test").unwrap();
+        assert!(validate_witness_invocation("tests/authority_witness.rs", &cargo).is_ok());
+        assert!(validate_witness_invocation("tests/test_authority.py", &pytest).is_ok());
+        assert!(validate_witness_invocation("src/authority.test.ts", &npm).is_ok());
+        assert!(validate_witness_invocation("tests/test_authority.py", &cargo).is_err());
+        assert!(validate_witness_invocation("tests/authority_witness.rs", &pytest).is_err());
     }
 
     #[test]
@@ -491,6 +647,27 @@ mod tests {
         )
         .unwrap_err();
         assert!(existing.to_string().contains("new test file"));
+
+        let backdoor = validate_witness_artifact(
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &fps(&[("src/witness_backdoor.rs", "payload")]),
+        );
+        assert!(
+            backdoor.is_err(),
+            "production files named witness are not tests"
+        );
+        let rust_prefix_backdoor = validate_witness_artifact(
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &fps(&[("src/test_backdoor.rs", "payload")]),
+        );
+        assert!(
+            rust_prefix_backdoor.is_err(),
+            "Rust test prefixes outside a recognized test directory are not integration tests"
+        );
     }
 
     // ---- tampered_paths ----------------------------------------------------

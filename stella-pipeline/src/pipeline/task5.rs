@@ -2,7 +2,34 @@
 
 use super::*;
 
+/// Candidate-bound hook execution: both the hook process and the engine's
+/// payload use the isolated root, never the session root.
+pub(super) struct BoundHookRunner<'a> {
+    pub(super) inner: &'a dyn HookRunner,
+    pub(super) cwd: &'a str,
+}
+
+#[async_trait::async_trait]
+impl HookRunner for BoundHookRunner<'_> {
+    async fn run(
+        &self,
+        action: &stella_core::hooks::HookAction,
+        payload_json: &str,
+        _cwd: &str,
+    ) -> Result<stella_core::hooks::HookExecResult, stella_core::hooks::HookExecError> {
+        self.inner.run(action, payload_json, self.cwd).await
+    }
+}
+
 impl<'a> Pipeline<'a> {
+    pub(super) fn engine_config_for(&self, surface: CandidateSurface<'_>) -> EngineConfig {
+        let mut config = self.config.engine.clone();
+        if let Some(cwd) = surface.cwd {
+            config.cwd = cwd.to_string();
+        }
+        config
+    }
+
     /// Author one failing witness inside the same disposable candidate that
     /// will execute, revise, verify, and (only on pass) adopt it.
     pub(super) async fn witness_stage(
@@ -34,11 +61,11 @@ impl<'a> Pipeline<'a> {
         let mut engine = Engine::with_sleeper(
             resolved.provider,
             tools,
-            self.config.engine.clone(),
+            self.engine_config_for(surface),
             self.sleeper,
         );
         if let Some((hooks, runner)) = self.hooks {
-            engine = engine.with_hooks(hooks, runner);
+            engine = engine.with_hooks(hooks, surface.hook_runner.unwrap_or(runner));
         }
 
         let mut messages = vec![
@@ -112,6 +139,14 @@ impl<'a> Pipeline<'a> {
             &untracked_after,
         )
         .map_err(|error| error.to_string())?;
+        let path = files
+            .keys()
+            .next()
+            .expect("validated witness artifact contains exactly one path");
+        validate_witness_invocation(path, &invocation).map_err(|error| error.to_string())?;
+        let identity = surface.repo_status.artifact_identity(path).await;
+        validate_witness_identity(path, &files[path], identity.as_ref())
+            .map_err(|error| error.to_string())?;
         Ok(Some(Witness {
             command,
             invocation,

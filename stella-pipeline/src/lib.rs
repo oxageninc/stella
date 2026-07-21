@@ -43,7 +43,7 @@
 //!
 //! The pipeline does no I/O itself; it orchestrates over the traits in
 //! [`ports`]: [`ProviderResolver`], [`ContextRecallPort`], [`RepoStructurePort`],
-//! [`TestRunner`], [`CommandRunner`], [`ApprovalGate`], and [`CandidateWorkspacePort`]
+//! [`TestRunner`], [`DiagnosticRunner`], [`ApprovalGate`], and [`CandidateWorkspacePort`]
 //! (best-of-N candidate isolation) — plus `stella-core`'s `Router`,
 //! `ToolExecutor`, and `Sleeper`. The `stella-cli` glue supplies the real
 //! implementations; every one has a no-op/default here so the pipeline runs
@@ -52,7 +52,7 @@
 //! [`ProviderResolver`]: ports::ProviderResolver
 //! [`ContextRecallPort`]: ports::ContextRecallPort
 //! [`RepoStructurePort`]: ports::RepoStructurePort
-//! [`CommandRunner`]: ports::CommandRunner
+//! [`DiagnosticRunner`]: ports::DiagnosticRunner
 //! [`TestRunner`]: ports::TestRunner
 //! [`ApprovalGate`]: ports::ApprovalGate
 //! [`CandidateWorkspacePort`]: ports::CandidateWorkspacePort
@@ -72,15 +72,16 @@ pub use pipeline::{
     PipelineRunError, PipelineStatus, RoleCallOverrides, Verdict,
 };
 pub use ports::{
-    AdoptedChange, AlwaysAbortGate, ApprovalGate, AutoApproveGate, CandidateWorkspace,
-    CandidateWorkspacePort, CmdOutcome, CommandRunner, ContextRecallPort, NoContextRecall,
-    NoRepoStatus, NoRepoStructure, ProviderResolver, RecalledFrame, RepoStatusPort,
-    RepoStructurePort, ScopeDecision, StdioApprovalGate, TestInvocation, TestRunner,
-    WorkspaceError,
+    AdoptedChange, AlwaysAbortGate, ApprovalGate, ArtifactIdentity, ArtifactKind, AutoApproveGate,
+    CandidateWorkspace, CandidateWorkspacePort, CmdOutcome, ContextRecallPort,
+    DiagnosticInvocation, DiagnosticRunner, NoContextRecall, NoRepoStatus, NoRepoStructure,
+    ProviderResolver, RecalledFrame, RepoStatusPort, RepoStructurePort, ScopeDecision,
+    StdioApprovalGate, TestInvocation, TestRunner, WorkspaceError,
 };
 pub use triage::TaskClass;
 pub use verify::{FlipOracle, FlipState, LadderDecision, LadderInputs};
 pub use witness::{
     TestInvocationError, Witness, WitnessArtifactError, parse_test_invocation,
-    parse_witness_command, tampered_paths, validate_witness_artifact, witness_watchlist,
+    parse_witness_command, tampered_paths, validate_witness_artifact, validate_witness_identity,
+    validate_witness_invocation, witness_watchlist,
 };

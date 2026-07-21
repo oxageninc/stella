@@ -25,9 +25,9 @@ use stella_mcp::{McpConfig, McpServerConfig, McpToolSet};
 use stella_model::credential::ApiKey;
 use stella_model::provider::Provider;
 use stella_pipeline::{
-    AlwaysAbortGate, CmdOutcome, CommandRunner, ContextRecallPort, NoContextRecall, Pipeline,
-    PipelineConfig, PipelinePorts, PipelineStatus, ProviderResolver, RepoStatusPort,
-    RepoStructurePort, StdioApprovalGate,
+    AlwaysAbortGate, CmdOutcome, ContextRecallPort, NoContextRecall, Pipeline, PipelineConfig,
+    PipelinePorts, PipelineStatus, ProviderResolver, RepoStatusPort, RepoStructurePort,
+    StdioApprovalGate,
 };
 use stella_protocol::event::BudgetMode;
 use stella_protocol::{AgentEvent, CompletionMessage, ModelRef, Role, ToolOutput};
@@ -225,7 +225,7 @@ async fn run_pipeline_one_shot(
             recall,
             repo: &ws_ports.repo_structure,
             repo_status: &ws_ports.repo_status,
-            commands: &ws_ports.command_runner,
+            diagnostics: &ws_ports.diagnostic_runner,
             tests: &ws_ports.test_runner,
             approvals: if approval_capability == PipelineApprovalCapability::Stdio {
                 &stdio_gate

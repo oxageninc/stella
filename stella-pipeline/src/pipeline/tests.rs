@@ -20,7 +20,8 @@ use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::mpsc;
 
 use crate::ports::{
-    AdoptedChange, AutoApproveGate, CmdOutcome, NoContextRecall, NoRepoStatus, NoRepoStructure,
+    AdoptedChange, ArtifactIdentity, ArtifactKind, AutoApproveGate, CmdOutcome,
+    DiagnosticInvocation, DiagnosticRunner, NoContextRecall, NoRepoStatus, NoRepoStructure,
     TestInvocation, TestRunner,
 };
 
@@ -58,6 +59,7 @@ struct SeqRepoStatus {
     last: std::sync::Mutex<HashMap<String, String>>,
     tracked_snapshots: std::sync::Mutex<VecDeque<HashMap<String, String>>>,
     tracked_last: std::sync::Mutex<HashMap<String, String>>,
+    artifact_identity: Option<ArtifactIdentity>,
 }
 impl SeqRepoStatus {
     fn new(snapshots: Vec<Vec<(&str, &str)>>) -> Self {
@@ -75,6 +77,7 @@ impl SeqRepoStatus {
             last: std::sync::Mutex::new(HashMap::new()),
             tracked_snapshots: std::sync::Mutex::new(VecDeque::new()),
             tracked_last: std::sync::Mutex::new(HashMap::new()),
+            artifact_identity: None,
         }
     }
 
@@ -90,6 +93,11 @@ impl SeqRepoStatus {
                 })
                 .collect(),
         );
+        self
+    }
+
+    fn with_artifact_identity(mut self, identity: ArtifactIdentity) -> Self {
+        self.artifact_identity = Some(identity);
         self
     }
 }
@@ -115,6 +123,21 @@ impl RepoStatusPort for SeqRepoStatus {
             }
             None => self.tracked_last.lock().unwrap().clone(),
         }
+    }
+
+    async fn artifact_identity(&self, path: &str) -> Option<ArtifactIdentity> {
+        self.artifact_identity.clone().or_else(|| {
+            self.last
+                .lock()
+                .unwrap()
+                .get(path)
+                .map(|fingerprint| ArtifactIdentity {
+                    fingerprint: fingerprint.clone(),
+                    kind: ArtifactKind::Regular,
+                    mode: 0o100644,
+                    link_count: 1,
+                })
+        })
     }
 }
 
@@ -195,29 +218,13 @@ impl ScriptedRunner {
     }
 }
 #[async_trait]
-impl CommandRunner for ScriptedRunner {
-    async fn run(&self, cmd: &str) -> CmdOutcome {
-        // Order matters: the no-index numstat and ls-files probes both
-        // contain "diff"/"git", so match them before the generic diff.
-        if cmd.contains("ls-files") {
-            let listing = self
-                .untracked
-                .iter()
-                .map(|(p, _)| p.as_str())
-                .collect::<Vec<_>>()
-                .join("\n");
-            return CmdOutcome {
-                exit_code: 0,
-                stdout_tail: listing,
-                stderr_tail: String::new(),
-            };
-        }
-        if cmd.contains("--no-index") && cmd.contains("--numstat") {
-            // Report `<added>\t0\t<path>` for the file named in the cmd.
+impl DiagnosticRunner for ScriptedRunner {
+    async fn run_diagnostic(&self, invocation: &DiagnosticInvocation) -> CmdOutcome {
+        if let DiagnosticInvocation::UntrackedNumstat { path } = invocation {
             let numstat = self
                 .untracked
                 .iter()
-                .find(|(p, _)| cmd.contains(p.as_str()))
+                .find(|(candidate, _)| candidate == path)
                 .map(|(p, n)| format!("{n}\t0\t{p}"))
                 .unwrap_or_default();
             return CmdOutcome {
@@ -226,7 +233,7 @@ impl CommandRunner for ScriptedRunner {
                 stderr_tail: String::new(),
             };
         }
-        if cmd.contains("diff") {
+        if matches!(invocation, DiagnosticInvocation::GitDiff) {
             return CmdOutcome {
                 exit_code: 0,
                 stdout_tail: self.diff.clone(),
@@ -280,9 +287,11 @@ impl ToolExecutor for EmptyTools {
 /// never the real tree's.
 struct NeverRunner;
 #[async_trait]
-impl CommandRunner for NeverRunner {
-    async fn run(&self, cmd: &str) -> CmdOutcome {
-        panic!("the session CommandRunner must not serve isolated candidates (got `{cmd}`)");
+impl DiagnosticRunner for NeverRunner {
+    async fn run_diagnostic(&self, invocation: &DiagnosticInvocation) -> CmdOutcome {
+        panic!(
+            "the session DiagnosticRunner must not serve isolated candidates (got {invocation:?})"
+        );
     }
 }
 #[async_trait]
@@ -303,10 +312,12 @@ impl RepoStatusPort for NeverRepoStatus {
 /// canned adoption outcome, and a shared log of lifecycle calls.
 struct FakeWorkspace {
     id: usize,
+    root: String,
     tools: EmptyTools,
-    commands: ScriptedRunner,
+    diagnostics: ScriptedRunner,
     repo_status: SeqRepoStatus,
     adopt_result: Result<Vec<AdoptedChange>, WorkspaceError>,
+    sealed_unchanged: bool,
     log: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
@@ -319,10 +330,12 @@ impl FakeWorkspace {
     ) -> Self {
         Self {
             id,
+            root: "/candidate/workspace".into(),
             tools: EmptyTools,
-            commands: ScriptedRunner::new(test_results, "@@ -1 +1 @@\n-a\n+b"),
+            diagnostics: ScriptedRunner::new(test_results, "@@ -1 +1 @@\n-a\n+b"),
             repo_status: SeqRepoStatus::new(vec![]),
             adopt_result,
+            sealed_unchanged: true,
             log,
         }
     }
@@ -331,21 +344,41 @@ impl FakeWorkspace {
         self.repo_status = repo_status;
         self
     }
+
+    fn with_post_verification_drift(mut self) -> Self {
+        self.sealed_unchanged = false;
+        self
+    }
+
+    fn with_root(mut self, root: impl Into<String>) -> Self {
+        self.root = root.into();
+        self
+    }
 }
 
 #[async_trait]
 impl CandidateWorkspace for FakeWorkspace {
+    fn root(&self) -> &str {
+        &self.root
+    }
     fn tools(&self) -> &dyn ToolExecutor {
         &self.tools
     }
-    fn commands(&self) -> &dyn CommandRunner {
-        &self.commands
+    fn diagnostics(&self) -> &dyn DiagnosticRunner {
+        &self.diagnostics
     }
     fn tests(&self) -> &dyn TestRunner {
-        &self.commands
+        &self.diagnostics
     }
     fn repo_status(&self) -> &dyn RepoStatusPort {
         &self.repo_status
+    }
+    async fn seal(&self) -> Result<(), WorkspaceError> {
+        self.log.lock().unwrap().push(format!("seal:{}", self.id));
+        Ok(())
+    }
+    async fn sealed_is_unchanged(&self) -> Result<bool, WorkspaceError> {
+        Ok(self.sealed_unchanged)
     }
     async fn adopt(&self) -> Result<Vec<AdoptedChange>, WorkspaceError> {
         self.log.lock().unwrap().push(format!("adopt:{}", self.id));
@@ -490,7 +523,7 @@ async fn single_task_with_a_flip_submits_fast_and_skips_the_judge() {
 
     let config = PipelineConfig {
         test_command: Some("cargo test -p x".into()),
-        diff_command: Some("git diff".into()),
+        diff_diagnostic: Some(DiagnosticInvocation::GitDiff),
         ..PipelineConfig::default()
     };
     let pipeline = Pipeline::new(
@@ -501,7 +534,7 @@ async fn single_task_with_a_flip_submits_fast_and_skips_the_judge() {
             recall: &recall,
             repo: &repo,
             repo_status: &repo_status,
-            commands: &runner,
+            diagnostics: &runner,
             tests: &runner,
             approvals: &approvals,
             sleeper: &sleeper,
@@ -567,7 +600,7 @@ async fn a_queued_steer_is_injected_into_the_execute_turn() {
 
     let config = PipelineConfig {
         test_command: Some("cargo test -p x".into()),
-        diff_command: Some("git diff".into()),
+        diff_diagnostic: Some(DiagnosticInvocation::GitDiff),
         ..PipelineConfig::default()
     };
     let pipeline = Pipeline::new(
@@ -578,7 +611,7 @@ async fn a_queued_steer_is_injected_into_the_execute_turn() {
             recall: &recall,
             repo: &repo,
             repo_status: &repo_status,
-            commands: &runner,
+            diagnostics: &runner,
             tests: &runner,
             approvals: &approvals,
             sleeper: &sleeper,
@@ -636,7 +669,7 @@ async fn misclassified_lookup_that_touches_files_still_gets_verified() {
 
     let config = PipelineConfig {
         test_command: None,
-        diff_command: Some("git diff".into()),
+        diff_diagnostic: Some(DiagnosticInvocation::GitDiff),
         ..PipelineConfig::default()
     };
     let pipeline = Pipeline::new(
@@ -647,7 +680,7 @@ async fn misclassified_lookup_that_touches_files_still_gets_verified() {
             recall: &recall,
             repo: &repo,
             repo_status: &repo_status,
-            commands: &runner,
+            diagnostics: &runner,
             tests: &runner,
             approvals: &approvals,
             sleeper: &sleeper,
@@ -706,7 +739,7 @@ async fn clean_lookup_skips_plan_verify_and_judge() {
             recall: &recall,
             repo: &repo,
             repo_status: &repo_status,
-            commands: &runner,
+            diagnostics: &runner,
             tests: &runner,
             approvals: &approvals,
             sleeper: &sleeper,
@@ -772,7 +805,7 @@ async fn paid_headless_scope_review_error_retains_settled_cost() {
             recall: &recall,
             repo: &repo,
             repo_status: &repo_status,
-            commands: &runner,
+            diagnostics: &runner,
             tests: &runner,
             approvals: &approvals,
             sleeper: &sleeper,
@@ -828,7 +861,7 @@ async fn user_abort_at_scope_review_is_a_clean_abort() {
             recall: &recall,
             repo: &repo,
             repo_status: &repo_status,
-            commands: &runner,
+            diagnostics: &runner,
             tests: &runner,
             approvals: &approvals,
             sleeper: &sleeper,
@@ -862,14 +895,6 @@ fn count_diff_lines_ignores_headers() {
     assert_eq!(count_diff_lines(diff), 2);
 }
 
-#[test]
-fn shell_single_quote_neutralizes_metacharacters() {
-    assert_eq!(shell_single_quote("a b"), "'a b'");
-    // An embedded quote can't break out — the classic '\'' escape.
-    assert_eq!(shell_single_quote("a'b"), r"'a'\''b'");
-    assert_eq!(shell_single_quote("x; rm -rf ~"), "'x; rm -rf ~'");
-}
-
 /// P1/P2 regression: a large NEW file must contribute its real added-line
 /// count (not a flat 1, which slipped a 10k-line file under the diff
 /// budget), and a file already untracked before the turn must not be
@@ -898,7 +923,7 @@ async fn gather_diff_counts_real_new_file_lines_and_excludes_pre_existing() {
             recall: &recall,
             repo: &repo,
             repo_status: &repo_status,
-            commands: &runner,
+            diagnostics: &runner,
             tests: &runner,
             approvals: &approvals,
             sleeper: &sleeper,
@@ -911,9 +936,12 @@ async fn gather_diff_counts_real_new_file_lines_and_excludes_pre_existing() {
     );
 
     let surface = CandidateSurface {
-        commands: &runner,
+        diagnostics: &runner,
         tests: &runner,
         repo_status: &repo_status,
+        cwd: None,
+        hook_runner: None,
+        workspace: None,
     };
     // No baseline → the file is this turn's; its real 5000 lines count.
     let (lines, text) = pipeline.gather_diff(surface, &HashMap::new()).await;
@@ -1041,18 +1069,17 @@ async fn a_witness_that_never_fails_aborts_and_removes_the_candidate() {
 }
 
 /// Tamper exclusion: the worker modified the witness test file after it
-/// was authored, so the observed fail→pass flip is NOT credited — the
-/// evidence degrades to inconclusive and the model judge decides.
+/// was authored, so the candidate hard-fails without judge override.
 #[tokio::test]
-async fn a_tampered_witness_file_excludes_the_flip_from_evidence() {
+async fn a_tampered_witness_file_hard_fails_before_judge_evaluation() {
     let provider = ScriptedProvider::new(vec![
         text_result("single"),
         text_result("TEST_COMMAND: cargo test witness"),
         text_result("done"),                     // worker
-        text_result("FAIL the test was edited"), // judge on tampered evidence
+        text_result("FAIL the test was edited"), // must remain unused
     ]);
     // witness check (fail), baseline (fail), post-execute (pass) → the
-    // oracle flips — but the tamper check below must void the credit.
+    // oracle flips — but the tamper check below must hard-fail the candidate.
     // untracked_fingerprints call order: witness-before (empty),
     // witness-after (test authored at w1 → watchlist), candidate
     // untracked_before, gather_diff after execute, tamper check — where
@@ -1075,15 +1102,10 @@ async fn a_tampered_witness_file_excludes_the_flip_from_evidence() {
     let (outcome, events, _) = run_isolated(&provider, &port, config, "Fix the retry bug").await;
     let outcome = outcome.expect("run succeeds");
 
-    let verdict = outcome.verdict.expect("verified");
-    assert!(!verdict.passed, "the judge failed the tampered work");
+    assert!(matches!(outcome.status, PipelineStatus::Aborted { .. }));
     assert!(
-        !verdict.deterministic,
-        "a tampered flip must never submit fast — it degrades to the judge"
-    );
-    assert!(
-        stages(&events).contains(&StageKind::Judge),
-        "tamper forces the model judge instead of SubmitFast"
+        !stages(&events).contains(&StageKind::Judge),
+        "tamper is not eligible for judge override"
     );
 }
 
@@ -1126,7 +1148,7 @@ async fn second_consecutive_red_verification_gets_judge_guidance() {
             recall: &recall,
             repo: &repo,
             repo_status: &repo_status,
-            commands: &runner,
+            diagnostics: &runner,
             tests: &runner,
             approvals: &approvals,
             sleeper: &sleeper,
@@ -1178,7 +1200,7 @@ async fn run_isolated(
     Vec<CompletionMessage>,
 ) {
     let resolver = OneProvider(provider);
-    let commands = NeverRunner;
+    let diagnostics = NeverRunner;
     let repo_status = NeverRepoStatus;
     let tools = EmptyTools;
     let recall = NoContextRecall;
@@ -1195,8 +1217,8 @@ async fn run_isolated(
             recall: &recall,
             repo: &repo,
             repo_status: &repo_status,
-            commands: &commands,
-            tests: &commands,
+            diagnostics: &diagnostics,
+            tests: &diagnostics,
             approvals: &approvals,
             sleeper: &sleeper,
             hooks: None,
@@ -1321,7 +1343,7 @@ async fn single_shot_never_touches_the_candidate_workspace_port() {
             recall: &recall,
             repo: &repo,
             repo_status: &repo_status,
-            commands: &runner,
+            diagnostics: &runner,
             tests: &runner,
             approvals: &approvals,
             sleeper: &sleeper,
@@ -1382,7 +1404,7 @@ async fn a_failed_snapshot_scores_an_aborted_candidate_and_the_run_continues() {
     let log = log.lock().unwrap().clone();
     assert_eq!(
         log,
-        vec!["create", "create", "adopt:1", "remove:1"],
+        vec!["create", "create", "seal:1", "adopt:1", "remove:1"],
         "no adoption or removal for the never-created workspace"
     );
 }
@@ -1475,7 +1497,7 @@ async fn best_of_n_without_a_port_degrades_to_the_shared_tree_with_a_warning() {
             recall: &recall,
             repo: &repo,
             repo_status: &repo_status,
-            commands: &runner,
+            diagnostics: &runner,
             tests: &runner,
             approvals: &approvals,
             sleeper: &sleeper,

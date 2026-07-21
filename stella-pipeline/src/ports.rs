@@ -12,7 +12,7 @@
 //! not: a way to pick which provider a role resolved to
 //! ([`ProviderResolver`]), the surrounding context/repo material that shapes
 //! triage and planning ([`ContextRecallPort`], [`RepoStructurePort`]), and
-//! the deterministic verification substrate ([`TestRunner`], [`CommandRunner`],
+//! the deterministic verification substrate ([`TestRunner`], [`DiagnosticRunner`],
 //! [`ApprovalGate`]). None of these belong inside the step-driver.
 
 use async_trait::async_trait;
@@ -93,8 +93,8 @@ pub trait RepoStructurePort: Send + Sync {
 /// after-turn snapshot to find files the turn **created or modified**, since
 /// `git diff` alone is blind to untracked files.
 ///
-/// Distinct from [`CommandRunner`] on purpose: the listing must be COMPLETE —
-/// `CommandRunner` output is middle-out truncated (L-S3), so a large untracked
+/// Distinct from [`DiagnosticRunner`] on purpose: the listing must be COMPLETE —
+/// diagnostic output is middle-out truncated (L-S3), so a large untracked
 /// set would lose files and corrupt the diff-size accounting — and it must
 /// carry per-file fingerprints so a modification (not just a creation) to an
 /// already-untracked file is visible. A caller without a git working tree
@@ -113,6 +113,37 @@ pub trait RepoStatusPort: Send + Sync {
     /// never enter an accepted witness artifact.
     async fn tracked_fingerprints(&self) -> std::collections::HashMap<String, String> {
         std::collections::HashMap::new()
+    }
+
+    /// Filesystem identity for one repo-relative artifact, obtained without
+    /// following symlinks. Witness acceptance requires a regular single-link
+    /// file; callers without filesystem access return `None`.
+    async fn artifact_identity(&self, _path: &str) -> Option<ArtifactIdentity> {
+        None
+    }
+}
+
+/// Filesystem object kind captured without following symlinks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArtifactKind {
+    Regular,
+    Symlink,
+    Other,
+}
+
+/// Complete witness artifact identity. The fingerprint commits to content,
+/// kind, Unix mode/link count, and symlink target where applicable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactIdentity {
+    pub fingerprint: String,
+    pub kind: ArtifactKind,
+    pub mode: u32,
+    pub link_count: u64,
+}
+
+impl ArtifactIdentity {
+    pub fn is_regular_single_link(&self) -> bool {
+        self.kind == ArtifactKind::Regular && self.link_count == 1
     }
 }
 
@@ -152,21 +183,23 @@ impl CmdOutcome {
     }
 }
 
-/// Runs host-authored diagnostic commands such as fixed git diff probes.
-/// Model/user test text never crosses this port; it is parsed into a
-/// [`TestInvocation`] and sent through [`TestRunner`] instead.
+/// Closed diagnostic vocabulary. Every variant maps to fixed executable argv;
+/// no caller-provided shell string crosses this boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DiagnosticInvocation {
+    GitDiff,
+    UntrackedNumstat { path: String },
+}
+
 #[async_trait]
-pub trait CommandRunner: Send + Sync {
-    /// Run `cmd` to completion and report its outcome. Implementations must
-    /// never panic — a command that cannot even start reports a non-zero
-    /// `exit_code` with the reason in `stderr_tail`, never an `Err`, so the
-    /// ladder always has evidence to reason over.
-    async fn run(&self, cmd: &str) -> CmdOutcome;
+pub trait DiagnosticRunner: Send + Sync {
+    /// Run one fixed diagnostic invocation directly, without a shell.
+    async fn run_diagnostic(&self, invocation: &DiagnosticInvocation) -> CmdOutcome;
 }
 
 /// Runs only already-validated [`TestInvocation`] values. Kept separate from
-/// [`CommandRunner`] so model-authored test text can never reach the diagnostic
-/// shell used for fixed git inspection commands.
+/// [`DiagnosticRunner`] so model-authored test text can never retarget the fixed
+/// Git diagnostic vocabulary.
 #[async_trait]
 pub trait TestRunner: Send + Sync {
     /// Spawn `invocation.program` with `invocation.args` directly.
@@ -193,6 +226,10 @@ pub enum WorkspaceError {
     /// back to running that candidate in the shared tree.
     #[error("could not snapshot the working tree: {reason}")]
     Snapshot { reason: String },
+    /// Candidate state could not be committed into the immutable tree that
+    /// final verification and adoption must share.
+    #[error("could not seal candidate workspace `{workspace}`: {reason}")]
+    Seal { reason: String, workspace: String },
     /// Applying the winning candidate's changes to the real tree failed —
     /// typically because the user edited the same files mid-run. Adoption is
     /// all-or-nothing: NOTHING was applied, `paths` names the conflicts, and
@@ -219,17 +256,25 @@ pub enum WorkspaceError {
 /// runs.
 #[async_trait]
 pub trait CandidateWorkspace: Send + Sync {
+    /// Absolute workspace root used to bind engine hook payloads and hook
+    /// process execution to this candidate rather than the session tree.
+    fn root(&self) -> &str;
     /// The tool executor rooted at this workspace: every engine-turn tool
     /// call (read/edit/shell) lands in the snapshot, never in the real tree.
     fn tools(&self) -> &dyn stella_core::ToolExecutor;
-    /// Runs host-authored diagnostic commands inside the snapshot.
-    fn commands(&self) -> &dyn CommandRunner;
+    /// Runs closed diagnostic invocations inside the snapshot.
+    fn diagnostics(&self) -> &dyn DiagnosticRunner;
     /// Typed test-process runner rooted at this workspace.
     fn tests(&self) -> &dyn TestRunner;
     /// Untracked-file fingerprints of the snapshot, mirroring the real
     /// tree's semantics (the tamper watchlist and zero-diff guard must keep
     /// working unchanged inside a candidate).
     fn repo_status(&self) -> &dyn RepoStatusPort;
+    /// Commit the current candidate bytes into its private immutable history
+    /// immediately before a final verification observation.
+    async fn seal(&self) -> Result<(), WorkspaceError>;
+    /// Whether the live worktree and HEAD still exactly match the last seal.
+    async fn sealed_is_unchanged(&self) -> Result<bool, WorkspaceError>;
     /// Apply this workspace's changes — relative to its starting snapshot —
     /// to the real tree. All-or-nothing: on conflict the real tree is left
     /// byte-identical and the error names the conflicting paths

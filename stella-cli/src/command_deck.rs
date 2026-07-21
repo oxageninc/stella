@@ -4328,7 +4328,7 @@ async fn run_lead_pipeline_turn(
             recall,
             repo: &ws_ports.repo_structure,
             repo_status: &ws_ports.repo_status,
-            commands: &ws_ports.command_runner,
+            diagnostics: &ws_ports.diagnostic_runner,
             tests: &ws_ports.test_runner,
             approvals: &agent::HEADLESS_APPROVAL_GATE,
             sleeper: &TokioSleeper,

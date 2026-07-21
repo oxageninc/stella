@@ -506,6 +506,7 @@ async fn candidate_rules_reuse_the_parent_snapshot_after_source_removal() {
             &serde_json::json!({"path": "protected/candidate.txt", "content": "no\n"}),
         )
         .await;
+    candidate.seal().await.unwrap();
     let adopted = candidate.adopt().await.unwrap();
     let landed = root.path().join("protected/candidate.txt").exists();
     candidate.remove().await;
