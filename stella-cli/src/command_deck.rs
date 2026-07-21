@@ -3146,41 +3146,6 @@ fn deck_reserved() -> Vec<&'static str> {
     DECK_BUILTINS.iter().map(|(name, _)| *name).collect()
 }
 
-/// An argument-carrying form of `/models` — handled model-free: when the
-/// configured model itself is broken, `/models refresh` is how the user
-/// digs out, and routing it into a model turn fails on the very error
-/// being fixed. Parsed conservatively — a single recognized token (plus
-/// `refresh --force`); anything sentence-like stays a prompt, matching
-/// the "`/init do the thing` is a model prompt" rule.
-enum ModelsCommand {
-    /// `/models refresh [--force]` — re-sync the catalog, no model call.
-    Refresh { force: bool },
-    /// `/models list` — the same listing the bare `/models` prints.
-    List,
-    /// `/models <typo>` — one unrecognized token: a mistyped subcommand,
-    /// answered with usage instead of a wasted model call.
-    Usage(String),
-}
-
-/// Parse `trimmed` as a [`ModelsCommand`]; `None` leaves it on the normal
-/// path (custom expansion, then prompt).
-fn parse_models_command(trimmed: &str) -> Option<ModelsCommand> {
-    let (head, rest) = trimmed.split_once(char::is_whitespace)?;
-    let rest = rest.trim();
-    if head != "/models" || rest.is_empty() {
-        return None;
-    }
-    let mut words = rest.split_whitespace();
-    match (words.next(), words.next(), words.next()) {
-        (Some("refresh"), None, None) => Some(ModelsCommand::Refresh { force: false }),
-        (Some("refresh"), Some("--force"), None) => Some(ModelsCommand::Refresh { force: true }),
-        (Some("list"), None, None) => Some(ModelsCommand::List),
-        (Some(word), None, None) => Some(ModelsCommand::Usage(word.to_string())),
-        // A sentence after `/models` stays a prompt.
-        _ => None,
-    }
-}
-
 // ── Agent-engine config (the SETTINGS tab's config panel) ─────────────────────
 
 /// Build an [`Inbound::EngineConfig`] snapshot: the freshly merged
@@ -4025,10 +3990,12 @@ async fn run_deck_command(
         "/files" | "/diff" | "/graph" | "/agents" | "/skills" | "/mcp" | "/mcp-search"
         | "/settings" | "/sessions" | "/context" | "/inbox" => {}
         _ => {
-            // The `/models` argument forms first (see [`ModelsCommand`]):
-            // handled model-free — a catalog refresh is part of digging out
-            // of a broken model setting, so it can never be allowed to
-            // depend on a working model.
+            // The `/models` argument forms first (see
+            // [`crate::model_catalog::ModelsCommand`]): handled model-free —
+            // a catalog refresh is part of digging out of a broken model
+            // setting, so it can never be allowed to depend on a working
+            // model.
+            use crate::model_catalog::{ModelsCommand, parse_models_command};
             if let Some(command) = parse_models_command(trimmed) {
                 match command {
                     ModelsCommand::Refresh { force } => {
@@ -4642,35 +4609,6 @@ fn pseudo_diff(old: &str, new: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn deck_arg_commands_parse_models_forms_and_leave_sentences_as_prompts() {
-        assert!(matches!(
-            parse_models_command("/models refresh"),
-            Some(ModelsCommand::Refresh { force: false })
-        ));
-        assert!(matches!(
-            parse_models_command("/models refresh --force"),
-            Some(ModelsCommand::Refresh { force: true })
-        ));
-        assert!(matches!(
-            parse_models_command("/models list"),
-            Some(ModelsCommand::List)
-        ));
-        // One unrecognized token is a typo'd subcommand → usage, never a
-        // model call; a sentence stays a prompt.
-        assert!(matches!(
-            parse_models_command("/models refrsh"),
-            Some(ModelsCommand::Usage(_))
-        ));
-        assert!(parse_models_command("/models what can I use").is_none());
-        // Bare forms and non-command paths are not arg commands — and the
-        // removed `/model-<role>` heads no longer parse (model config lives
-        // on the SETTINGS tab).
-        assert!(parse_models_command("/models").is_none());
-        assert!(parse_models_command("/model-default zai/glm-5.2").is_none());
-        assert!(parse_models_command("/src/main.rs explain").is_none());
-    }
 
     #[test]
     fn parse_skill_hits_strips_ansi_and_extracts_id_installs_url() {
