@@ -7,7 +7,7 @@
 //! rendering, Tier-2 guard evaluation — live in `stella-core` (no I/O,
 //!); this module owns exactly the I/O half:
 //! walking the rule directories, reading extension-authored rules out of
-//! `.stella/store.db` (`stella_store::Store::list_rules`), and registering
+//! `.stella/private/store.db` (`stella_store::Store::list_rules`), and registering
 //! the blocking policy handler that threads [`evaluate_guards`] into
 //! `ToolRegistry::execute`'s `tool.call.requested` chain
 //! (`stella_core::bus`). Tier-1 rendering into the system prompt happens in
@@ -95,7 +95,7 @@ impl RuleSource for FsRuleSource {
     }
 }
 
-/// Extension-authored rules from the workspace store (`.stella/store.db`),
+/// Extension-authored rules from the workspace store (`.stella/private/store.db`),
 /// rendered as the [`RuleFile`]s the engine's merge consumes. The synthetic
 /// `store://rules/<id>.md` path both labels the rule's provenance
 /// ([`Rule::source`]) and yields the stored id as the filename stem, so a
@@ -105,7 +105,10 @@ impl RuleSource for FsRuleSource {
 /// persistence: any failure means no store rules this session, never an
 /// error.
 fn store_rule_files(workspace_root: &Path) -> Vec<RuleFile> {
-    if !workspace_root.join(".stella").join("store.db").exists() {
+    if !matches!(
+        stella_store::existing_workspace_private_sqlite_path(workspace_root, "store.db"),
+        Ok(Some(_))
+    ) {
         return Vec::new();
     }
     let Ok(store) = stella_store::Store::open(workspace_root) else {

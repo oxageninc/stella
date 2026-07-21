@@ -282,7 +282,7 @@ pub async fn recall_via_host(host: &Host, query: &ContextQuery) -> Vec<Attribute
         if spent_tokens.saturating_add(frame.frame.token_cost) > query.max_tokens {
             continue;
         }
-        if !seen.insert(frame.frame.id.clone()) {
+        if !seen.insert((frame.provider.clone(), frame.frame.id.clone())) {
             continue;
         }
         spent_tokens += frame.frame.token_cost;
@@ -365,7 +365,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn merges_providers_by_score_and_dedupes_by_id() {
+    async fn merges_providers_by_score_and_dedupes_only_within_a_provider() {
         let mut host = Host::new();
         host.register(scripted(
             "a",
@@ -377,9 +377,27 @@ mod tests {
         ));
         let kept = recall_via_host(&host, &query(10, 1_000)).await;
         let ids: Vec<&str> = kept.iter().map(|f| f.frame.id.as_str()).collect();
-        assert_eq!(ids, vec!["high", "shared", "low"], "score-ordered, deduped");
+        assert_eq!(ids.first(), Some(&"high"), "highest score remains first");
+        assert_eq!(ids.last(), Some(&"low"), "lowest score remains last");
+        let mut shared_providers: Vec<&str> = kept
+            .iter()
+            .filter(|f| f.frame.id == "shared")
+            .map(|f| f.provider.as_str())
+            .collect();
+        shared_providers.sort_unstable();
+        assert_eq!(
+            shared_providers,
+            vec!["a", "b"],
+            "provider-local ids must not collide across host legs"
+        );
         assert_eq!(kept[0].provider, "b", "host provider identity survives");
-        assert_eq!(kept[2].provider, "a", "each frame keeps its own leg");
+        assert_eq!(
+            kept.iter()
+                .find(|f| f.frame.id == "low")
+                .map(|f| f.provider.as_str()),
+            Some("a"),
+            "each frame keeps its own leg"
+        );
     }
 
     #[tokio::test]

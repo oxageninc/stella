@@ -9,14 +9,16 @@ the quarantine set afresh for every call. A citation marked untruthful enough
 to cross the quarantine threshold therefore disappears from both consumers on
 the next recall, even when the session was already open.
 
-Sensitive local state is created owner-only from birth on Unix (`0700`
-directories, `0600` regular files), existing private modes are repaired, and
-terminal symlinks are rejected. The mixed project `.stella` directory and its
-committable settings and rules retain their repository-selected modes. User
-settings, context/store/usage databases, session records, journals, snapshots,
-and notifications use the hardened paths. Other platforms fail closed for
-private-file creation until they have equivalent owner-only/no-follow
-primitives.
+Sensitive workspace state now lives below `.stella/private/`, an owner-only
+`0700` boundary, with regular files created or repaired to `0600` and terminal
+symlinks rejected. SQLite main/WAL/SHM files therefore share one private
+directory instead of racing in the mixed project `.stella` directory. The
+mixed directory and committable settings and rules retain their
+repository-selected modes. User settings, context/store/usage/codegraph/fleet
+databases, reflections, session records, journals, snapshots, notifications,
+MCP OAuth credentials, MCP config, and TUI debug logs use hardened persistence.
+Other platforms fail closed until equivalent owner-only/no-follow primitives
+exist.
 
 ## TDD evidence
 
@@ -35,8 +37,9 @@ RED was established before implementation:
 - A session-open quarantine regression initially kept returning a memory after
   two untruthful citations were recorded. Both rendered and structured recall
   now call the same fresh-quarantine operation and exclude it immediately.
-- With a permissive existing `.stella`, SQLite created `context.db` with the
-  ambient mode. It is now pre-created securely as `0600` without chmodding the
+- With a permissive existing `.stella`, SQLite created `context.db` and its
+  sidecars with ambient modes. The whole database family now lives under a
+  mode-at-create `0700` `.stella/private/` boundary without chmodding the mixed
   project directory, `settings.json`, or `.stella/rules/*.md`.
 - Store, usage, session, journal, notification, and user-settings mode tests
   initially observed permissive files/directories. They now prove owner-only
@@ -49,6 +52,12 @@ RED was established before implementation:
   focused regression returned two records instead of three. Opening the same
   no-follow descriptor for read plus append restored recovery without a second
   path traversal.
+- Review regressions proved provider-local deduplication, local-memory-only
+  quarantine, A/B suppression before skill loading, and multi-hop provenance
+  source/method selection.
+- A legacy database with live WAL/SHM sidecars initially admitted a partial
+  multi-rename migration. It now fails closed, remains byte-identical, and
+  asks the operator to close/checkpoint before the main DB is atomically moved.
 
 ## Implementation notes
 
@@ -65,6 +74,13 @@ RED was established before implementation:
   atomic-write, and SQLite-open primitives. SQLite receives a canonical parent
   path and `SQLITE_OPEN_NOFOLLOW`; regular files use `O_NOFOLLOW | O_CLOEXEC`,
   creation mode `0600`, descriptor-based mode repair, and a single-link check.
+- Workspace SQLite consumers resolve store, context, codegraph, and fleet files
+  through the same `.stella/private/` boundary. Safe closed legacy databases
+  migrate once; permissive legacy parents, ambiguous old/new files, and live
+  sidecar families remain untouched with actionable errors.
+- Sensitive atomic replacements fsync both the file and containing directory.
+  Reflections, MCP OAuth/config, settings, and TUI debug writers reject
+  terminal symlinks and repair owner-only modes where supported.
 - Fresh private directories use mode-at-create `0700`. Existing directories
   known to contain only private state are repaired to `0700`. Existing mixed
   project `.stella` directories are validated but deliberately not chmodded.
@@ -78,11 +94,23 @@ RED was established before implementation:
 
 - `cargo test -p stella-protocol`: 43 tests passed.
 - `cargo test -p stella-pipeline`: 130 unit tests and 4 replay tests passed.
-- `cargo test -p stella-store`: 84 tests passed.
-- `cargo test -p stella-cli`: 342 tests passed.
+- `cargo test -p stella-context`: 53 tests passed.
+- `cargo test -p stella-store`: 87 tests passed.
+- `cargo test -p stella-graph`: 65 unit + 18 integration tests passed; 1
+  environment-dependent watcher test ignored.
+- `cargo test -p stella-tools`: 328 unit + 10 integration tests passed; 1
+  sandbox test ignored. The 6 localhost tracker tests passed outside the
+  filesystem/network sandbox.
+- `cargo test -p stella-cli`: 345 tests passed after the projection split.
+- `cargo test -p stella-tui`: 487 unit + 5 render tests passed; 1 TTY test
+  ignored.
+- `cargo test -p stella-mcp`: 68 unit + 22 integration + 1 doc test passed.
+- `cargo test -p stella-observatory`: 22 tests passed.
 - `cargo clippy --workspace --all-targets -- -D warnings`: passed.
 - `cargo fmt --all -- --check`: passed.
-- `make sizes`: all 293 tracked Rust files passed.
+- `make sizes`: all 297 tracked Rust files passed.
+- `pnpm --dir stella-docs typecheck` and `pnpm --dir stella-docs build`:
+  passed; 81 static pages generated.
 - `git diff --check`: passed.
 
 ## Self-review
@@ -94,7 +122,8 @@ RED was established before implementation:
   on a check followed by a normal path open.
 - Confirmed project `.stella`, settings, and canonical rules are never passed to
   the private-directory repair primitive.
-- Re-ran full protocol, pipeline, store, and CLI suites after the module split.
+- Re-ran the full affected protocol, pipeline, context, store, graph, tools,
+  CLI, TUI, MCP, and Observatory suites after the module split.
 
 ## Concerns
 

@@ -42,7 +42,7 @@ workspace of focused crates.
 - **Code graph** — A tree-sitter symbol/import index (Rust, TS/JS, Python, SQL)
   queried by the agent and the `stella graph` command instead of grepping.
 - **Local-only telemetry** — Executions, events, token/cost telemetry, and the
-  files-touched ledger in `.stella/store.db`. The only network traffic Stella
+  files-touched ledger in `.stella/private/store.db`. The only network traffic Stella
   produces is to the model provider you chose.
 - **Budget enforcement** — A `--budget` flag aborts cleanly between steps, never
   mid-tool.
@@ -54,6 +54,9 @@ workspace of focused crates.
 ## Prerequisites
 
 - **macOS or Linux**, `x86_64` or `arm64`.
+- Private persistence currently depends on Unix owner/mode and no-follow
+  primitives. Non-Unix builds fail closed for sensitive state writes; Windows
+  persistence is not currently supported or claimed.
 - For prebuilt / Homebrew install: `curl`.
 - For building from source: **Rust 1.90+** (via [rustup](https://rustup.rs)) and `git`.
 - An API key for any supported provider, *or* a local OpenAI-compatible model
@@ -312,7 +315,7 @@ stella fleet --plan .stella/fleet.toml --max-concurrency 2 --budget 5.0
 ```
 
 One git worktree + `fleet/<task>` branch per task, wave-scheduled by dependency,
-recorded in `.stella/fleet.db`. A plan file is the serde form of the fleet DAG:
+recorded in `.stella/private/fleet.db`. A plan file is the serde form of the fleet DAG:
 `[[tasks]]` entries with `id`, `title`, `prompt`, optional `depends_on`, and
 `isolation`.
 
@@ -403,13 +406,13 @@ prompt, so every model call considers them at prompt-cache prices. New memories
 take effect the next session — hot-injection would invalidate the cache.
 
 Every working turn is also recorded as an **episode** (summary, files touched,
-outcome, time window) in `.stella/context.db`, and `stella init` writes the
+outcome, time window) in `.stella/private/context.db`, and `stella init` writes the
 domain taxonomy as bi-temporal facts. Recall fans out through the OCP host to
 the memory store and the code graph, fused by score under one budget.
 
 ## Telemetry
 
-Executions are recorded, best-effort, in `.stella/store.db`: the full event
+Executions are recorded, best-effort, in `.stella/private/store.db`: the full event
 stream, per-model-call telemetry (tokens, cache hits, cost), and the
 Files-Touched ledger. The store is never a dependency of a turn — a session
 runs even if the file can't be opened. Query it with any SQLite client.
@@ -462,7 +465,7 @@ flowchart TD
     MCP["stella-mcp<br/>external MCP servers"] -.->|merges tools into registry| TOOLS
     CORE -->|emits AgentEvent stream| STORE["stella-store<br/>SQLite: executions · events · telemetry"]
     U -->|"recall · episodes · bi-temporal facts"| CTX["stella-context — context plane<br/>recall · embeddings · memory"]
-    GRAPH["stella-graph — tree-sitter code index"] -->|"auto-indexed at session start · queried via `graph_query` + `stella graph`"| DB[("SQLite code graph<br/>.stella/codegraph.db")]
+    GRAPH["stella-graph — tree-sitter code index"] -->|"auto-indexed at session start · queried via `graph_query` + `stella graph`"| DB[("SQLite code graph<br/>.stella/private/codegraph.db")]
     MODEL -.->|versioned serde| PROTO["stella-protocol — shared types + Provider/tool ports"]
     TOOLS -.-> PROTO
     STORE -.-> PROTO

@@ -8,9 +8,9 @@ SQLite store on your disk — nothing is sent anywhere.
 
 ## Local metering
 
-Everything lands in one SQLite file: `<workspace>/.stella/store.db`. Because the store is
+Everything lands in one SQLite file: `<workspace>/.stella/private/store.db`. Because the store is
 a real SQLite file, you can inspect it with any SQLite client after a run — e.g.
-`sqlite3 <workspace>/.stella/store.db` — and every execution, its model, and its cost are
+`sqlite3 <workspace>/.stella/private/store.db` — and every execution, its model, and its cost are
 queryable on your own machine. WAL is enabled, so a read-only reader like
 [`stella stats`](/docs/commands/stats) is never blocked by a live session. Stella never
 transmits this data.
@@ -38,7 +38,7 @@ same tables:
 | `tasks` | The latest task-board snapshot, one row per task per session |
 | `pull_requests` | Tracked pull requests — status and CI verdict, keyed by URL |
 | `file_locks` | Cooperative file claims for multi-agent work |
-| `graph_nodes` / `graph_edges` | Reserved schema for a future context-plane seam — the code graph itself lives in `.stella/codegraph.db` |
+| `graph_nodes` / `graph_edges` | Reserved schema for a future context-plane seam — the code graph itself lives in `.stella/private/codegraph.db` |
 
 ## Budget: observed vs. enforced
 

@@ -2,9 +2,9 @@
 //! `stella-fleet`'s one dispatch seam: a DAG of tasks (from positional
 //! prompts or a `--plan` file), a git worktree per isolated task, wave
 //! scheduling with bounded concurrency, and every attempt/commit/dollar
-//! stamped into the SQLite ledger (`.stella/fleet.db`). A task that declares
+//! stamped into the SQLite ledger (`.stella/private/fleet.db`). A task that declares
 //! `claims` (workspace-relative paths it will touch) holds them as
-//! cooperative file locks in `.stella/store.db` for the attempt's duration —
+//! cooperative file locks in `.stella/private/store.db` for the attempt's duration —
 //! a path another task (or another run) already claims fails that dispatch
 //! by name instead of letting two agents edit the same file.
 //!
@@ -103,11 +103,10 @@ pub async fn run_fleet(
     }
     println!();
 
-    let dot_stella = root.join(".stella");
-    std::fs::create_dir_all(&dot_stella)
-        .map_err(|e| format!("could not create {}: {e}", dot_stella.display()))?;
-    let ledger = Ledger::open(&dot_stella.join("fleet.db"))
-        .map_err(|e| format!("could not open the fleet ledger: {e}"))?;
+    let ledger_path = stella_store::workspace_private_sqlite_path(&root, "fleet.db")
+        .map_err(|e| format!("could not prepare private fleet state: {e}"))?;
+    let ledger =
+        Ledger::open(&ledger_path).map_err(|e| format!("could not open the fleet ledger: {e}"))?;
 
     // Millisecond + pid: two runs in the same second (scripted/CI) must not
     // share a ledger run id — `record_run` is INSERT OR REPLACE, so a
@@ -139,7 +138,7 @@ pub async fn run_fleet(
         FleetConfig::new(&run_id, &base_sha).with_max_concurrency(max_concurrency.max(1)),
     )
     .map_err(|e| format!("could not start the fleet: {e}"))?;
-    // File claims live in the workspace store (`.stella/store.db`), opened
+    // File claims live in the workspace store (`.stella/private/store.db`), opened
     // only when the plan declares any: enforcing claims requires the store
     // (a claim silently unenforced defeats its purpose), but a claim-free
     // run must not grow a new failure mode.
@@ -157,7 +156,7 @@ pub async fn run_fleet(
         .await
         .map_err(|e| format!("fleet run failed: {e}"))?;
 
-    render_report(&plan, &report, &dot_stella);
+    render_report(&plan, &report, &ledger_path);
     if report.budget_aborted {
         return Err(format!(
             "budget cap reached after ${:.4} — remaining waves were not launched",
@@ -712,7 +711,7 @@ fn truncate(s: &str) -> String {
 /// The end-of-run report: per task its outcome, spend, commits, and (when
 /// isolated) the worktree that holds the work, then the totals and where the
 /// receipts live.
-fn render_report(plan: &Plan, report: &FleetRunReport, dot_stella: &Path) {
+fn render_report(plan: &Plan, report: &FleetRunReport, ledger_path: &Path) {
     println!();
     for handle in &report.handles {
         let ok = handle.outcome.success;
@@ -763,7 +762,7 @@ fn render_report(plan: &Plan, report: &FleetRunReport, dot_stella: &Path) {
     println!(
         "\n  total ${:.4} · ledger {} · worktrees kept for review (`git worktree list`)\n",
         report.total_cost_usd(),
-        dot_stella.join("fleet.db").display(),
+        ledger_path.display(),
     );
 }
 

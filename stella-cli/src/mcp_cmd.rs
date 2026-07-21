@@ -23,10 +23,17 @@ pub fn mcp_toml_path(workspace_root: &Path) -> PathBuf {
 /// Load `.stella/mcp.toml` (an absent file is an empty config, not an error).
 pub fn load_config(workspace_root: &Path) -> Result<McpConfig, String> {
     let path = mcp_toml_path(workspace_root);
-    match std::fs::read_to_string(&path) {
+    match stella_store::read_sensitive_file_to_string(&path) {
         Ok(text) => McpConfig::from_toml_str(&text)
             .map_err(|e| format!("{} is invalid: {e}", path.display())),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(McpConfig::default()),
+        Err(_)
+            if matches!(
+                std::fs::symlink_metadata(&path),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound
+            ) =>
+        {
+            Ok(McpConfig::default())
+        }
         Err(e) => Err(format!("cannot read {}: {e}", path.display())),
     }
 }
@@ -35,35 +42,23 @@ pub fn load_config(workspace_root: &Path) -> Result<McpConfig, String> {
 /// since it may hold credentials.
 pub fn save_config(workspace_root: &Path, cfg: &McpConfig) -> Result<(), String> {
     let path = mcp_toml_path(workspace_root);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
+    if let Some(parent) = path.parent()
+        && !parent.exists()
+    {
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder
+            .create(parent)
             .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
     }
     let toml = cfg.to_toml_string().map_err(|e| e.to_string())?;
-    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
-    write_owner_only(&tmp, toml.as_bytes())
-        .map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, &path).map_err(|e| format!("cannot replace {}: {e}", path.display()))?;
-    Ok(())
-}
-
-fn write_owner_only(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)?;
-        file.write_all(bytes)
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(path, bytes)
-    }
+    stella_store::write_sensitive_file_atomic(&path, toml.as_bytes())
+        .map_err(|e| format!("cannot write {}: {e}", path.display()))
 }
 
 /// The configured MCP registry URL (settings.json `mcp.registry_url`, else the
@@ -126,7 +121,10 @@ pub fn remove(workspace_root: &Path, name: &str) -> Result<bool, String> {
 
 /// The workspace's OAuth token store, beside `mcp.toml` (owner-only JSON).
 pub fn oauth_store_path(workspace_root: &Path) -> PathBuf {
-    workspace_root.join(".stella").join("mcp_oauth.json")
+    workspace_root
+        .join(".stella")
+        .join("private")
+        .join("mcp_oauth.json")
 }
 
 /// The session's OAuth manager: lazy per-server bearer sources over the
@@ -213,10 +211,12 @@ fn open_in_browser(url: &str) {
 }
 
 /// Per-(server, tool) usage aggregates from local telemetry
-/// (`.stella/store.db`). Missing store → empty (never creates the file).
+/// (`.stella/private/store.db`). Missing store → empty (never creates the file).
 pub fn usage_stats(workspace_root: &Path) -> Result<Vec<stella_store::McpUsageStat>, String> {
-    let db = workspace_root.join(".stella").join("store.db");
-    if !db.exists() {
+    if stella_store::existing_workspace_private_sqlite_path(workspace_root, "store.db")
+        .map_err(|e| format!("cannot resolve store: {e}"))?
+        .is_none()
+    {
         return Ok(Vec::new());
     }
     let store =
@@ -428,7 +428,7 @@ fn run_logout(workspace_root: &Path, name: &str) -> Result<(), String> {
 }
 
 fn run_usage(workspace_root: &Path) -> Result<(), String> {
-    crate::tui::section_header("MCP tool usage (.stella/store.db)");
+    crate::tui::section_header("MCP tool usage (.stella/private/store.db)");
     let stats = usage_stats(workspace_root)?;
     if stats.is_empty() {
         println!(
@@ -521,5 +521,30 @@ mod tests {
         assert!(load_config(&dir).unwrap().names().is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn credential_config_is_owner_only_and_rejects_symlink_targets() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = McpConfig::default();
+        save_config(dir.path(), &cfg).unwrap();
+        assert_eq!(
+            std::fs::metadata(mcp_toml_path(dir.path()))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+
+        let target = dir.path().join("outside.toml");
+        std::fs::write(&target, "[servers]\n").unwrap();
+        std::fs::remove_file(mcp_toml_path(dir.path())).unwrap();
+        symlink(&target, mcp_toml_path(dir.path())).unwrap();
+        assert!(save_config(dir.path(), &cfg).is_err());
+        assert_eq!(std::fs::read_to_string(target).unwrap(), "[servers]\n");
     }
 }

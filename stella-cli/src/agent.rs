@@ -808,7 +808,7 @@ fn surface_reflection(report: &ReflectionReport, format: OutputFormat) {
     }
 }
 
-/// Build the workspace code-graph index into `.stella/codegraph.db` (the
+/// Build the workspace code-graph index into `.stella/private/codegraph.db` (the
 /// `stella-graph` tree-sitter indexer). This is the data side of `init`: the
 /// domain taxonomy tags graph nodes/edges, and the index makes the symbols +
 /// import edges queryable as `ContextFrame`s by the context plane.
@@ -846,10 +846,8 @@ async fn build_code_graph(workspace_root: &std::path::Path, emit: &mut dyn FnMut
 fn index_workspace_graph_blocking(
     workspace_root: &std::path::Path,
 ) -> Result<GraphSummary, String> {
-    let dot_stella = workspace_root.join(".stella");
-    std::fs::create_dir_all(&dot_stella)
-        .map_err(|e| format!("! could not create .stella for the code graph: {e} — skipped"))?;
-    let db_path = dot_stella.join("codegraph.db");
+    let db_path = stella_store::workspace_private_sqlite_path(workspace_root, "codegraph.db")
+        .map_err(|e| format!("! could not prepare private code graph state: {e} — skipped"))?;
     let graph = stella_graph::CodeGraph::open(workspace_root, &db_path)
         .map_err(|e| format!("! code-graph store unavailable: {e} — skipped"))?;
     let stats = graph.index_all().map_err(|e| {
@@ -899,7 +897,7 @@ fn format_graph_stats(summary: &GraphSummary) -> String {
 /// A session-lifetime holder for the live code graph. It keeps the in-process
 /// `notify` watcher (and its debounce task) alive so file changes — the
 /// agent's own edits and external ones — incrementally re-index into
-/// `.stella/codegraph.db` for the rest of the session. Dropping it (or calling
+/// `.stella/private/codegraph.db` for the rest of the session. Dropping it (or calling
 /// [`SessionGraph::shutdown`]) tears the watcher down cleanly. The mounted
 /// graph is installed only once the background build finishes, so an early
 /// session exit simply leaves the slot empty (and the never-installed watcher
@@ -934,7 +932,7 @@ impl Drop for SessionGraph {
 /// 2. The moment the index is ready the `graph_query` tool is enabled for the
 ///    rest of the session ([`ToolRegistry::enable_code_graph_if_available`])
 ///    and the schema gate learns any new table/type names — so a session that
-///    launched in a repo with no `.stella/codegraph.db` gains the tool
+///    launched in a repo with no `.stella/private/codegraph.db` gains the tool
 ///    mid-session, no restart, no manual `stella init`.
 /// 3. The live `notify` watcher is then armed via
 ///    [`stella_graph::CodeGraph::mount`] so subsequent edits incrementally
@@ -1068,7 +1066,9 @@ pub(crate) fn graph_snapshot_focus(
 ) -> Option<stella_tui::GraphSnapshot> {
     use stella_tui::{GraphEdge, GraphNode, GraphSnapshot};
 
-    let db_path = workspace_root.join(".stella").join("codegraph.db");
+    let db_path =
+        stella_store::existing_workspace_private_sqlite_path(workspace_root, "codegraph.db")
+            .ok()??;
     if !db_path.exists() {
         return None;
     }
@@ -1135,7 +1135,7 @@ pub(crate) fn graph_snapshot_focus(
 
 /// Seed the tool registry's storage-gate baseline with the assembled
 /// storage map (persisted index + `stella.storage.toml`). Best-effort: with
-/// no `.stella/codegraph.db` and no manifest the snapshot is empty and every
+/// no `.stella/private/codegraph.db` and no manifest the snapshot is empty and every
 /// gate mechanism is a no-op until `stella init` runs. The gate also
 /// re-reads the persisted map per gated write, so this baseline only has to
 /// cover session start.
@@ -1147,7 +1147,7 @@ pub(crate) fn populate_schema_index(registry: &ToolRegistry, workspace_root: &st
 /// index, and write `.stella/domains.toml` (see `crate::domains`). Domain
 /// inference is model-assisted when a provider resolves, with a deterministic
 /// directory heuristic fallback, so init always succeeds — offline included.
-/// The code graph (`.stella/codegraph.db`) is built unconditionally: it needs
+/// The code graph (`.stella/private/codegraph.db`) is built unconditionally: it needs
 /// no provider, only the on-disk source tree.
 pub async fn run_init(
     model_override: Option<&str>,
@@ -1600,7 +1600,7 @@ pub(crate) fn build_budget_guard(budget_limit: Option<f64>) -> BudgetGuard {
     }
 }
 
-/// Open the workspace SQLite store (`.stella/store.db`). Persistence is
+/// Open the workspace SQLite store (`.stella/private/store.db`). Persistence is
 /// observability, not a work dependency: a store that won't open warns once
 /// and the session runs on without it — never a startup failure.
 pub(crate) fn open_store(workspace_root: &std::path::Path) -> Option<Arc<Store>> {

@@ -1278,7 +1278,7 @@ mod tests {
     use crate::issues::IssueBackend;
 
     /// A registry rooted in a fresh empty tempdir. Rooting tests at a shared
-    /// path like `/tmp` is not hermetic: a stray `.stella/codegraph.db` left
+    /// path like `/tmp` is not hermetic: a stray `.stella/private/codegraph.db` left
     /// there by a real session conditionally registers `graph_query` and
     /// skews every tool-set assertion. The `TempDir` is returned so the root
     /// outlives the registry.
@@ -1725,7 +1725,7 @@ mod tests {
 
         // Build a minimal index, exactly what `stella init` does.
         std::fs::write(root.join("lib.rs"), "pub fn f() {}\n").unwrap();
-        let db = root.join(".stella").join("codegraph.db");
+        let db = crate::graph::graph_db_path(&root);
         std::fs::create_dir_all(db.parent().unwrap()).unwrap();
         let graph = stella_graph::CodeGraph::open(&root, &db).unwrap();
         graph.index_all().unwrap();

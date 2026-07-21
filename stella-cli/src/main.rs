@@ -249,7 +249,7 @@ enum Command {
     /// Fan tasks out to a fleet of worker agents in ONE shared tree —
     /// coordinated by cooperative claims (lock-on-first-write, sub-second,
     /// rivals named), wave-scheduled by dependency, every attempt, commit,
-    /// and dollar recorded in .stella/fleet.db. Tasks opting into
+    /// and dollar recorded in .stella/private/fleet.db. Tasks opting into
     /// isolation = "isolated" get a dedicated worktree whose fleet/<task>
     /// branch is left in place for review.
     Fleet {
@@ -290,7 +290,7 @@ enum Command {
 
     /// Query the code graph built by `stella init` — symbol definitions and
     /// references, a file's imports/importers, or its graph neighborhood.
-    /// Offline: reads .stella/codegraph.db, needs no API key.
+    /// Offline: reads .stella/private/codegraph.db, needs no API key.
     Graph {
         /// What to ask the graph
         #[arg(value_enum)]
@@ -312,7 +312,7 @@ enum Command {
 
     /// Inspect the storage map — every storage layer, namespace, relation,
     /// and field, with intent/boundaries from stella.storage.toml. Offline:
-    /// reads .stella/codegraph.db + the manifest, needs no API key.
+    /// reads .stella/private/codegraph.db + the manifest, needs no API key.
     Storage {
         #[command(subcommand)]
         cmd: StorageCmd,
@@ -325,7 +325,7 @@ enum Command {
     },
 
     /// Summarize cost, tokens, and resolve rate per provider/model from
-    /// local telemetry (.stella/store.db) — $/resolved-task receipts
+    /// local telemetry (.stella/private/store.db) — $/resolved-task receipts
     Stats {
         /// Output format: table (aligned, with TOTAL row), json, or csv
         #[arg(long, value_enum, default_value = "table")]
@@ -338,7 +338,7 @@ enum Command {
     },
 
     /// Open the Observatory — a local web dashboard over this workspace's
-    /// telemetry (.stella/store.db + fleet.db): spend, tokens, cache
+    /// telemetry (.stella/private/store.db + fleet.db): spend, tokens, cache
     /// traffic, tool calls, files touched, memory citations, reflections,
     /// and fleet runs. Binds 127.0.0.1 only and opens the stores strictly
     /// read-only — nothing ever leaves this machine.
@@ -489,7 +489,7 @@ pub enum McpCmd {
         /// The configured server's local name
         name: String,
     },
-    /// Show MCP tool-usage telemetry (.stella/store.db): calls per server/tool
+    /// Show MCP tool-usage telemetry (.stella/private/store.db): calls per server/tool
     Usage,
 }
 

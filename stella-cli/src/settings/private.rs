@@ -82,6 +82,9 @@ fn write_user_settings(path: &Path, bytes: &[u8]) -> Result<(), String> {
         drop(file);
         std::fs::rename(&tmp, path)
             .map_err(|e| format!("cannot replace {}: {e}", path.display()))?;
+        std::fs::File::open(parent)
+            .and_then(|dir| dir.sync_all())
+            .map_err(|e| format!("cannot fsync directory {}: {e}", parent.display()))?;
         Ok(())
     })();
     if result.is_err() {

@@ -1,7 +1,7 @@
 //! `usage.db` — the **user-tier** telemetry aggregate, one database per
 //! developer (not per project), living under the OS data dir (e.g.
 //! `~/.local/share/stella/usage.db`). It is a *derived* store: every project's
-//! `.stella/store.db` is the source of truth, and each finished turn is rolled
+//! `.stella/private/store.db` is the source of truth, and each finished turn is rolled
 //! up here so a future cross-project dashboard can answer "how do I actually
 //! use Stella, across all my repos?" without opening every project database.
 //!

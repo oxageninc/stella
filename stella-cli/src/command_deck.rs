@@ -140,12 +140,29 @@ fn debug_log_path() -> Option<PathBuf> {
     if std::env::var_os("OXAGEN_DEBUG").is_none_or(|v| v.is_empty() || v == "0") {
         return None;
     }
-    let state_home = std::env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))?;
-    let dir = state_home.join("stella").join("logs");
-    std::fs::create_dir_all(&dir).ok()?;
-    Some(dir.join(format!("deck-{}.jsonl", std::process::id())))
+    #[cfg(not(unix))]
+    return None;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        let state_home = std::env::var_os("XDG_STATE_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))?;
+        let dir = state_home.join("stella").join("logs");
+        match std::fs::symlink_metadata(&dir) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+            Ok(_) => return None,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let mut builder = std::fs::DirBuilder::new();
+                builder.recursive(true).mode(0o700);
+                builder.create(&dir).ok()?;
+            }
+            Err(_) => return None,
+        }
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).ok()?;
+        Some(dir.join(format!("deck-{}.jsonl", std::process::id())))
+    }
 }
 
 /// How one dispatched turn ended, as seen by the driver loop.
@@ -2852,7 +2869,7 @@ fn symbol_hit(frame: &ocp_types::ContextFrame) -> EntityHit {
 }
 
 /// The local (non-tracker) assignee sources, read synchronously (call on
-/// the blocking pool): memories from `.stella/context.db` — with citation
+/// the blocking pool): memories from `.stella/private/context.db` — with citation
 /// stats joined from `store.db` by `public_id` — and code-graph symbol
 /// definitions when an index exists. Read-only politeness (the `stella
 /// stats` discipline): a missing database reads as "no hits", never a
@@ -2862,14 +2879,19 @@ fn local_assignee_hits(root: &std::path::Path, query: &str) -> Vec<EntityHit> {
     let mut hits = Vec::new();
 
     // Memories: substring over display_name/content; empty query lists all.
-    let context_db = root.join(".stella").join("context.db");
-    if context_db.exists()
+    let context_db = stella_store::existing_workspace_private_sqlite_path(root, "context.db")
+        .ok()
+        .flatten();
+    if let Some(context_db) = context_db
         && let Ok(context) = stella_context::ContextStore::open(&context_db)
         && let Ok(nodes) = context.memory_nodes()
     {
         let stats: std::collections::HashMap<String, (i64, f64)> = {
-            let store_db = root.join(".stella").join("store.db");
-            if store_db.exists() {
+            if stella_store::existing_workspace_private_sqlite_path(root, "store.db")
+                .ok()
+                .flatten()
+                .is_some()
+            {
                 stella_store::Store::open(root)
                     .and_then(|store| store.memory_citation_stats())
                     .map(|rows| {

@@ -1,5 +1,5 @@
 //! `graph_query` — query the workspace's code graph (tree-sitter symbols +
-//! import edges, auto-indexed at session start into `.stella/codegraph.db`
+//! import edges, auto-indexed at session start into `.stella/private/codegraph.db`
 //! and kept fresh by the live watcher).
 //!
 //! This is the runtime retrieval surface of `stella-graph`: instead of
@@ -28,7 +28,7 @@ const MAX_FRAMES: usize = 30;
 
 /// The index location `stella init` writes and the schema gate reads.
 pub fn graph_db_path(root: &Path) -> PathBuf {
-    root.join(".stella").join("codegraph.db")
+    root.join(".stella").join("private").join("codegraph.db")
 }
 
 /// Whether the workspace has an index — the registration condition.
@@ -91,7 +91,9 @@ pub fn run_query(root: &Path, op: &str, target: &str) -> ToolOutput {
     let db_path = graph_db_path(root);
     if !db_path.exists() {
         return ToolOutput::Error {
-            message: "no code graph index — run `stella init` to build .stella/codegraph.db".into(),
+            message:
+                "no code graph index — run `stella init` to build .stella/private/codegraph.db"
+                    .into(),
         };
     }
     let graph = match stella_graph::CodeGraph::open(root, &db_path) {

@@ -6,7 +6,7 @@
 //! (Field Manual Part 4: "code is a graph, not text"), yet agents keep
 //! grepping instead of asking it. So the search tools bring the graph to the
 //! agent: every successful result carries a compact per-file map (symbols,
-//! import edges) drawn from `.stella/codegraph.db`. A search whose *pattern is
+//! import edges) drawn from `.stella/private/codegraph.db`. A search whose *pattern is
 //! symbol-shaped* — a definition/reference hunt graph_query serves better —
 //! additionally carries a one-line pointer at the tool ([`is_symbol_shaped`]
 //! decides). Not once-per-session: the nudge fires on every symbol-shaped

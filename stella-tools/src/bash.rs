@@ -428,7 +428,7 @@ mod tests {
         }
     }
 
-    /// An indexed workspace — a source file plus a built `.stella/codegraph.db`,
+    /// An indexed workspace — a source file plus a built `.stella/private/codegraph.db`,
     /// exactly what `stella init` leaves so `graph_available` is true.
     fn indexed_tempdir() -> tempfile::TempDir {
         let dir = tempfile::tempdir().expect("tempdir");

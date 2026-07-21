@@ -1,5 +1,5 @@
 //! `stella-store` — the session's local SQLite database at
-//! `.stella/store.db`: durable state, full execution records, and
+//! `.stella/private/store.db`: durable state, full execution records, and
 //! analytics-grade telemetry, all on the user's disk (no server, no
 //! account — the local-first non-negotiable).
 //!
@@ -117,10 +117,14 @@ pub use catalog::CatalogStore;
 // natural name. Reach the writer through its module.
 pub use journal::JournalRecord;
 pub use notify::{Notification, NotificationStore};
-pub use private::prepare_private_sqlite_path;
+pub use private::{
+    WORKSPACE_PRIVATE_DIR, append_workspace_private_line, existing_workspace_private_sqlite_path,
+    existing_workspace_private_state_path, read_sensitive_file_to_string,
+    workspace_private_sqlite_path, workspace_private_state_path, write_sensitive_file_atomic,
+};
 pub(crate) use private::{
-    ensure_private_dir, open_private_file, open_private_sqlite, read_private_to_string,
-    write_private_atomic,
+    ensure_private_dir, ensure_workspace_state_dir, open_private_file, open_private_sqlite,
+    read_private_to_string, write_private_atomic,
 };
 pub use sessions::{SessionRecord, SessionRegistry, SessionStatus};
 
@@ -546,38 +550,14 @@ pub struct Store {
 }
 
 impl Store {
-    /// Open (creating if needed) the workspace database at `.stella/store.db`
+    /// Open (creating if needed) at `.stella/private/store.db`
     /// and apply the schema.
     pub fn open(workspace_root: &Path) -> Result<Self> {
-        let dir = workspace_root.join(".stella");
-        let created = match std::fs::symlink_metadata(&dir) {
-            Ok(metadata) => {
-                if metadata.file_type().is_symlink() || !metadata.is_dir() {
-                    return Err(StoreError(format!(
-                        "workspace state path {} is not a real directory",
-                        dir.display()
-                    )));
-                }
-                false
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let mut builder = std::fs::DirBuilder::new();
-                builder.recursive(true);
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::DirBuilderExt;
-                    builder.mode(0o700);
-                }
-                builder
-                    .create(&dir)
-                    .map_err(|e| StoreError(e.to_string()))?;
-                true
-            }
-            Err(error) => return Err(StoreError(error.to_string())),
-        };
+        let (dir, created) = ensure_workspace_state_dir(workspace_root)?;
         harden_workspace_dir(&dir, created)?;
+        let db_path = workspace_private_sqlite_path(workspace_root, "store.db")?;
         Self::init(
-            open_private_sqlite(&dir.join("store.db"))?,
+            open_private_sqlite(&db_path)?,
             Some(workspace_root.to_path_buf()),
         )
     }
@@ -3166,6 +3146,12 @@ mod tests {
             std::thread::current().id()
         ));
         std::fs::create_dir_all(root.join(".stella")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(root.join(".stella"), std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+        }
         // Simulate a database created before drift correction: the telemetry
         // table exists WITHOUT estimated_input_tokens and already has a row.
         {
@@ -3287,6 +3273,12 @@ mod tests {
         ));
         std::fs::remove_dir_all(&root).ok();
         std::fs::create_dir_all(root.join(".stella")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(root.join(".stella"), std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+        }
         root
     }
 

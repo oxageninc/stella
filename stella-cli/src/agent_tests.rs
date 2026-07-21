@@ -91,8 +91,7 @@ fn graph_fixture() -> tempfile::TempDir {
     )
     .unwrap();
     std::fs::write(root.path().join("leaf.rs"), "pub fn d() {}\n").unwrap();
-    std::fs::create_dir_all(root.path().join(".stella")).unwrap();
-    let db = root.path().join(".stella").join("codegraph.db");
+    let db = stella_store::workspace_private_sqlite_path(root.path(), "codegraph.db").unwrap();
     let graph = stella_graph::CodeGraph::open(root.path(), &db).expect("open graph");
     graph.index_all().expect("index");
     graph.shutdown();
@@ -137,7 +136,7 @@ fn graph_snapshot_is_none_without_an_index() {
 }
 
 /// Auto-build on session start (task part A): a workspace with a source
-/// file but NO `.stella/codegraph.db` does not advertise `graph_query` on
+/// file but NO `.stella/private/codegraph.db` does not advertise `graph_query` on
 /// turn 1; once [`spawn_session_graph`]'s background build completes the
 /// tool is advertised AND dispatchable — no manual `stella init`, no
 /// restart. Awaiting the returned handle is the deterministic "index
@@ -166,7 +165,7 @@ async fn spawn_session_graph_auto_builds_and_enables_graph_query() {
     // dispatches against the freshly built index.
     assert!(
         stella_tools::graph::graph_available(&root),
-        "the background build must create .stella/codegraph.db"
+        "the background build must create .stella/private/codegraph.db"
     );
     assert!(
         advertises(&registry),

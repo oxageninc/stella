@@ -15,7 +15,7 @@
 //! turn runs …
 //! outcome ─> reflect_and_record(): one cheap model call -> 0-3 lessons
 //!            ├─ MemoryInput::reflection(...) -> context.db (domain-tagged)
-//!            ├─ appended to .stella/reflections.jsonl (the mining log)
+//!            ├─ appended to .stella/private/reflections.jsonl (the mining log)
 //!            └─ mine_skill_candidates over the log -> decide_auto_creation
 //!               -> new SKILL.md files (capped per session, no-clobber)
 //! ```
@@ -41,6 +41,9 @@ use stella_protocol::{CompletionMessage, CompletionRequest, MessageRole, Provide
 
 use crate::domains::Domains;
 
+mod projection;
+use projection::{is_quarantined_local_memory, project_recalled_frame};
+
 /// Marker prefixing a recalled-context message so [`inject_recall_block`]
 /// can find the newest one for dedup. Blocks land at the conversation
 /// tail and stay in place as durable history (L-E8: the byte-stable
@@ -49,7 +52,7 @@ use crate::domains::Domains;
 pub const RECALL_MARKER: &str = "[auto-recalled context]";
 
 /// One reflection lesson as the model returns it and as persisted to the
-/// mining log (`.stella/reflections.jsonl`, one JSON object per line).
+/// mining log (`.stella/private/reflections.jsonl`, one JSON object per line).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReflectionLesson {
     pub lesson: String,
@@ -203,16 +206,8 @@ impl SessionMemory {
         warn: bool,
         include_workspace_skills: bool,
     ) -> Option<Self> {
-        // Store::open establishes the mixed `.stella` directory safely
-        // (0700 from birth when new, existing project mode untouched, no
-        // symlink). The context DB itself is private even when that mixed
-        // directory is intentionally permissive.
-        let privacy_guard = stella_store::Store::open(workspace_root).ok()?;
-        drop(privacy_guard);
-        let db_path = stella_store::prepare_private_sqlite_path(
-            &workspace_root.join(".stella").join("context.db"),
-        )
-        .ok()?;
+        let db_path =
+            stella_store::workspace_private_sqlite_path(workspace_root, "context.db").ok()?;
         match ContextStore::open_and_warm(
             &db_path,
             std::sync::Arc::new(HashEmbedder::default()),
@@ -275,6 +270,9 @@ impl SessionMemory {
     /// deterministic coin flip), recall returns `None` so the turn runs
     /// without context — the outcome is then comparable to recalled turns.
     pub async fn recall_block(&self, prompt: &str) -> Option<String> {
+        if self.ab_suppressed {
+            return None;
+        }
         let mut sections: Vec<String> = Vec::new();
         let frames = self.recalled_frames(prompt).await;
         if let Some(section) = render_context_section(&frames) {
@@ -530,19 +528,25 @@ impl SessionMemory {
         // Count how many lessons actually reached the log so the message below
         // reports partial persistence accurately (some serialize/append writes
         // may fail while others succeed).
-        let log_path = self
-            .workspace_root
-            .join(".stella")
-            .join("reflections.jsonl");
+        let log_path =
+            stella_store::workspace_private_state_path(&self.workspace_root, "reflections.jsonl")
+                .ok();
         let mut logged_count = 0usize;
         for lesson in &lessons {
             if let Ok(line) = serde_json::to_string(lesson)
-                && append_line(&log_path, &line).is_ok()
+                && stella_store::append_workspace_private_line(
+                    &self.workspace_root,
+                    "reflections.jsonl",
+                    &line,
+                )
+                .is_ok()
             {
                 logged_count += 1;
             }
         }
-        self.auto_create_skills(&log_path, quiet);
+        if let Some(log_path) = &log_path {
+            self.auto_create_skills(log_path, quiet);
+        }
 
         if !quiet {
             let n = lessons.len();
@@ -662,47 +666,9 @@ impl SessionMemory {
             .await
             .into_iter()
             .filter_map(project_recalled_frame)
-            .filter(|frame| frame.id.as_ref().is_none_or(|id| !quarantined.contains(id)))
+            .filter(|frame| !is_quarantined_local_memory(frame, &quarantined))
             .collect()
     }
-}
-
-/// Lossless projection from the OCP frame plus host-owned provider identity
-/// into the pipeline port shape. The source and method come from the most
-/// derived provenance entries; no frame kind is relabeled as memory.
-fn project_recalled_frame(attributed: crate::ocp::AttributedContextFrame) -> Option<RecalledFrame> {
-    let frame = attributed.frame;
-    let citation_label = frame.citation_label.clone()?;
-    let source = frame
-        .provenance
-        .iter()
-        .rev()
-        .find_map(|entry| entry.by.clone())
-        .unwrap_or_else(|| attributed.provider.clone());
-    let method = frame
-        .provenance
-        .iter()
-        .rev()
-        .find_map(|entry| entry.method.clone());
-    let uri = frame
-        .uri
-        .clone()
-        .or_else(|| frame.provenance.iter().find_map(|entry| entry.uri.clone()));
-    let kind = serde_json::to_value(frame.kind)
-        .ok()
-        .and_then(|value| value.as_str().map(str::to_owned))
-        .unwrap_or_default();
-    Some(RecalledFrame {
-        citation_label,
-        provider: attributed.provider,
-        source,
-        kind,
-        uri,
-        method,
-        content: frame.content.trim().to_string(),
-        token_cost: frame.token_cost,
-        id: Some(frame.id),
-    })
 }
 
 /// The pipeline's context-recall port over the workspace memory store: the
@@ -958,18 +924,6 @@ pub fn parse_lessons(text: &str, allowed_domains: &[String]) -> Vec<ReflectionLe
     lessons
 }
 
-fn append_line(path: &Path, line: &str) -> std::io::Result<()> {
-    use std::io::Write;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?;
-    writeln!(file, "{line}")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1184,7 +1138,7 @@ mod tests {
                 range: Some("L7-9".into()),
                 digest: None,
                 method: None,
-                by: None,
+                by: Some("git-worktree".into()),
             },
             ocp_types::Provenance {
                 kind: "derivation".into(),
@@ -1203,12 +1157,59 @@ mod tests {
         .expect("labeled graph frame projects");
 
         assert_eq!(recalled.provider, "code-graph");
-        assert_eq!(recalled.source, "code-graph");
+        assert_eq!(
+            recalled.source, "git-worktree",
+            "source is the earliest origin actor, not the latest derivation actor"
+        );
         assert_eq!(recalled.kind, "symbol");
         assert_eq!(recalled.uri.as_deref(), Some("file:///repo/src/lib.rs"));
         assert_eq!(
             recalled.method.as_deref(),
             Some("tree-sitter/symbol-extract")
+        );
+    }
+
+    #[test]
+    fn quarantine_is_scoped_to_local_memory_provider_and_kind() {
+        let quarantined = std::collections::HashSet::from(["shared-id".to_string()]);
+        let mut local = frame(
+            "shared-id",
+            ocp_types::FrameKind::Memory,
+            "local",
+            "local memory",
+        );
+        assert!(is_quarantined_local_memory(&local, &quarantined));
+
+        local.provider = "external-graph".into();
+        assert!(
+            !is_quarantined_local_memory(&local, &quarantined),
+            "an external provider may reuse a local id"
+        );
+        local.provider = "workspace-memory".into();
+        local.kind = "symbol".into();
+        assert!(
+            !is_quarantined_local_memory(&local, &quarantined),
+            "only actual local memory frames participate in memory quarantine"
+        );
+    }
+
+    #[tokio::test]
+    async fn ab_control_suppresses_skills_before_any_recall_section_is_built() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join(".stella/skills/reviewer");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: reviewer\ndescription: database review\n---\nALWAYS_REVIEW_DATABASES",
+        )
+        .unwrap();
+        let mut memory = SessionMemory::open_with_workspace_skills(dir.path(), false, true)
+            .expect("session memory");
+        memory.ab_suppressed = true;
+
+        assert!(
+            memory.recall_block("review the database").await.is_none(),
+            "a control turn must suppress skills as well as context frames"
         );
     }
 
@@ -1289,7 +1290,8 @@ mod tests {
                 & 0o777
         };
         assert_eq!(mode(&dot), 0o777, "mixed project directory is untouched");
-        assert_eq!(mode(&dot.join("context.db")), 0o600);
+        assert_eq!(mode(&dot.join("private")), 0o700);
+        assert_eq!(mode(&dot.join("private/context.db")), 0o600);
     }
 
     #[cfg(unix)]
@@ -1304,7 +1306,8 @@ mod tests {
         let external = ContextStore::open(&target).unwrap();
         drop(external);
         let before = std::fs::read(&target).unwrap();
-        symlink(&target, dot.join("context.db")).unwrap();
+        std::fs::create_dir_all(dot.join("private")).unwrap();
+        symlink(&target, dot.join("private/context.db")).unwrap();
 
         assert!(SessionMemory::open(dir.path(), false).is_none());
         assert_eq!(std::fs::read(&target).unwrap(), before);
@@ -1408,7 +1411,7 @@ mod tests {
 
     /// End-to-end proof that the self-improvement write path works: a
     /// reflection model call returning lessons must land them in BOTH the
-    /// mining log (`.stella/reflections.jsonl`) and the recallable context
+    /// mining log (`.stella/private/reflections.jsonl`) and the recallable context
     /// store. Uses a stub provider so the assertion is deterministic (the
     /// live model legitimately returns `[]` for trivial turns).
     #[tokio::test]
@@ -1457,11 +1460,21 @@ mod tests {
         assert!(report.model_error.is_none());
 
         // The mining log now carries the lesson, one JSON object per line.
-        let log = std::fs::read_to_string(dir.path().join(".stella/reflections.jsonl"))
+        let log = std::fs::read_to_string(dir.path().join(".stella/private/reflections.jsonl"))
             .expect("reflections.jsonl was written");
         assert!(
             log.contains("withTenantDb"),
             "the lesson reached the mining log: {log}"
         );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(&dir.path().join(".stella/private")), 0o700);
+            assert_eq!(
+                mode(&dir.path().join(".stella/private/reflections.jsonl")),
+                0o600
+            );
+        }
     }
 }
