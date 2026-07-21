@@ -77,6 +77,14 @@ impl Session {
         self.frames.recv().await
     }
 
+    /// A handle to this session's reverse-RPC registry, cloneable and `Send`.
+    /// The HTTP layer keeps one alongside the session so a POST resolve handler
+    /// can answer a reverse request without holding the (exclusively-streamed)
+    /// session itself.
+    pub fn pending(&self) -> Pending {
+        self.pending.clone()
+    }
+
     /// Answer a [`ServerFrame::ToolRequest`] with the host-run tool output.
     pub fn resolve_tool(&self, request_id: &str, output: ToolOutput) -> Result<(), ServeError> {
         self.pending.resolve_tool(request_id, output)

@@ -27,8 +27,10 @@
 
 mod error;
 mod frame;
+mod http;
 mod pending;
 mod remote;
+mod server;
 mod session;
 
 pub use error::ServeError;
@@ -37,4 +39,5 @@ pub use frame::{
     TurnOutcomeWire,
 };
 pub use pending::Pending;
+pub use server::{ServeConfig, serve};
 pub use session::{Session, SessionSpec};
