@@ -319,9 +319,8 @@ fn step_usage_accumulates_tokens_and_file_change_fills_ledger() {
     w.apply_inbound(&ev(
         "lead",
         AgentEvent::StepUsage {
-            step: 1,
-            purpose: None,
             output_text: None,
+            step: 1,
             model: "glm-5.2".into(),
             input_tokens: 1200,
             output_tokens: 300,
@@ -401,9 +400,8 @@ fn context_tokens_track_the_latest_window_not_the_cumulative_input() {
     let mut w = WorkspaceModel::new();
     w.apply_inbound(&reg("lead"));
     let step = |input: u64| AgentEvent::StepUsage {
-        step: 1,
-        purpose: None,
         output_text: None,
+        step: 1,
         model: "glm-5.2".into(),
         input_tokens: input,
         output_tokens: 10,
@@ -431,9 +429,8 @@ fn context_tokens_track_the_latest_window_not_the_cumulative_input() {
 #[test]
 fn budget_tick_sets_live_spend_without_double_counting_step_usage() {
     let step = |cost_usd: f64| AgentEvent::StepUsage {
-        step: 1,
-        purpose: None,
         output_text: None,
+        step: 1,
         model: "m".into(),
         input_tokens: 1,
         output_tokens: 1,

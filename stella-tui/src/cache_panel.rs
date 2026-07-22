@@ -335,9 +335,10 @@ mod tests {
 
     fn step_usage_full(input: u64, cached: u64, write: u64) -> AgentEvent {
         AgentEvent::StepUsage {
-            step: 1,
-            purpose: None,
             output_text: None,
+            step: 1,
+            role: stella_protocol::event::ModelCallRole::Worker,
+            provider: "zai".into(),
             model: "glm".into(),
             input_tokens: input,
             output_tokens: 0,

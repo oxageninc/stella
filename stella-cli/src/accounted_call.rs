@@ -66,7 +66,7 @@ pub(crate) async fn complete_standalone(
             estimated_input_tokens: 0,
         },
         &mut budget,
-        &tx,
+        &stella_core::EventSender::new(tx.clone()),
         &TokioSleeper,
     )
     .await;

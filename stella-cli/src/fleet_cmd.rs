@@ -45,6 +45,7 @@ use stella_fleet::{
     WatchConfig, WorkerControls, WorkerOutcome, WorktreeManager,
 };
 use stella_protocol::{AgentEvent, CompletionMessage, PrStatus};
+use stella_tools::ToolRegistry;
 use stella_tools::hook_runner::ShellHookRunner;
 use tokio::sync::{mpsc, watch};
 
@@ -511,6 +512,7 @@ async fn run_task(
         crate::OutputFormat::Json,
         execution.clone(),
         cfg.provider.id.to_string(),
+        false,
     );
 
     // The task's control lines (stella-fleet's `WorkerControls`). The stop
@@ -936,8 +938,10 @@ mod tests {
             crate::OutputFormat::Json,
             execution.clone(),
             "anthropic".into(),
+            false,
         );
         tx.send(AgentEvent::StepUsage {
+            output_text: None,
             step: 0,
             role: stella_protocol::ModelCallRole::Worker,
             provider: "anthropic".into(),

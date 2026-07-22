@@ -98,6 +98,7 @@ fn full_deck_frame_grows_a_third_statline_row_for_a_diagnosed_agent() {
         model.apply_inbound(&Inbound::Event {
             agent: "lead".into(),
             event: AgentEvent::StepUsage {
+                output_text: None,
                 step,
                 role: stella_protocol::event::ModelCallRole::Worker,
                 provider: "anthropic".into(),
@@ -339,6 +340,7 @@ fn statline_keeps_the_context_meter_on_a_narrow_terminal() {
 /// that feeds the CACHE cell.
 fn step_usage(input: u64, cached: u64) -> AgentEvent {
     AgentEvent::StepUsage {
+        output_text: None,
         step: 1,
         role: stella_protocol::ModelCallRole::Worker,
         provider: "test".into(),

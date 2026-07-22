@@ -307,8 +307,22 @@ pub(crate) fn workspace_ports(
     // The candidate registry mirrors the session's custom tool surface —
     // discovered from the same root, so a candidate sees exactly the custom
     // tools the session does (re-rooted at its snapshot at create time).
-    let custom_tools =
-        custom_tool_report_for_scopes(&root, cfg.authority.project_custom_tools_allowed).tools;
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let custom_tools = stella_tools::custom::discover_in_scopes(
+        &root,
+        home.as_deref(),
+        cfg.authority.project_custom_tools_allowed,
+    )
+    .tools;
+    let mut candidate_workspaces = crate::candidate_ws::GitCandidateWorkspaces::new(
+        root.clone(),
+        registry_options,
+        custom_tools,
+        active_rules,
+    );
+    if let Some(mcp) = &mcp {
+        candidate_workspaces = candidate_workspaces.with_candidate_mcp(Arc::clone(mcp));
+    }
     Ok(WorkspacePorts {
         repo_structure: GitRepoStructure { root: root.clone() },
         repo_status: GitRepoStatus { root: root.clone() },

@@ -6,10 +6,10 @@ use stella_protocol::{
     AgentEvent, CompletionRequest, CompletionResult, ModelCallRole, Provider, ProviderError,
     UsageIncompleteReason,
 };
-use tokio::sync::mpsc::UnboundedSender;
 use tokio::time::timeout;
 
 use crate::budget::{BudgetGuard, BudgetOutcome};
+use crate::event_sender::EventSender;
 use crate::retry::{RetryPolicy, Sleeper, retry_with_backoff_observed};
 
 pub struct AccountedCall<'a> {
@@ -34,7 +34,7 @@ pub enum AccountedCallError {
 pub async fn run_accounted_call(
     call: AccountedCall<'_>,
     budget: &mut BudgetGuard,
-    events: &UnboundedSender<AgentEvent>,
+    events: &EventSender,
     sleeper: &dyn Sleeper,
 ) -> Result<CompletionResult, AccountedCallError> {
     let started = Instant::now();
@@ -79,6 +79,11 @@ pub async fn run_accounted_call(
         step: 0,
         role: call.role,
         provider: provider.to_string(),
+        // Every role routed through here is a management or compaction call —
+        // none emit a separate `Text` event, so this is the only durable record
+        // of what the model actually said (the bench harness's ATIF audit trail
+        // reads it). Execute calls take the engine path and leave this `None`.
+        output_text: Some(result.text.clone()),
         model: result.model.clone(),
         input_tokens: result.usage.input_tokens,
         output_tokens: result.usage.output_tokens,
@@ -121,7 +126,7 @@ pub async fn run_accounted_call(
 
 fn emit_incomplete(
     call: &AccountedCall<'_>,
-    events: &UnboundedSender<AgentEvent>,
+    events: &EventSender,
     duration: Duration,
     retries: Option<u32>,
 ) {
@@ -211,7 +216,7 @@ mod tests {
                 estimated_input_tokens: 1,
             },
             &mut budget,
-            &tx,
+            &EventSender::new(tx),
             &NoopSleeper,
         )
         .await

@@ -285,9 +285,10 @@ async fn mini_run(tx: &mpsc::UnboundedSender<Inbound>, id: &str) {
             diff: Some("@@ -1 +1,2 @@\n-old\n+new\n+line\n".into()),
         }),
         ev(AgentEvent::StepUsage {
-            step: 1,
-            purpose: None,
             output_text: None,
+            step: 1,
+            role: ModelCallRole::Worker,
+            provider: "zai".into(),
             model: "glm-5.2".into(),
             input_tokens: 4_000,
             output_tokens: 260,

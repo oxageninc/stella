@@ -43,15 +43,17 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+
 use stella_core::hooks::{HookRunner, Hooks};
 use stella_core::retry::{RetryPolicy, Sleeper};
 use stella_core::router::FallbackInfo;
 use stella_core::{BudgetGuard, Engine, EngineConfig, EventSender, Router, TurnOutcome};
 use stella_protocol::{
-    AgentEvent, CompletionMessage, ContextFrameRef, JudgeEvidence, ModelRef, Provider,
-    ProviderShare, Role, StageKind,
+    AgentEvent, CompletionMessage, ContextFrameRef, JudgeEvidence, ModelCallRole, ModelRef,
+    Provider, ProviderShare, Role, StageKind,
 };
-use tokio::time::timeout;
 
 use crate::candidate::{
     CandidateScore, CandidateSummary, score_from_verification, select_best_candidate,
@@ -75,7 +77,7 @@ use crate::witness::{
     validate_witness_identity, validate_witness_invocation, witness_identity_matches,
     witness_prompt, witness_repair_prompt,
 };
-mod accounting;
+mod raw_usage;
 mod run_error;
 mod stage_budget;
 mod task5;
@@ -652,36 +654,24 @@ impl<'a> Pipeline<'a> {
             self.emit_fallback(fb);
         }
 
-        let messages = vec![CompletionMessage::user(triage_prompt(goal))];
-        // Deterministic policy (L-M4: max_retries = 0). The latency ceiling is
-        // a classification deadline, not a billing cancellation: a late paid
-        // call is awaited and metered, but its answer is ignored. This avoids
-        // undercounting a request canceled after it began generating.
-        let call = self.complete_once(
-            resolved.provider,
-            "triage",
-            messages,
-            RetryPolicy::deterministic(),
-            &self.config.role_overrides.triage,
-        );
-        tokio::pin!(call);
-        let model_class = match timeout(self.config.triage_latency_ceiling, &mut call).await {
-            Ok(Ok(result)) => {
-                *total += result.cost_usd;
-                let model_class = classify_triage_response(&result.text);
-                self.record_and_tick(budget, result.cost_usd)?;
-                model_class
-            }
-            Ok(Err(_)) => None,
-            Err(_) => {
-                // Preserve exact usage but deliberately ignore a response that
-                // missed the decision deadline.
-                if let Ok(result) = call.await {
-                    *total += result.cost_usd;
-                    self.record_and_tick(budget, result.cost_usd)?;
-                }
-                None
-            }
+        let model_class = match self
+            .metered_raw_call(
+                RawCall {
+                    role: ModelCallRole::Triage,
+                    resolved: &resolved,
+                    messages: vec![CompletionMessage::user(triage_prompt(goal))],
+                    policy: RetryPolicy::deterministic(),
+                    overrides: &self.config.role_overrides.triage,
+                    timeout: Some(self.config.triage_latency_ceiling),
+                },
+                budget,
+                total,
+            )
+            .await
+        {
+            Ok(result) => classify_triage_response(&result.text),
+            Err(RawCallError::Budget(abort)) => return Err(abort),
+            Err(RawCallError::Provider | RawCallError::Timeout) => None,
         };
         Ok(resolve_task_class(model_class, goal))
     }
@@ -715,12 +705,17 @@ impl<'a> Pipeline<'a> {
         // Plan rides the worker's settings (same router tier, same tuning).
         let worker_overrides = RoleCallOverrides::default();
         let result = match self
-            .complete_once(
-                resolved.provider,
-                "plan",
-                vec![CompletionMessage::user(prompt)],
-                RetryPolicy::standard(),
-                &worker_overrides,
+            .metered_raw_call(
+                RawCall {
+                    role: ModelCallRole::Plan,
+                    resolved: &resolved,
+                    messages: vec![CompletionMessage::user(prompt)],
+                    policy: RetryPolicy::standard(),
+                    overrides: &worker_overrides,
+                    timeout: None,
+                },
+                budget,
+                total,
             )
             .await
         {
@@ -728,28 +723,31 @@ impl<'a> Pipeline<'a> {
             Err(RawCallError::Budget(abort)) => return Err(abort),
             Err(RawCallError::Provider | RawCallError::Timeout) => return Ok(fallback_plan()),
         };
-        *total += result.cost_usd;
-        self.record_and_tick(budget, result.cost_usd)?;
 
         if let Some(steps) = parse_plan(&result.text) {
             return Ok(steps);
         }
 
         // One bounded JSON-repair retry (L-V2), deterministic (no retry-hang).
-        if let Ok(repair) = self
-            .complete_once(
-                resolved.provider,
-                "plan_repair",
-                vec![CompletionMessage::user(plan_repair_prompt(&result.text))],
-                RetryPolicy::deterministic(),
-                &worker_overrides,
+        match self
+            .metered_raw_call(
+                RawCall {
+                    role: ModelCallRole::PlanRepair,
+                    resolved: &resolved,
+                    messages: vec![CompletionMessage::user(plan_repair_prompt(&result.text))],
+                    policy: RetryPolicy::deterministic(),
+                    overrides: &worker_overrides,
+                    timeout: None,
+                },
+                budget,
+                total,
             )
             .await
         {
-            *total += repair.cost_usd;
-            self.record_and_tick(budget, repair.cost_usd)?;
-            if let Some(steps) = parse_plan(&repair.text) {
-                return Ok(steps);
+            Ok(repair) => {
+                if let Some(steps) = parse_plan(&repair.text) {
+                    return Ok(steps);
+                }
             }
             Err(RawCallError::Budget(abort)) => return Err(abort),
             Err(RawCallError::Provider | RawCallError::Timeout) => {}
@@ -1589,18 +1587,21 @@ impl<'a> Pipeline<'a> {
         });
         let prompt = guidance_prompt(goal, diff, evidence_summary);
         match self
-            .complete_once(
-                resolved.provider,
-                "guidance",
-                vec![CompletionMessage::user(prompt)],
-                RetryPolicy::deterministic(),
-                &self.config.role_overrides.judge,
+            .metered_raw_call(
+                RawCall {
+                    role: ModelCallRole::DistressGuidance,
+                    resolved: &resolved,
+                    messages: vec![CompletionMessage::user(prompt)],
+                    policy: RetryPolicy::deterministic(),
+                    overrides: &self.config.role_overrides.judge,
+                    timeout: None,
+                },
+                budget,
+                total,
             )
             .await
         {
             Ok(result) => {
-                *total += result.cost_usd;
-                self.record_and_tick(budget, result.cost_usd)?;
                 let text = result.text.trim().to_string();
                 if text.is_empty() {
                     Ok(None)
@@ -1638,19 +1639,23 @@ impl<'a> Pipeline<'a> {
         // Deterministic policy: a judge call that fails must not hang; it falls
         // back to the heuristic verdict rather than retrying.
         match self
-            .complete_once(
-                resolved.provider,
-                "judge",
-                vec![CompletionMessage::user(prompt)],
-                RetryPolicy::deterministic(),
-                &self.config.role_overrides.judge,
+            .metered_raw_call(
+                RawCall {
+                    role: ModelCallRole::Judge,
+                    resolved: &resolved,
+                    messages: vec![CompletionMessage::user(prompt)],
+                    policy: RetryPolicy::deterministic(),
+                    overrides: &self.config.role_overrides.judge,
+                    timeout: None,
+                },
+                budget,
+                total,
             )
             .await
         {
             Ok(result) => {
                 let verdict = parse_judge_response(&result.text)
                     .unwrap_or_else(|| heuristic_fallback(inputs));
-                self.record_and_tick(budget, result.cost_usd)?;
                 Ok(verdict)
             }
             Err(RawCallError::Budget(abort)) => Err(abort),
@@ -1680,6 +1685,52 @@ impl<'a> Pipeline<'a> {
             provider,
             fallback: decision.fallback,
         })
+    }
+
+    /// Run one engine turn, forwarding every event to the consumer **live**
+    /// (a concurrent drain task, not a post-hoc flush — an execute turn can
+    /// run tool loops for minutes, and buffering froze the renderer for the
+    /// whole turn) **except** the engine's `Stage`/`Complete` (the pipeline
+    /// owns those), tallying `FileChange`s into `file_changes` for the
+    /// zero-diff guard.
+    async fn run_engine_turn(
+        &self,
+        engine: &Engine<'_>,
+        messages: &mut Vec<CompletionMessage>,
+        budget: &mut BudgetGuard,
+        file_changes: &mut u32,
+    ) -> TurnOutcome {
+        // The filtered sender is SYNCHRONOUS on purpose: when the outer
+        // sender carries a durability boundary, a paid StepUsage cannot
+        // return to the engine before append+flush completes. Draining a
+        // channel from a spawned forwarder instead would let the engine make
+        // another paid call before the previous one's metering row is durable.
+        let seen_file_changes = Arc::new(AtomicU32::new(0));
+        let count = seen_file_changes.clone();
+        let consumer = self.events.clone();
+        let filtered = EventSender::from_fn(move |event| {
+            match &event {
+                // The pipeline is the sole authority for stage boundaries and
+                // the terminal event of an outcome-producing run — drop the
+                // engine's per-turn copies.
+                AgentEvent::Stage { .. } | AgentEvent::Complete { .. } => Ok(()),
+                AgentEvent::FileChange { kind, .. } => {
+                    // Reads ride the same event for the files panel but are
+                    // not changes — counting them would defeat the zero-diff
+                    // guard on read-only turns.
+                    if kind.is_mutation() {
+                        count.fetch_add(1, Ordering::Relaxed);
+                    }
+                    consumer.send(event)
+                }
+                _ => consumer.send(event),
+            }
+        });
+        let outcome = engine
+            .run_turn_with_sender(messages, budget, &filtered)
+            .await;
+        *file_changes += seen_file_changes.load(Ordering::Relaxed);
+        outcome
     }
 
     /// The real added-line count of an untracked file, via a no-index diff
@@ -1797,23 +1848,6 @@ impl<'a> Pipeline<'a> {
             message,
             retryable: true,
         });
-    }
-
-    /// Adapt mainline's stage-budget helper to the ordered EventSender seam.
-    /// The helper remains the single policy implementation; draining its
-    /// short-lived channel synchronously preserves event order and durability.
-    fn record_and_tick(
-        &self,
-        budget: &mut BudgetGuard,
-        cost_usd: f64,
-    ) -> Result<(), PipelineBudgetAbort> {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let outcome = stage_budget::record_and_tick(budget, cost_usd, &tx);
-        drop(tx);
-        while let Ok(event) = rx.try_recv() {
-            self.emit(event);
-        }
-        outcome
     }
 
     fn aborted_before_execute(

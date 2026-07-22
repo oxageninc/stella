@@ -111,9 +111,6 @@ use crate::subsession::{self, SubSessions, SupervisorMsg};
 use authoring::handle_agent_create;
 pub(crate) use forwarder::spawn_forwarder;
 
-mod forwarder;
-pub(crate) use forwarder::spawn_forwarder;
-
 /// The lead agent's id — the one conversation this driver runs.
 const LEAD: &str = "lead";
 

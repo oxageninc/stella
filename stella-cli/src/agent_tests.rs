@@ -52,9 +52,10 @@ fn persist_event_records_cache_write_tokens_from_step_usage() {
         .begin_execution("run", "prompt", "anthropic", "claude-fable-5")
         .expect("begin execution");
     let event = AgentEvent::StepUsage {
-        step: 0,
-        purpose: None,
         output_text: None,
+        step: 0,
+        role: stella_protocol::ModelCallRole::Worker,
+        provider: "anthropic".into(),
         model: "claude-fable-5".into(),
         input_tokens: 1_000,
         output_tokens: 50,
@@ -730,7 +731,7 @@ fn non_tty_text_run_wiring_stays_headless_and_json_run_wiring_never_bypasses_sco
     // config must stay headless.
     let text_capability = approval_capability_for(true, false, false);
     let text_config =
-        pipeline_config_for_approval_capability(&cfg, text_capability, &model_ref, None);
+        pipeline_config_for_approval_capability(&cfg, text_capability, None, &model_ref);
     assert_ne!(
         text_capability,
         PipelineApprovalCapability::Stdio,
@@ -746,7 +747,7 @@ fn non_tty_text_run_wiring_stays_headless_and_json_run_wiring_never_bypasses_sco
     // review; JSON has nowhere to render a prompt regardless of TTY state.
     let json_capability = approval_capability_for(false, true, true);
     let json_config =
-        pipeline_config_for_approval_capability(&cfg, json_capability, &model_ref, None);
+        pipeline_config_for_approval_capability(&cfg, json_capability, None, &model_ref);
     assert!(json_config.headless);
     assert!(
         !json_config.headless_bypass_scope_review,
@@ -1011,6 +1012,7 @@ fn reflection_json_preserves_full_paid_call_envelope_and_cost() {
         model_error: None,
         cost_usd: 0.0042,
         events: vec![AgentEvent::StepUsage {
+            output_text: None,
             step: 0,
             role: stella_protocol::ModelCallRole::Reflection,
             provider: "anthropic".into(),

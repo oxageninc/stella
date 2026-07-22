@@ -828,9 +828,10 @@ mod tests {
                 reason: "x".into(),
             },
             AgentEvent::StepUsage {
-                step: 0,
-                purpose: None,
                 output_text: None,
+                step: 0,
+                role: stella_protocol::ModelCallRole::Worker,
+                provider: "test".into(),
                 model: "m".into(),
                 input_tokens: 1,
                 output_tokens: 1,

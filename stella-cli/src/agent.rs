@@ -31,7 +31,7 @@ use stella_pipeline::{
 };
 use stella_protocol::event::BudgetMode;
 use stella_protocol::{AgentEvent, CompletionMessage, ModelRef, Role, ToolOutput};
-use stella_store::Store;
+use stella_store::{Store, TelemetryRow};
 use stella_tools::ToolRegistry;
 use stella_tools::custom::{self, CustomTool, CustomToolSet};
 use stella_tools::hook_runner::ShellHookRunner;
@@ -42,7 +42,9 @@ use crate::OutputFormat;
 use crate::config::Config;
 use crate::domains::{Domains, heuristic_domains, infer_domains};
 use crate::interactive::{InteractiveToolSet, SkillRegistry, default_ask_io};
-use crate::memory::{SessionMemory, inject_recall_block, turn_warrants_reflection};
+use crate::memory::{
+    ReflectionReport, SessionMemory, inject_recall_block, turn_warrants_reflection,
+};
 use crate::runtime::{SystemClock, TokioSleeper};
 use crate::tui;
 use stella_context::EpisodeOutcome;
@@ -52,8 +54,8 @@ mod goal;
 mod graph;
 mod outcome;
 mod output;
+mod persistence;
 mod prompt;
-mod telemetry;
 mod tools;
 
 pub(crate) use engine::*;
@@ -68,8 +70,10 @@ use outcome::{
 };
 pub(crate) use outcome::{pipeline_execution_closeout, settled_cost_since};
 use output::*;
+pub(crate) use persistence::{
+    persist_event, record_execution_end, spawn_renderer, warn_store_write_failed,
+};
 pub(crate) use prompt::*;
-pub(crate) use telemetry::{persist_event, record_execution_end, warn_store_write_failed};
 pub(crate) use tools::*;
 
 /// Construct the native tool registry without consulting optional host/user backends when the
@@ -336,6 +340,7 @@ async fn run_pipeline_one_shot(
     // explicitly opt out with `STELLA_DISABLE_REFLECTION` when it must avoid a
     // post-turn provider call (for example, a benchmark adapter that meters
     // only the task-solving envelope).
+    let mut reflection_report = ReflectionReport::default();
     if one_shot_reflection_enabled(format)
         && (turn_warrants_reflection(&messages) || !files.is_empty())
         && let Some(m) = &mut memory
@@ -921,6 +926,62 @@ pub(crate) async fn record_turn_episode(
     .await;
 }
 
+/// Surface a post-turn [`ReflectionReport`] for human text output. Machine
+/// streams route reflection events through their execution renderer so
+/// `Complete` remains the unique final frame; this helper never writes a
+/// second, unframed stdout sequence after that terminal barrier.
+pub(crate) fn surface_reflection(report: &ReflectionReport, format: OutputFormat) {
+    if format == OutputFormat::Text {
+        for event in &report.events {
+            match event {
+                AgentEvent::StepUsage {
+                    role,
+                    provider,
+                    model,
+                    input_tokens,
+                    output_tokens,
+                    cost_usd,
+                    retries,
+                    complete,
+                    ..
+                } => eprintln!(
+                    "  {} {:?} {provider}/{model}: {input_tokens} in, {output_tokens} out, \
+                     ${cost_usd:.4}, {retries} retries, complete={complete}",
+                    "✦".magenta(),
+                    role
+                ),
+                AgentEvent::UsageIncomplete {
+                    role,
+                    provider,
+                    model,
+                    reason,
+                    retries,
+                    ..
+                } => eprintln!(
+                    "  {} {:?} {provider}/{model}: usage incomplete ({reason:?}, retries={retries:?})",
+                    "!".yellow(),
+                    role
+                ),
+                _ => {}
+            }
+        }
+    }
+    if let Some(err) = &report.model_error {
+        eprintln!(
+            "  {} post-turn reflection skipped — model call failed: {err}",
+            "!".yellow()
+        );
+    }
+}
+
+fn reflection_json(report: &ReflectionReport) -> serde_json::Value {
+    serde_json::json!({
+        "recorded": report.recorded,
+        "error": report.model_error,
+        "cost_usd": report.cost_usd,
+        "events": report.events,
+    })
+}
 /// The shared init flow behind `stella init` and the `/init` chat command:
 /// infer the domain taxonomy (model-assisted when a provider is available,
 /// directory heuristic otherwise), build the code-graph index, persist
@@ -1888,96 +1949,6 @@ async fn run_turn(
         }
         TurnOutcome::Aborted { reason, .. } => Err(reason),
     }
-}
-
-/// Drain, render, and persist the engine's event stream concurrently with
-/// the engine. `ToolResult` carries only `call_id`, so the tool name is
-/// tracked here to label the result card (see `tui::render_event`'s doc for
-/// why that pair is handled inline rather than in the generic dispatcher).
-/// Persistence (when a store is open) runs for every format before
-/// rendering: each event is appended to the execution's stream (chain-of-
-/// thought `Reasoning` deltas included) and each `StepUsage` becomes a
-/// telemetry row. Store failures degrade to a single warning — rendering
-/// never stops for persistence. Returns the collected events (non-empty only
-/// in Json mode, where the caller emits one final summary object).
-fn spawn_renderer(
-    mut rx: mpsc::UnboundedReceiver<AgentEvent>,
-    format: OutputFormat,
-    execution: Option<(Arc<Store>, i64)>,
-    provider_id: String,
-    durable_pre_persisted: bool,
-) -> tokio::task::JoinHandle<Vec<AgentEvent>> {
-    tokio::spawn(async move {
-        let mut tool_names: HashMap<String, String> = HashMap::new();
-        let mut collected: Vec<AgentEvent> = Vec::new();
-        let mut seq = 0u64;
-        let mut store_warned = false;
-        while let Some(event) = rx.recv().await {
-            // `TextDelta` previews never reach the store: the authoritative
-            // `Text` event carries the full step text into the audit record,
-            // and one SQLite insert per token would stall this drain loop.
-            let preview = matches!(event, AgentEvent::TextDelta { .. });
-            if let Some((store, id)) = &execution
-                && !preview
-            {
-                if !persist_event(store, *id, seq, &event, &provider_id) && !store_warned {
-                    eprintln!(
-                        "  {} store write failed — telemetry for this execution is incomplete",
-                        "⚠".yellow()
-                    );
-                    store_warned = true;
-                }
-                seq += 1;
-            }
-            match format {
-                OutputFormat::StreamJson => {
-                    // One line per event — the stable machine interface.
-                    // Serialization of a protocol enum never fails; if it
-                    // somehow does, terminate before
-                    // the provider loop can spend on a later unmetered call.
-                    match serde_json::to_string(&event) {
-                        Ok(line) if durable_pre_persisted => {
-                            emit_pre_persisted_stream_json_line_or_terminate(&line)
-                        }
-                        Ok(line) => emit_stream_json_line_or_terminate(&line),
-                        Err(error) => terminate_stream_json(&format!(
-                            "stream-json serialization failed: {error}"
-                        )),
-                    }
-                }
-                OutputFormat::Json => collected.push(event),
-                OutputFormat::Text => match &event {
-                    AgentEvent::ToolStart { call } => {
-                        tool_names.insert(call.call_id.clone(), call.name.clone());
-                        tui::tool_call_card(&call.name, &call.input, "running");
-                    }
-                    AgentEvent::ToolResult {
-                        call_id,
-                        output,
-                        duration_ms,
-                        ..
-                    } => {
-                        let name = tool_names
-                            .get(call_id)
-                            .map(String::as_str)
-                            .unwrap_or("tool");
-                        let content = match output {
-                            ToolOutput::Ok { content } => content.clone(),
-                            ToolOutput::Error { message } => message.clone(),
-                        };
-                        tui::tool_result_card(
-                            name,
-                            &content,
-                            output.is_error(),
-                            Duration::from_millis(*duration_ms),
-                        );
-                    }
-                    other => tui::render_event(other),
-                },
-            }
-        }
-        collected
-    })
 }
 
 fn print_help() {

@@ -8,11 +8,16 @@ pub(crate) struct RendererOutcome {
     pub(crate) persistence_complete: bool,
 }
 
+/// `durable_pre_persisted` is set when [`super::output::event_sender_for_run`]
+/// already appended every event to Harbor's durable JSONL sink before admitting
+/// it here. The line then only needs publishing to stdout — re-appending would
+/// double the evidence record the benchmark harness audits.
 pub(crate) fn spawn_renderer(
     mut rx: mpsc::UnboundedReceiver<AgentEvent>,
     format: OutputFormat,
     execution: Option<(Arc<Store>, i64)>,
     provider_id: String,
+    durable_pre_persisted: bool,
 ) -> tokio::task::JoinHandle<RendererOutcome> {
     tokio::spawn(async move {
         let mut tool_names: HashMap<String, String> = HashMap::new();
@@ -49,10 +54,11 @@ pub(crate) fn spawn_renderer(
                 seq += 1;
             }
             match format {
-                OutputFormat::StreamJson => match serde_json::to_string(&event) {
-                    Ok(line) => println!("{line}"),
-                    Err(e) => eprintln!("{{\"type\":\"error\",\"message\":\"serialize: {e}\"}}"),
-                },
+                // One line per event — the stable machine interface.
+                // Serialization of a protocol enum never fails; if it somehow
+                // does, terminate before the provider loop can spend on a
+                // later unmetered call.
+                OutputFormat::StreamJson => emit_stream_json(&event, durable_pre_persisted),
                 OutputFormat::Json => outcome.events.push(event),
                 OutputFormat::Text => match &event {
                     AgentEvent::ToolStart { call } => {
@@ -93,12 +99,23 @@ pub(crate) fn spawn_renderer(
             {
                 outcome.persistence_complete = false;
             }
-            if let Ok(line) = serde_json::to_string(&event) {
-                println!("{line}");
-            }
+            emit_stream_json(&event, durable_pre_persisted);
         }
         outcome
     })
+}
+
+/// Publish one stream-json line, honoring Harbor's durable sink. Failures are
+/// terminal rather than a warning: a benchmark run whose evidence file is
+/// incomplete must not keep spending on later calls.
+fn emit_stream_json(event: &AgentEvent, durable_pre_persisted: bool) {
+    match serde_json::to_string(event) {
+        Ok(line) if durable_pre_persisted => {
+            emit_pre_persisted_stream_json_line_or_terminate(&line)
+        }
+        Ok(line) => emit_stream_json_line_or_terminate(&line),
+        Err(error) => terminate_stream_json(&format!("stream-json serialization failed: {error}")),
+    }
 }
 
 fn defer_stream_terminal(
@@ -336,6 +353,7 @@ mod stream_tests {
             OutputFormat::StreamJson,
             Some((store.clone(), execution_id)),
             "anthropic".into(),
+            false,
         );
         tx.send(AgentEvent::Complete {
             model: "worker".into(),
