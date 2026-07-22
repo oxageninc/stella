@@ -457,7 +457,7 @@ mod tests {
             agent: "lead".into(),
             event: AgentEvent::StepUsage {
                 step: 1,
-                role: stella_protocol::ModelCallRole::Worker,
+                role: stella_protocol::event::ModelCallRole::Worker,
                 provider: "anthropic".into(),
                 model: "claude".into(),
                 input_tokens: 1_000,

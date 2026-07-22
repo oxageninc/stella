@@ -210,6 +210,9 @@ async fn run_pipeline_one_shot(
             std::io::stdin().is_terminal(),
             std::io::stdout().is_terminal(),
         );
+        // `--test-command` arms the deterministic verify ladder: the
+        // fail→pass flip oracle and SubmitFast/Revise decisions all key off
+        // it. Left unset, every verification escalates to the model judge.
         let mut pipeline_config = pipeline_config_for_approval_capability(
             cfg,
             approval_capability,

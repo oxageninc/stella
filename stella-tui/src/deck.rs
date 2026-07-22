@@ -1019,5 +1019,4 @@ fn snip(text: &str) -> String {
 }
 
 #[cfg(test)]
-#[path = "deck/model_tests.rs"]
 mod tests;

@@ -45,6 +45,7 @@ pub(crate) fn cache_insight_for(
         return None;
     };
     let usage = CompletionUsage {
+        reported: *complete,
         input_tokens: *input_tokens,
         output_tokens: *output_tokens,
         cached_input_tokens: *cached_input_tokens,
@@ -71,8 +72,8 @@ mod tests {
     fn step_usage(model: &str, input: u64, cached: u64, write: u64) -> AgentEvent {
         AgentEvent::StepUsage {
             step: 1,
-            role: stella_protocol::ModelCallRole::Worker,
-            provider: "anthropic".into(),
+            role: stella_protocol::event::ModelCallRole::Worker,
+            provider: "test".into(),
             model: model.to_string(),
             input_tokens: input,
             output_tokens: 0,

@@ -1467,6 +1467,4 @@ fn render_help(ui: &mut DeckUi, area: Rect, buf: &mut Buffer) {
 }
 
 #[cfg(test)]
-#[allow(clippy::field_reassign_with_default)]
-#[path = "deck/render_tests.rs"]
 mod tests;
