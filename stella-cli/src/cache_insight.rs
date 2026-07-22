@@ -38,12 +38,14 @@ pub(crate) fn cache_insight_for(
         output_tokens,
         cached_input_tokens,
         cache_write_tokens,
+        complete,
         ..
     } = event
     else {
         return None;
     };
     let usage = CompletionUsage {
+        reported: *complete,
         input_tokens: *input_tokens,
         output_tokens: *output_tokens,
         cached_input_tokens: *cached_input_tokens,
@@ -81,6 +83,7 @@ mod tests {
             duration_ms: 1,
             retries: 0,
             tool_calls: 0,
+            complete: true,
         }
     }
 

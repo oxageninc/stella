@@ -13,17 +13,15 @@
 //!
 //! # Deferred-flush events (L-E10)
 //!
-//! [`crate::retry::retry_with_backoff`] already implements the contract:
-//! on success it returns the *full* retry history (so a step that failed
-//! twice then succeeded still reports two `Retry` events — the attempts
-//! were real, they just didn't fail the step); on failure it returns only
-//! the terminal error. `run_turn` emits events straight from that outcome,
-//! so a step that never commits emits nothing about its doomed attempts —
-//! there is nothing extra to build here, the discipline is inherited.
+//! [`crate::retry::retry_with_backoff_observed`] returns committed retry
+//! history while synchronously exposing each failed provider attempt to the
+//! accounting path. Ordinary retry narration stays deferred until success;
+//! content-free `UsageIncomplete` envelopes are durable immediately because
+//! a later successful attempt cannot recover the failed call's usage.
 //!
 //! # Retry never re-executes a tool call
 //!
-//! [`crate::retry::retry_with_backoff`] wraps *only* the model call
+//! [`crate::retry::retry_with_backoff_observed`] wraps *only* the model call
 //! (`Provider::complete`). Tool execution happens exactly once, after a
 //! model call has already succeeded and returned tool calls to run — it is
 //! never inside the retried closure. A retried step therefore structurally
@@ -70,6 +68,7 @@ use crate::loop_detect::{LoopDetectionConfig, detect_loop};
 use crate::ports::ToolExecutor;
 use crate::retry::{RetryPolicy, Sleeper};
 use crate::speculation::{SpeculationGate, SpeculationPool, SpeculativeResult};
+use crate::{AccountedCall, AccountedCallError, run_accounted_call};
 
 mod model_call;
 
@@ -182,6 +181,7 @@ pub struct Engine<'a> {
     pub(crate) tools: &'a dyn ToolExecutor,
     pub(crate) sleeper: &'a dyn Sleeper,
     pub(crate) config: EngineConfig,
+    call_role: stella_protocol::ModelCallRole,
     /// Lifecycle hooks, off by default. Attached via [`Engine::with_hooks`]
     /// so `with_sleeper` keeps its existing signature. When `None`,
     /// no hook is ever consulted and the turn path adds zero work.
@@ -250,11 +250,19 @@ impl<'a> Engine<'a> {
             tools,
             sleeper,
             config,
+            call_role: stella_protocol::ModelCallRole::Worker,
             hooks: None,
             calibration: None,
             gate: None,
             steering: None,
         }
+    }
+
+    /// Attribute this engine's provider calls to a concrete pipeline role.
+    /// Ordinary execution defaults to [`ModelCallRole::Worker`].
+    pub fn with_call_role(mut self, role: stella_protocol::ModelCallRole) -> Self {
+        self.call_role = role;
+        self
     }
 
     /// Attach lifecycle hooks (`crate::hooks`) to an engine, opt-in. Kept a
@@ -495,11 +503,8 @@ impl<'a> Engine<'a> {
         0.0
     }
 
-    /// Replace the oldest replaceable span of the conversation with one
-    /// model-written summary message. Best-effort by contract: any failure
-    /// (no viable span, provider error, empty summary) leaves the
-    /// conversation untouched and the turn proceeds exactly as before this
-    /// mechanism existed. Returns the summarizer call's spend.
+    /// Replace the oldest viable span with a model-written summary. Failures
+    /// leave the conversation untouched. Returns the summarizer call's spend.
     async fn summarize_overflow_span(
         &self,
         step: usize,
@@ -552,8 +557,8 @@ impl<'a> Engine<'a> {
         let call_started = std::time::Instant::now();
         let result = match self.provider.complete(request).await {
             Ok(result) => result,
-            // Best-effort: a summarizer outage must never fail the turn.
-            Err(_) => return 0.0,
+            Err(AccountedCallError::Budget { result, .. }) => return result.cost_usd,
+            Err(AccountedCallError::Provider(_) | AccountedCallError::Timeout) => return 0.0,
         };
         let duration_ms = call_started.elapsed().as_millis() as u64;
         let cost_usd = result.cost_usd;
@@ -1195,7 +1200,7 @@ mod tests {
         CompletionResultAlias {
             text: text.into(),
             tool_calls: vec![],
-            usage: CompletionUsage::default(),
+            usage: CompletionUsage::reported_zero(),
             model: "scripted".into(),
             cost_usd: 0.0001,
             finish_reason: None,
@@ -1210,7 +1215,7 @@ mod tests {
                 name: name.into(),
                 input: serde_json::json!({"cmd": "echo hi"}),
             }],
-            usage: CompletionUsage::default(),
+            usage: CompletionUsage::reported_zero(),
             model: "scripted".into(),
             cost_usd: 0.0001,
             finish_reason: None,
@@ -1264,7 +1269,7 @@ mod tests {
                 Ok(CompletionResultAlias {
                     text: String::new(),
                     tool_calls: vec![self.commit.clone()],
-                    usage: CompletionUsage::default(),
+                    usage: CompletionUsage::reported_zero(),
                     model: "speculating".into(),
                     cost_usd: 0.0001,
                     finish_reason: None,
@@ -2004,6 +2009,7 @@ mod tests {
             text: String::new(),
             tool_calls: vec![],
             usage: CompletionUsage {
+                reported: true,
                 input_tokens: 100,
                 output_tokens: 8192,
                 cached_input_tokens: 0,
@@ -2320,7 +2326,7 @@ mod tests {
                     name: "bash".into(),
                     input: serde_json::json!({"cmd": format!("step {i}")}),
                 }],
-                usage: CompletionUsage::default(),
+                usage: CompletionUsage::reported_zero(),
                 model: format!("{dialect}-model"),
                 cost_usd: 0.00001,
                 finish_reason: None,
@@ -2431,7 +2437,7 @@ mod tests {
                     input: serde_json::json!({"which": *id}),
                 })
                 .collect(),
-            usage: CompletionUsage::default(),
+            usage: CompletionUsage::reported_zero(),
             model: "scripted".into(),
             cost_usd: 0.0001,
             finish_reason: None,
@@ -2646,6 +2652,7 @@ mod tests {
                 multi_call_result(calls)
             };
             result.usage = CompletionUsage {
+                reported: true,
                 input_tokens: 1000,
                 output_tokens: 50,
                 cached_input_tokens: 800,
@@ -2656,8 +2663,7 @@ mod tests {
         let provider = ScriptedProvider {
             id: "scripted".into(),
             script: TokioMutex::new(vec![
-                // Step 0 commits only after one retryable failure — its
-                // StepUsage must say retries: 1.
+                // Step 0 commits after a retry, so StepUsage must say retries: 1.
                 Err(ProviderError::RateLimited {
                     message: "429".into(),
                     retry_after_ms: Some(1),
@@ -2821,13 +2827,13 @@ mod tests {
         let with_real_usage = |result: CompletionResultAlias| {
             let mut result = result;
             result.usage = CompletionUsage {
+                reported: true,
                 input_tokens: 4_000,
                 output_tokens: 50,
                 cached_input_tokens: 0,
                 cache_write_tokens: 0,
             };
-            // Vary each call's input: `tool_call_result` reuses one command,
-            // and three byte-identical bash calls are exactly what
+            // Vary each input: three byte-identical bash calls are exactly what
             // `loop_detect` exists to abort — this test is about the
             // calibration feed, not the loop breaker.
             if let Some(call) = result.tool_calls.first_mut() {
@@ -3161,4 +3167,5 @@ mod tests {
     }
 
     mod task4;
+    mod usage_completeness;
 }

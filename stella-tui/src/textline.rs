@@ -413,7 +413,8 @@ pub fn event_line(event: &AgentEvent) -> Option<EventLine> {
         | AgentEvent::TextDelta { .. }
         | AgentEvent::Reasoning { .. }
         | AgentEvent::ToolStart { .. }
-        | AgentEvent::ToolResult { .. } => None,
+        | AgentEvent::ToolResult { .. }
+        | AgentEvent::UsageIncomplete { .. } => None,
         AgentEvent::Retry { attempt, reason } => Some(retry(*attempt, reason)),
         AgentEvent::Steered { text } => Some(steered(text)),
         AgentEvent::Compaction {
@@ -840,6 +841,7 @@ mod tests {
                 duration_ms: 1,
                 retries: 0,
                 tool_calls: 0,
+                complete: true,
             },
             AgentEvent::GoalVerdict {
                 round: 1,

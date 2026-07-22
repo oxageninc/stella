@@ -410,6 +410,7 @@ mod tests {
                 duration_ms: 100,
                 retries: 0,
                 tool_calls: 1,
+                complete: true,
             },
         });
         model.apply_inbound(&Inbound::Event {
@@ -468,6 +469,7 @@ mod tests {
                 duration_ms: 100,
                 retries: 0,
                 tool_calls: 0,
+                complete: true,
             },
         });
         model.apply_inbound(&Inbound::CacheInsight {

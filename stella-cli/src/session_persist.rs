@@ -856,6 +856,7 @@ mod tests {
                     duration_ms: 900,
                     retries: 0,
                     tool_calls: 1,
+                    complete: true,
                 },
             },
             Inbound::Event {

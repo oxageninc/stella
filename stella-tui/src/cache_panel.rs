@@ -348,6 +348,7 @@ mod tests {
             duration_ms: 1,
             retries: 0,
             tool_calls: 0,
+            complete: true,
         }
     }
 

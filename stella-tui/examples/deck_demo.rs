@@ -17,7 +17,7 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::json;
-use stella_protocol::{AgentEvent, FileChangeKind, StageKind, ToolCall, ToolOutput};
+use stella_protocol::{AgentEvent, FileChangeKind, ModelCallRole, StageKind, ToolCall, ToolOutput};
 use tokio::sync::mpsc;
 
 use stella_tui::scenario::{demo_graph, demo_inbound};
@@ -298,6 +298,7 @@ async fn mini_run(tx: &mpsc::UnboundedSender<Inbound>, id: &str) {
             duration_ms: 1_100,
             retries: 0,
             tool_calls: 1,
+            complete: true,
         }),
         ev(AgentEvent::BudgetTick {
             spent_usd: 0.008,
