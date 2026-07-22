@@ -560,11 +560,14 @@ async fn run_task(
             let router = Router::new(wiring.pins.clone(), wiring.profiles.clone(), breaker);
             // Rooted at the fleet worker's own worktree, so a candidate snapshot
             // nests off that worktree's checkout, never the primary repo's.
+            // Fleet workers don't connect MCP at all today (`tools: &claims`
+            // wraps the raw registry directly) — nothing to share, hence `None`.
             let ws_ports = agent::workspace_ports(
                 root.to_path_buf(),
                 &cfg,
                 registry_options,
                 active_rules.clone(),
+                None,
             )?;
             let recall = NoContextRecall;
             let hook_runner = ShellHookRunner;
@@ -584,6 +587,7 @@ async fn run_task(
                     .as_ref()
                     .map(|h| (h, &hook_runner as &dyn stella_core::hooks::HookRunner)),
                 candidate_workspaces: Some(&ws_ports.candidate_workspaces),
+                mcp_prefetch: None,
                 // Headless / fleet: no concurrent input channel to steer from.
                 steering: None,
             };

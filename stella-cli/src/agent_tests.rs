@@ -622,6 +622,7 @@ async fn candidate_rules_reuse_the_parent_snapshot_after_source_removal() {
         &cfg,
         stella_tools::RegistryOptions::default(),
         parent_rules.clone(),
+        None,
     )
     .unwrap();
     let candidate = ws_ports.candidate_workspaces.create().await.unwrap();
