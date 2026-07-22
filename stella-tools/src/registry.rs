@@ -1767,6 +1767,8 @@ mod tests {
                     | "ci_status"
                     | "search_issues"
                     | "task_list"
+                    | "project_overview"
+                    | "graph_query"
                     | "get_issue"
                     | "list_labels"
                     | "list_members"

@@ -47,10 +47,12 @@ impl Tool for ProjectOverview {
                           graph_query or gather_context once you know what to ask about."
                 .into(),
             input_schema: json!({ "type": "object", "properties": {} }),
-            // NOT read-only: the call runs an index catch-up pass, which
-            // writes to codegraph.db. The flag gates write concurrency, so
-            // claiming otherwise would let this race a real write.
-            read_only: false,
+            // Read-only in the sense the flag means: it mutates no
+            // workspace state, so speculative execution commutes with
+            // everything around it. The index catch-up writes only to
+            // Stella's own codegraph.db, which is invisible to the model and
+            // serialized by the store's write guard.
+            read_only: true,
         }
     }
 
