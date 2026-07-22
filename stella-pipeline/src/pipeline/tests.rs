@@ -829,7 +829,7 @@ async fn paid_headless_scope_review_error_retains_settled_cost() {
     let approvals = FixedGate(ScopeDecision::Approve);
     let sleeper = NoopSleeper;
     let router = router();
-    let (tx, _rx) = mpsc::unbounded_channel();
+    let (tx, mut rx) = mpsc::unbounded_channel();
 
     let config = PipelineConfig {
         headless: true,
@@ -871,6 +871,17 @@ async fn paid_headless_scope_review_error_retains_settled_cost() {
     assert!(
         (err.total_cost_usd - 0.0002).abs() < 1e-9,
         "triage and plan spend must survive the hard error: {err:?}"
+    );
+    // The error leaves through the `Result`, so without an explicit event the
+    // stream simply stops mid-plan. A consumer reading only events (the bench
+    // adapter, the deck) must still be told why the run ended.
+    let events = drain(&mut rx);
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Error { message, .. } if message.contains("scope review")
+        )),
+        "the headless scope stop announces itself: {events:?}"
     );
 }
 

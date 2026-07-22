@@ -800,6 +800,18 @@ impl<'a> Pipeline<'a> {
         }
 
         if self.config.headless && !self.config.headless_bypass_scope_review {
+            // Say why the run is ending. This error leaves through the
+            // `Result`, not the event stream, so without this the stream just
+            // stops mid-plan: a consumer reading only events sees a run that
+            // vanished with no terminal event and no explanation.
+            self.emit(AgentEvent::Error {
+                message: format!(
+                    "this plan needs scope review ({} steps, ~{} files) and a headless run                      has nobody to ask; set `headless_scope_bypass: on` where the working                      tree is disposable, or raise the scope thresholds",
+                    plan.len(),
+                    estimate.estimated_files
+                ),
+                retryable: false,
+            });
             return Err(PipelineError::ScopeReviewRequiredHeadless);
         }
 
