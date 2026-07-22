@@ -25,9 +25,9 @@ use stella_mcp::{McpConfig, McpServerConfig, McpToolSet};
 use stella_model::credential::ApiKey;
 use stella_model::provider::Provider;
 use stella_pipeline::{
-    AlwaysAbortGate, CmdOutcome, ContextRecallPort, NoContextRecall, Pipeline, PipelineConfig,
-    PipelinePorts, PipelineStatus, ProviderResolver, RepoStatusPort, RepoStructurePort,
-    StdioApprovalGate,
+    AlwaysAbortGate, CmdOutcome, ContextRecallPort, McpPrefetchPort, NoContextRecall, Pipeline,
+    PipelineConfig, PipelinePorts, PipelineStatus, ProviderResolver, RepoStatusPort,
+    RepoStructurePort, StdioApprovalGate,
 };
 use stella_protocol::event::BudgetMode;
 use stella_protocol::{AgentEvent, CompletionMessage, ModelRef, Role, ToolOutput};
@@ -53,6 +53,7 @@ mod engine;
 mod goal;
 mod graph;
 mod outcome;
+mod output;
 mod persistence;
 mod prompt;
 mod tools;
@@ -68,11 +69,32 @@ use outcome::{
     pipeline_status_result,
 };
 pub(crate) use outcome::{pipeline_execution_closeout, settled_cost_since};
+use output::*;
 pub(crate) use persistence::{
     persist_event, record_execution_end, spawn_renderer, warn_store_write_failed,
 };
 pub(crate) use prompt::*;
 pub(crate) use tools::*;
+
+/// Construct the native tool registry without consulting optional host/user backends when the
+/// trusted benchmark launcher seals filesystem state; ordinary sessions retain auto-detection.
+pub(crate) async fn new_tool_registry(
+    workspace_root: std::path::PathBuf,
+    options: stella_tools::RegistryOptions,
+) -> ToolRegistry {
+    if crate::settings::filesystem_settings_disabled() {
+        ToolRegistry::with_backends_and_options(workspace_root, None, None, options)
+    } else {
+        ToolRegistry::new_detected(workspace_root, options).await
+    }
+}
+
+/// Public skill-registry commands are an extension surface omitted from a filesystem-isolated
+/// tool schema; ordinary sessions retain them.
+fn skill_registry_for_run(workspace_root: std::path::PathBuf) -> Option<SkillRegistry> {
+    (!crate::settings::filesystem_settings_disabled())
+        .then(|| SkillRegistry::from_env(workspace_root))
+}
 
 /// Run a one-shot prompt. `use_pipeline` selects the staged pipeline (the
 /// default) vs the raw step-loop (`--no-pipeline`). `test_command`, when
@@ -87,6 +109,9 @@ pub async fn run_one_shot(
     use_pipeline: bool,
     test_command: Option<&str>,
 ) -> Result<(), String> {
+    // A benchmark's durable sink is part of the accounting boundary. Prove the exact mounted file
+    // is writable before provider construction or any code path that can make a paid call.
+    preflight_durable_stream(format)?;
     crate::enterprise_telemetry::authorize_one_shot(use_pipeline)?;
     if use_pipeline {
         run_pipeline_one_shot(cfg, prompt, budget_limit, format, test_command).await
@@ -108,12 +133,14 @@ async fn run_pipeline_one_shot(
     let provider = build_provider(cfg)?;
     let model_ref = ModelRef::new(cfg.provider.id, cfg.model_id.clone());
     let registry_options = registry_options(cfg);
-    let registry: Arc<ToolRegistry> = Arc::new(
-        ToolRegistry::new_detected(cfg.workspace_root.clone(), registry_options.clone()).await,
-    );
+    let registry: Arc<ToolRegistry> =
+        Arc::new(new_tool_registry(cfg.workspace_root.clone(), registry_options.clone()).await);
     populate_schema_index(&registry, &cfg.workspace_root)?;
     let active_rules =
         crate::rules::enforce_workspace_rules(&registry, &cfg.workspace_root, &cfg.authority);
+    // Auto-build + live-refresh the code graph in the background so the
+    // pipeline's localize step can reach for `graph_query` once it is ready.
+    // Status goes to stderr — stdout may be machine-readable JSON.
     let (_session_graph, _graph_build) = spawn_session_graph(
         &cfg.workspace_root,
         registry.clone(),
@@ -128,7 +155,7 @@ async fn run_pipeline_one_shot(
     )
     .await?;
     let base_tools: &dyn ToolExecutor = match &mcp {
-        Some(set) => set,
+        Some(set) => set.as_ref(),
         None => &*registry,
     };
     let custom_tools = discover_custom_tools(cfg, format == OutputFormat::Text).await;
@@ -150,8 +177,15 @@ async fn run_pipeline_one_shot(
     let mut presence = SessionPresence::announce(cfg, prompt);
     let execution = begin_execution(&store, "pipeline", prompt, cfg, Some(presence.id()));
 
-    let (tx, rx) = mpsc::unbounded_channel::<AgentEvent>();
-    let renderer = spawn_renderer(rx, format, execution.clone(), cfg.provider.id.to_string());
+    let (raw_tx, rx) = mpsc::unbounded_channel::<AgentEvent>();
+    let (tx, durable_pre_persisted) = event_sender_for_run(raw_tx, format);
+    let renderer = spawn_renderer(
+        rx,
+        format,
+        execution.clone(),
+        cfg.provider.id.to_string(),
+        durable_pre_persisted,
+    );
 
     // Role wiring from `agent_engine_config`: per-role model pins (worker/
     // triage/judge), their adapters, and per-role request overrides. Notices
@@ -188,8 +222,13 @@ async fn run_pipeline_one_shot(
             &customs,
             tx.clone(),
             default_ask_io(format == OutputFormat::Text),
-        )
-        .with_skill_registry(SkillRegistry::from_env(cfg.workspace_root.clone()));
+        );
+        let interactive = match skill_registry_for_run(cfg.workspace_root.clone()) {
+            Some(skills) => interactive.with_skill_registry(skills),
+            None => interactive,
+        };
+        // Outermost: the discovery layer (tool_search/skill_search/mcp_search)
+        // must see the complete advertised catalog below it.
         let tools =
             crate::discovery::DiscoveryToolSet::new(&interactive, cfg.workspace_root.clone())
                 .with_project_prompts_allowed(cfg.authority.project_prompts_allowed);
@@ -199,12 +238,17 @@ async fn run_pipeline_one_shot(
             cfg,
             registry_options,
             active_rules.clone(),
+            mcp.clone(),
         )?;
 
         let breaker = CircuitBreaker::new(Box::new(SystemClock::new()));
         let router = Router::new(wiring.pins.clone(), wiring.profiles.clone(), breaker);
 
         let is_text = format == OutputFormat::Text;
+        // The exact condition lives in `approval_capability_for` so it stays
+        // directly unit-testable — inlining it here is what a prior
+        // squash-merge collapsed into a bare `is_text` check, with no test to
+        // catch the regression.
         let approval_capability = approval_capability_for(
             is_text,
             std::io::stdin().is_terminal(),
@@ -251,6 +295,10 @@ async fn run_pipeline_one_shot(
                 .as_ref()
                 .map(|h| (h, &hook_runner as &dyn stella_core::hooks::HookRunner)),
             candidate_workspaces: Some(&ws_ports.candidate_workspaces),
+            mcp_prefetch: ws_ports
+                .mcp_prefetch
+                .as_ref()
+                .map(|p| p as &dyn McpPrefetchPort),
             // Headless / fleet: no concurrent input channel to steer from.
             steering: None,
         };
@@ -287,8 +335,14 @@ async fn run_pipeline_one_shot(
     // — is what makes the primary surface actually learn. The reflector is
     // then handed an enriched transcript (final answer + a note of what
     // changed) so it has signal even when the tool turns aren't in `messages`.
+    // Output format does not change Stella's learning semantics: text, JSON,
+    // and stream-JSON runs all reflect by default. Ephemeral automation may
+    // explicitly opt out with `STELLA_DISABLE_REFLECTION` when it must avoid a
+    // post-turn provider call (for example, a benchmark adapter that meters
+    // only the task-solving envelope).
     let mut reflection_report = ReflectionReport::default();
-    if (turn_warrants_reflection(&messages) || !files.is_empty())
+    if one_shot_reflection_enabled(format)
+        && (turn_warrants_reflection(&messages) || !files.is_empty())
         && let Some(m) = &mut memory
     {
         if format == OutputFormat::StreamJson {
@@ -458,7 +512,7 @@ pub async fn run_interactive(cfg: &Config, budget_limit: Option<f64>) -> Result<
     )?;
     let provider = build_provider(cfg)?;
     let registry: std::sync::Arc<ToolRegistry> = std::sync::Arc::new(
-        ToolRegistry::new_detected(cfg.workspace_root.clone(), registry_options(cfg)).await,
+        new_tool_registry(cfg.workspace_root.clone(), registry_options(cfg)).await,
     );
     let mcp = connect_mcp(
         cfg,
@@ -482,7 +536,7 @@ pub async fn run_interactive(cfg: &Config, budget_limit: Option<f64>) -> Result<
         Box::new(|| {}),
     );
     let base_tools: &dyn ToolExecutor = match &mcp {
-        Some(set) => set,
+        Some(set) => set.as_ref(),
         None => &*registry,
     };
     let custom_tools = discover_custom_tools(cfg, true).await;
@@ -1182,7 +1236,9 @@ pub(crate) enum McpPlan {
 }
 
 pub(crate) fn load_mcp_plan(cfg: &Config) -> McpPlan {
-    if crate::enterprise_telemetry::process_free_authority_active() {
+    if crate::settings::filesystem_settings_disabled()
+        || crate::enterprise_telemetry::process_free_authority_active()
+    {
         return McpPlan::None;
     }
     let path = cfg.workspace_root.join(".stella").join("mcp.toml");
@@ -1259,7 +1315,7 @@ pub(crate) async fn connect_mcp(
     native: std::sync::Arc<dyn ToolExecutor>,
     usage: Option<stella_core::mcp_usage::McpUsageLedger>,
     print_diagnostics: bool,
-) -> Result<Option<McpToolSet>, String> {
+) -> Result<Option<Arc<McpToolSet>>, String> {
     let servers = match load_mcp_plan(cfg) {
         McpPlan::None => return Ok(None),
         McpPlan::Invalid(reason) => {
@@ -1288,7 +1344,10 @@ pub(crate) async fn connect_mcp(
             );
         }
     }
-    Ok(Some(set))
+    // Arc'd so a pipeline driver can share the same connected set into the
+    // Best-of-N candidate tool surface and orchestrator pre-fetch (issue
+    // #248 Phase 1) alongside its own `&dyn ToolExecutor` borrow.
+    Ok(Some(Arc::new(set)))
 }
 
 pub(crate) async fn discover_custom_tools(
@@ -1301,16 +1360,12 @@ pub(crate) async fn discover_custom_tools(
     // The manifest walk is synchronous directory I/O — off the runtime
     // worker thread it goes (#64).
     let root = cfg.workspace_root.clone();
-    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
     let include_workspace = cfg.authority.project_custom_tools_allowed;
-    let worker_home = home.clone();
     let report = tokio::task::spawn_blocking(move || {
-        custom::discover_in_scopes(&root, worker_home.as_deref(), include_workspace)
+        custom_tool_report_for_scopes(&root, include_workspace)
     })
     .await
-    .unwrap_or_else(|_| {
-        custom::discover_in_scopes(&cfg.workspace_root, home.as_deref(), include_workspace)
-    });
+    .unwrap_or_else(|_| custom_tool_report_for_scopes(&cfg.workspace_root, include_workspace));
     if print_diagnostics {
         for diagnostic in &report.diagnostics {
             eprintln!(
@@ -1588,6 +1643,12 @@ pub(crate) fn settle_reflection_budget(report: &mut ReflectionReport, guard: &mu
 /// observability, not a work dependency: a store that won't open warns once
 /// and the session runs on without it — never a startup failure.
 pub(crate) fn open_store(workspace_root: &std::path::Path) -> Option<Arc<Store>> {
+    // Persisted telemetry can feed calibration and extension-authored rules
+    // back into later sessions. Claim-mode trials are isolated and ephemeral:
+    // do not read that state or create `.stella/store.db` in the task.
+    if crate::settings::filesystem_settings_disabled() {
+        return None;
+    }
     match Store::open(workspace_root) {
         Ok(store) => Some(Arc::new(store)),
         Err(e) => {
@@ -1733,11 +1794,11 @@ impl SessionPresence {
 
 /// Run one full turn through `stella_core::Engine`, rendering its
 /// `AgentEvent` stream live via a spawned draining task running
-/// concurrently with the engine (the channel is unbounded and `send` never
-/// blocks, so events reach the renderer as soon as an `.await` point in
-/// `run_turn` yields — same live-feeling output the old inline-print loop
-/// had, just sourced from the event stream instead of direct calls). That
-/// same drain task ([`spawn_renderer`]) also persists every event and each
+/// concurrently with the engine. Ordinary runs enqueue to an unbounded
+/// channel; benchmark stream-json runs synchronously append+flush each event
+/// before enqueueing it, so paid-call evidence survives a paused/cancelled
+/// renderer. Events still reach the renderer as soon as `run_turn` yields.
+/// The drain task ([`spawn_renderer`]) persists every event and each
 /// `StepUsage` to the workspace store when one is open. `registry` is the
 /// concrete tool registry (its CRUD ledger is read after the turn for the
 /// Files Touched panel); `base_tools` is the same registry as the engine's
@@ -1763,15 +1824,22 @@ async fn run_turn(
     let turn_start = Instant::now();
     let execution = begin_execution(store, kind, prompt, cfg, session);
 
-    let (tx, rx) = mpsc::unbounded_channel::<AgentEvent>();
-    let renderer = spawn_renderer(rx, format, execution.clone(), cfg.provider.id.to_string());
+    let (raw_tx, rx) = mpsc::unbounded_channel::<AgentEvent>();
+    let (tx, durable_pre_persisted) = event_sender_for_run(raw_tx, format);
+    let renderer = spawn_renderer(
+        rx,
+        format,
+        execution.clone(),
+        cfg.provider.id.to_string(),
+        durable_pre_persisted,
+    );
 
     // The scoped tool set must drop its tx clone before awaiting the renderer.
     let outcome = if crate::enterprise_telemetry::process_free_authority_active() {
         let engine =
             Engine::with_sleeper(provider, registry, engine_config_for(cfg), &TokioSleeper)
                 .with_calibration(calibration);
-        engine.run_turn(messages, budget, &tx).await
+        engine.run_turn_with_sender(messages, budget, &tx).await
     } else {
         let customs = CustomToolSet::new(
             base_tools,
@@ -1782,8 +1850,13 @@ async fn run_turn(
             &customs,
             tx.clone(),
             default_ask_io(format == OutputFormat::Text),
-        )
-        .with_skill_registry(SkillRegistry::from_env(cfg.workspace_root.clone()));
+        );
+        let interactive = match skill_registry_for_run(cfg.workspace_root.clone()) {
+            Some(skills) => interactive.with_skill_registry(skills),
+            None => interactive,
+        };
+        // Outermost discovery layer; the session-scoped `activated` handle
+        // keeps lean-mode activations across the per-turn stack rebuild.
         let tools =
             crate::discovery::DiscoveryToolSet::new(&interactive, cfg.workspace_root.clone())
                 .with_project_prompts_allowed(cfg.authority.project_prompts_allowed)
@@ -1795,7 +1868,7 @@ async fn run_turn(
         if let Some(hooks) = &cfg.hooks {
             engine = engine.with_hooks(hooks, &hook_runner);
         }
-        engine.run_turn(messages, budget, &tx).await
+        engine.run_turn_with_sender(messages, budget, &tx).await
     };
     // Dropping the last sender closes the channel, ending the renderer's
     // `recv()` loop; awaiting it ensures every already-queued event has

@@ -843,6 +843,7 @@ mod tests {
             Inbound::Event {
                 agent: "lead".into(),
                 event: AgentEvent::StepUsage {
+                    output_text: None,
                     step: 1,
                     role: stella_protocol::ModelCallRole::Worker,
                     provider: "z".into(),

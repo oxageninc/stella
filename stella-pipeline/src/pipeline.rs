@@ -43,15 +43,17 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+
 use stella_core::hooks::{HookRunner, Hooks};
 use stella_core::retry::{RetryPolicy, Sleeper};
 use stella_core::router::FallbackInfo;
-use stella_core::{BudgetGuard, Engine, EngineConfig, Router, TurnOutcome};
+use stella_core::{BudgetGuard, Engine, EngineConfig, EventSender, Router, TurnOutcome};
 use stella_protocol::{
     AgentEvent, CompletionMessage, ContextFrameRef, JudgeEvidence, ModelCallRole, ModelRef,
     Provider, ProviderShare, Role, StageKind,
 };
-use tokio::sync::mpsc::UnboundedSender;
 
 use crate::candidate::{
     CandidateScore, CandidateSummary, score_from_verification, select_best_candidate,
@@ -59,11 +61,12 @@ use crate::candidate::{
 use crate::plan::{PlanStep, build_planner_prompt, parse_plan, plan_repair_prompt};
 use crate::ports::{
     ApprovalGate, CandidateWorkspace, CandidateWorkspacePort, ContextRecallPort,
-    DiagnosticInvocation, DiagnosticRunner, ProviderResolver, RecalledFrame, RepoStatusPort,
-    RepoStructurePort, ScopeDecision, TestInvocation, TestRunner, WorkspaceError,
+    DiagnosticInvocation, DiagnosticRunner, McpPrefetchPort, PipelinePorts, ProviderResolver,
+    RecalledFrame, RepoStatusPort, RepoStructurePort, ScopeDecision, TestInvocation, TestRunner,
+    WorkspaceError,
 };
 use crate::scope::{ScopeEstimate, apply_trim, build_proposal, needs_scope_review};
-use crate::triage::{TaskClass, classify_triage_response, resolve_task_class, triage_prompt};
+use crate::triage::{TaskAssessment, TaskClass, parse_triage_response, resolve_task_class, triage_prompt};
 use crate::verify::{
     FlipOracle, JudgeVerdict as ModelJudgeVerdict, LadderDecision, LadderInputs,
     deterministic_fail_evidence, deterministic_pass_evidence, guidance_prompt, heuristic_fallback,
@@ -81,7 +84,7 @@ mod task5;
 use raw_usage::{RawCall, RawCallError};
 use run_error::RoleResolveError;
 pub use run_error::{PipelineError, PipelineRunError};
-use stage_budget::{PipelineBudgetAbort, aborted_before_execute, budget_abort};
+use stage_budget::{PipelineBudgetAbort, budget_abort};
 use task5::BoundHookRunner;
 /// Minimal fallback when the caller supplies no stable system prefix.
 const DEFAULT_SYSTEM_PROMPT: &str =
@@ -90,54 +93,6 @@ const DEFAULT_SYSTEM_PROMPT: &str =
 /// Small fixed system prompt for the independent witness author.
 const WITNESS_SYSTEM_PROMPT: &str = "You are a precise test author. You write minimal failing tests that pin down intended \
      behavior. You never modify production code and never fix the problem yourself.";
-
-/// The ports the pipeline orchestrates over. The `stella-cli` glue fills this
-/// with real subsystem adapters; tests fill it with scripted doubles. Grouped
-/// into one struct so [`Pipeline::new`] stays a two-argument constructor
-/// rather than a nine-parameter one.
-pub struct PipelinePorts<'a> {
-    /// Role → model resolution (`stella-core`). Held immutably; see the
-    /// module's "breaker feedback boundary" note.
-    pub router: &'a Router,
-    /// Maps a resolved [`ModelRef`] to its concrete provider adapter.
-    pub providers: &'a dyn ProviderResolver,
-    /// The tool registry the execute engine drives.
-    pub tools: &'a dyn stella_core::ToolExecutor,
-    /// Context recall at turn start (L-E8).
-    pub recall: &'a dyn ContextRecallPort,
-    /// Repo-structure summary for the planner's split context (L-E6).
-    pub repo: &'a dyn RepoStructurePort,
-    /// Untracked-file snapshots for the zero-diff guard (`git diff` can't see
-    /// untracked files; this makes new/modified untracked files visible).
-    pub repo_status: &'a dyn RepoStatusPort,
-    /// Runs closed, typed diagnostic invocations.
-    pub diagnostics: &'a dyn DiagnosticRunner,
-    /// Runs validated test invocations directly, without a shell.
-    pub tests: &'a dyn TestRunner,
-    /// The interactive scope-review gate (L-E5).
-    pub approvals: &'a dyn ApprovalGate,
-    /// The delay port for retry backoff — the same testability seam
-    /// `stella-core` uses; production passes the CLI's tokio-backed
-    /// sleeper, tests a no-op.
-    pub sleeper: &'a dyn Sleeper,
-    /// Lifecycle hooks for the execute engine — the parsed config plus the
-    /// runner that spawns hook commands (`stella_core::hooks`). `None` runs
-    /// the exact pre-hooks pipeline; the CLI passes its settings-chain hooks
-    /// so `PreToolUse` gating also covers the default `stella run` path.
-    pub hooks: Option<(&'a Hooks, &'a dyn HookRunner)>,
-    /// Candidate isolation (L-E7): one snapshot per candidate and passing-only
-    /// adoption. Also required for authored witnesses at `candidates = 1`.
-    pub candidate_workspaces: Option<&'a dyn CandidateWorkspacePort>,
-    /// Step-boundary steering for the EXECUTE engine only — mid-turn user
-    /// messages injected as the model's next observation (`stella_core`'s
-    /// `TurnSteering`). `None` on non-interactive paths (headless `run`,
-    /// fleet). Attached to execute turns alone: triage, planning, the
-    /// witness author, and the judge are autonomous sub-steps with no
-    /// user-facing "steer this" moment. The pipeline's stop remains the
-    /// caller's hard cancel — a pipeline is triage→…→judge, so a
-    /// mid-execute soft stop has no single obvious continuation.
-    pub steering: Option<&'a dyn stella_core::ports::TurnSteering>,
-}
 
 /// Per-role request overrides for the pipeline's raw completion calls
 /// (triage / judge / guidance), resolved by the caller from
@@ -175,8 +130,10 @@ pub struct PipelineConfig {
     /// Per-role request overrides (`agent_engine_config`) for the raw
     /// triage/judge completion calls.
     pub role_overrides: PipelineRoleOverrides,
-    /// Hard latency ceiling on the triage classification call (L-M4): if it
-    /// doesn't answer within this, triage falls through to the full path.
+    /// Decision latency ceiling on the triage classification call (L-M4): if
+    /// it doesn't answer within this, its eventual response is ignored and
+    /// triage falls through to the full path. The paid call is still awaited
+    /// so usage cannot disappear from accounting through cancellation.
     pub triage_latency_ceiling: Duration,
     /// Thresholds above which a plan triggers interactive scope review (L-E5).
     pub scope_thresholds: crate::scope::ScopeThresholds,
@@ -420,8 +377,9 @@ pub struct Pipeline<'a> {
     sleeper: &'a dyn Sleeper,
     hooks: Option<(&'a Hooks, &'a dyn HookRunner)>,
     candidate_workspaces: Option<&'a dyn CandidateWorkspacePort>,
+    mcp_prefetch: Option<&'a dyn McpPrefetchPort>,
     steering: Option<&'a dyn stella_core::ports::TurnSteering>,
-    events: UnboundedSender<AgentEvent>,
+    events: EventSender,
     config: PipelineConfig,
     configured_test: Result<Option<TestInvocation>, crate::witness::TestInvocationError>,
 }
@@ -430,7 +388,7 @@ impl<'a> Pipeline<'a> {
     /// Construct a pipeline over the given ports, event sink, and config.
     pub fn new(
         ports: PipelinePorts<'a>,
-        events: UnboundedSender<AgentEvent>,
+        events: impl Into<EventSender>,
         config: PipelineConfig,
     ) -> Self {
         let configured_test = config
@@ -451,11 +409,20 @@ impl<'a> Pipeline<'a> {
             sleeper: ports.sleeper,
             hooks: ports.hooks,
             candidate_workspaces: ports.candidate_workspaces,
+            mcp_prefetch: ports.mcp_prefetch,
             steering: ports.steering,
-            events,
+            events: events.into(),
             config,
             configured_test,
         }
+    }
+
+    /// Replace the ordinary channel wrapper with a caller-supplied ordered
+    /// sender. Benchmark mode uses this to journal+flush every event before
+    /// the same event enters the renderer queue.
+    pub fn with_event_sender(mut self, events: EventSender) -> Self {
+        self.events = events;
+        self
     }
 
     /// Drive one prompt through the full staged flow. `messages` is the
@@ -494,20 +461,20 @@ impl<'a> Pipeline<'a> {
             });
             self.recall.recall(goal).await
         };
-        let (task_class, frames) =
+        let (assessment, frames) =
             tokio::join!(self.triage(goal, budget, &mut total_cost), recall_future);
         self.emit_context_recall(&frames);
-        let task_class = match task_class {
-            Ok(task_class) => task_class,
+        let assessment = match assessment {
+            Ok(assessment) => assessment,
             Err(abort) => {
-                return Ok(aborted_before_execute(
-                    &self.events,
+                return Ok(self.aborted_before_execute(
                     resolve_task_class(None, goal),
                     total_cost,
                     &abort.reason,
                 ));
             }
         };
+        let task_class = assessment.class;
         // The volatile recall+goal message rides AFTER the stable system
         // prefix (L-E8) — see assemble_user_message.
         messages.push(CompletionMessage::user(assemble_user_message(
@@ -523,26 +490,19 @@ impl<'a> Pipeline<'a> {
             {
                 Ok(plan) => Some(plan),
                 Err(abort) => {
-                    return Ok(aborted_before_execute(
-                        &self.events,
-                        task_class,
-                        total_cost,
-                        &abort.reason,
-                    ));
+                    return Ok(self.aborted_before_execute(task_class, total_cost, &abort.reason));
                 }
             }
         } else {
             None
         };
-
         // --- 4. Scope review (only for planned work above thresholds). -----
         let plan = match plan {
             Some(steps) => match self.scope_review(goal, steps).await {
                 Ok(Some(steps)) => Some(steps),
                 Ok(None) => {
                     // User aborted (or trimmed to nothing) at the gate.
-                    return Ok(aborted_before_execute(
-                        &self.events,
+                    return Ok(self.aborted_before_execute(
                         task_class,
                         total_cost,
                         "aborted at scope review",
@@ -556,9 +516,17 @@ impl<'a> Pipeline<'a> {
         // --- 5. Witness + execute + verify (single-shot or best-of-N). ------
         let n = self.config.candidate_count();
         let base_messages = messages.clone();
+        // Decided here, before the single-shot/best-of-N split, because an
+        // authored witness is the *only* reason a single candidate needs
+        // disposable isolation. Resolving independence later would commit the
+        // run to snapshot machinery it then discovers it cannot use — and
+        // candidate isolation requires a git working tree, so on a plain
+        // directory that is a hard failure rather than an unused cost.
         let authored_witness = self.config.test_command.is_none()
             && self.config.witness_writer
-            && task_class.verifies_unconditionally();
+            && assessment.wants_witness()
+            && task_class.verifies_unconditionally()
+            && self.can_author_independent_witness();
         // Single-shot (the default) runs directly over the session ports —
         // zero snapshot/adoption machinery only when the user supplied the
         // test invocation (or witness authoring is otherwise disabled).
@@ -585,7 +553,7 @@ impl<'a> Pipeline<'a> {
                     goal,
                     &base_messages,
                     plan.as_deref(),
-                    task_class,
+                    assessment,
                     None,
                     &worker,
                     1,
@@ -603,7 +571,7 @@ impl<'a> Pipeline<'a> {
                     goal,
                     &base_messages,
                     plan.as_deref(),
-                    task_class,
+                    assessment,
                     n,
                     &frames,
                     authored_witness,
@@ -681,7 +649,7 @@ impl<'a> Pipeline<'a> {
         goal: &str,
         budget: &mut BudgetGuard,
         total: &mut f64,
-    ) -> Result<TaskClass, PipelineBudgetAbort> {
+    ) -> Result<TaskAssessment, PipelineBudgetAbort> {
         self.emit(AgentEvent::Stage {
             name: StageKind::Triage,
         });
@@ -689,13 +657,15 @@ impl<'a> Pipeline<'a> {
             Ok(r) => r,
             // Triage resolution failure is soft: fall through to the full path
             // via the deterministic floor. Never fail the run on triage.
-            Err(_) => return Ok(resolve_task_class(None, goal)),
+            Err(_) => {
+                return Ok(TaskAssessment::from_class(resolve_task_class(None, goal)));
+            }
         };
         if let Some(fb) = &resolved.fallback {
             self.emit_fallback(fb);
         }
 
-        let model_class = match self
+        let assessment = match self
             .metered_raw_call(
                 RawCall {
                     role: ModelCallRole::Triage,
@@ -710,11 +680,20 @@ impl<'a> Pipeline<'a> {
             )
             .await
         {
-            Ok(result) => classify_triage_response(&result.text),
+            Ok(result) => parse_triage_response(&result.text),
             Err(RawCallError::Budget(abort)) => return Err(abort),
             Err(RawCallError::Provider | RawCallError::Timeout) => None,
         };
-        Ok(resolve_task_class(model_class, goal))
+        // The class still goes through `resolve_task_class` so a failed or
+        // unparseable triage lands on the deterministic floor exactly as
+        // before; a real assessment keeps its own assurance flags.
+        Ok(match assessment {
+            Some(assessment) => TaskAssessment {
+                class: resolve_task_class(Some(assessment.class), goal),
+                ..assessment
+            },
+            None => TaskAssessment::from_class(resolve_task_class(None, goal)),
+        })
     }
 
     // ------------------------------------------------------------------
@@ -821,7 +800,29 @@ impl<'a> Pipeline<'a> {
             return Ok(Some(plan));
         }
 
-        if self.config.headless && !self.config.headless_bypass_scope_review {
+        if self.config.headless && self.config.headless_bypass_scope_review {
+            // Bypass means proceed, not "ask a gate that always says no".
+            // The headless approval port is `AlwaysAbortGate`, so running the
+            // review anyway would empty the plan and end the turn having done
+            // nothing — the same zero-work outcome as the error below, just
+            // spelled differently.
+            return Ok(Some(plan));
+        }
+        if self.config.headless {
+            // Say why the run is ending. This error leaves through the
+            // `Result`, not the event stream, so without this the stream just
+            // stops mid-plan: a consumer reading only events sees a run that
+            // vanished with no terminal event and no explanation.
+            self.emit(AgentEvent::Error {
+                message: format!(
+                    "this plan needs scope review ({} steps, ~{} files) and a headless \
+                     run has nobody to ask; set `headless_scope_bypass: on` where the \
+                     working tree is disposable, or raise the scope thresholds",
+                    plan.len(),
+                    estimate.estimated_files
+                ),
+                retryable: false,
+            });
             return Err(PipelineError::ScopeReviewRequiredHeadless);
         }
 
@@ -860,7 +861,7 @@ impl<'a> Pipeline<'a> {
         goal: &str,
         base_messages: &[CompletionMessage],
         plan: Option<&[PlanStep]>,
-        task_class: TaskClass,
+        assessment: TaskAssessment,
         witness: Option<&Witness>,
         worker: &ResolvedRole<'a>,
         n: u32,
@@ -894,7 +895,7 @@ impl<'a> Pipeline<'a> {
                     goal,
                     base_messages,
                     plan,
-                    task_class,
+                    assessment,
                     witness,
                     &engine,
                     surface,
@@ -920,13 +921,16 @@ impl<'a> Pipeline<'a> {
         goal: &str,
         base_messages: &[CompletionMessage],
         plan: Option<&[PlanStep]>,
-        task_class: TaskClass,
+        assessment: TaskAssessment,
         n: u32,
         frames: &[RecalledFrame],
         author_witness: bool,
         budget: &mut BudgetGuard,
         total: &mut f64,
     ) -> Result<(CandidateResult, Option<String>), PipelineError> {
+        // Orchestrator pre-fetch (issue #248 Phase 1) — see `crate::mcp_prefetch::fold`.
+        let prefetched = crate::mcp_prefetch::fold(self.mcp_prefetch, goal, n, base_messages).await;
+        let base_messages: &[CompletionMessage] = prefetched.as_deref().unwrap_or(base_messages);
         let Some(port) = self.candidate_workspaces else {
             if author_witness {
                 return Ok((
@@ -960,7 +964,7 @@ impl<'a> Pipeline<'a> {
                     goal,
                     base_messages,
                     plan,
-                    task_class,
+                    assessment,
                     None,
                     &worker,
                     n,
@@ -988,34 +992,31 @@ impl<'a> Pipeline<'a> {
             self.emit_fallback(fallback);
         }
         let worker_label = worker.model_ref.to_string();
-        let witness_author = if author_witness {
-            let Ok(author) = self.resolve_provider(Role::Judge) else {
-                return Ok((
-                    CandidateResult::aborted(
-                        base_messages.to_vec(),
-                        "could not resolve an independent witness author".to_string(),
-                    ),
-                    Some(worker_label),
-                ));
-            };
-            if author.model_ref == worker.model_ref {
-                return Ok((
-                    CandidateResult::aborted(
-                        base_messages.to_vec(),
-                        format!(
-                            "could not resolve an independent witness author: judge and worker both resolved to `{}`",
-                            worker.model_ref
-                        ),
-                    ),
-                    Some(worker_label),
-                ));
+        // Losing the independent author costs the run its authored witness —
+        // it must never cost the run the whole task. A single-model
+        // configuration (every role pinned to one model, as benchmark and
+        // solo-provider setups do) previously aborted here after one model
+        // call, having done no work at all. Degrade to the unauthored verify
+        // ladder instead, and say so once.
+        // `can_author_independent_witness` already gated `author_witness` and
+        // announced any degradation, so this is the invariant guard for that
+        // decision — silent on purpose, never a second warning.
+        let mut author_witness = author_witness;
+        let witness_author = match author_witness
+            .then(|| self.resolve_provider(Role::Judge))
+            .and_then(Result::ok)
+            .filter(|author| author.model_ref != worker.model_ref)
+        {
+            Some(author) => {
+                if let Some(fallback) = &author.fallback {
+                    self.emit_fallback(fallback);
+                }
+                Some(author)
             }
-            if let Some(fallback) = &author.fallback {
-                self.emit_fallback(fallback);
+            None => {
+                author_witness = false;
+                None
             }
-            Some(author)
-        } else {
-            None
         };
 
         let mut candidates: Vec<CandidateResult> = Vec::with_capacity(n as usize);
@@ -1087,7 +1088,7 @@ impl<'a> Pipeline<'a> {
                     goal,
                     base_messages,
                     plan,
-                    task_class,
+                    assessment,
                     witness.as_ref(),
                     &engine,
                     surface,
@@ -1154,7 +1155,7 @@ impl<'a> Pipeline<'a> {
         goal: &str,
         base_messages: &[CompletionMessage],
         plan: Option<&[PlanStep]>,
-        task_class: TaskClass,
+        assessment: TaskAssessment,
         witness: Option<&Witness>,
         engine: &Engine<'_>,
         surface: CandidateSurface<'_>,
@@ -1172,7 +1173,7 @@ impl<'a> Pipeline<'a> {
         // best-of-N, or a shared tree an earlier candidate may have
         // modified), and a seeded observation would be a fabricated one.
         let mut oracle = FlipOracle::new();
-        if task_class.verifies_unconditionally()
+        if assessment.class.verifies_unconditionally()
             && let Some(cmd) = self.effective_test_command(witness)
         {
             let pre = surface.tests.run_test(cmd.invocation).await;
@@ -1211,14 +1212,14 @@ impl<'a> Pipeline<'a> {
         (state.diff_lines, state.diff_text) =
             self.gather_diff(surface, &state.untracked_before).await;
         let files_touched = state.file_changes > 0 || !state.diff_text.trim().is_empty();
-        let should_verify = task_class.verifies_unconditionally()
-            || (task_class == TaskClass::SimpleLookup && files_touched);
+        let should_verify = assessment.class.verifies_unconditionally()
+            || (assessment.class == TaskClass::SimpleLookup && files_touched);
         if !should_verify {
             // A clean lookup: nothing to verify.
             return state.into_unverified();
         }
 
-        self.verify_candidate(goal, witness, engine, surface, budget, total, state)
+        self.verify_candidate(goal, assessment, witness, engine, surface, budget, total, state)
             .await
     }
 
@@ -1288,6 +1289,7 @@ impl<'a> Pipeline<'a> {
     async fn verify_candidate(
         &self,
         goal: &str,
+        assessment: TaskAssessment,
         witness: Option<&Witness>,
         engine: &Engine<'_>,
         surface: CandidateSurface<'_>,
@@ -1420,6 +1422,31 @@ impl<'a> Pipeline<'a> {
                     {
                         return CandidateResult::aborted(state.messages, reason);
                     }
+                }
+                // Triage judged this result not worth a separate reviewer.
+                // Record exactly that: a pass carrying no independent
+                // evidence. Falling through to `heuristic_fallback` would
+                // report "judge unavailable", which describes a judge that
+                // broke — not one that was deliberately waived — and would
+                // turn a task triage called simple into a verification
+                // failure. The summary states plainly what was not done.
+                LadderDecision::ModelJudge if !assessment.wants_judge() => {
+                    let evidence = JudgeEvidence {
+                        summary: "model review waived by triage; no independent \
+                                  verification was performed"
+                            .to_string(),
+                        deterministic: false,
+                        evidence_refs: vec![],
+                    };
+                    self.emit(AgentEvent::JudgeVerdict {
+                        passed: true,
+                        evidence: evidence.clone(),
+                    });
+                    return state.into_verified(
+                        true,
+                        &evidence,
+                        score_from_verification(true, None),
+                    );
                 }
                 LadderDecision::ModelJudge => {
                     // Inconclusive — escalate to the model judge (judge ≠
@@ -1738,36 +1765,36 @@ impl<'a> Pipeline<'a> {
         budget: &mut BudgetGuard,
         file_changes: &mut u32,
     ) -> TurnOutcome {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        // The filtered sender is SYNCHRONOUS on purpose: when the outer
+        // sender carries a durability boundary, a paid StepUsage cannot
+        // return to the engine before append+flush completes. Draining a
+        // channel from a spawned forwarder instead would let the engine make
+        // another paid call before the previous one's metering row is durable.
+        let seen_file_changes = Arc::new(AtomicU32::new(0));
+        let count = seen_file_changes.clone();
         let consumer = self.events.clone();
-        let forwarder = tokio::spawn(async move {
-            let mut seen_file_changes: u32 = 0;
-            while let Some(event) = rx.recv().await {
-                let forward = match &event {
-                    // The pipeline is the sole authority for stage boundaries
-                    // and the terminal event of an outcome-producing run —
-                    // drop the engine's per-turn copies.
-                    AgentEvent::Stage { .. } | AgentEvent::Complete { .. } => false,
-                    AgentEvent::FileChange { kind, .. } => {
-                        // Reads ride the same event for the files panel but
-                        // are not changes — counting them would defeat the
-                        // zero-diff guard on read-only turns.
-                        if kind.is_mutation() {
-                            seen_file_changes += 1;
-                        }
-                        true
+        let filtered = EventSender::from_fn(move |event| {
+            match &event {
+                // The pipeline is the sole authority for stage boundaries and
+                // the terminal event of an outcome-producing run — drop the
+                // engine's per-turn copies.
+                AgentEvent::Stage { .. } | AgentEvent::Complete { .. } => Ok(()),
+                AgentEvent::FileChange { kind, .. } => {
+                    // Reads ride the same event for the files panel but are
+                    // not changes — counting them would defeat the zero-diff
+                    // guard on read-only turns.
+                    if kind.is_mutation() {
+                        count.fetch_add(1, Ordering::Relaxed);
                     }
-                    _ => true,
-                };
-                if forward {
-                    let _ = consumer.send(event);
+                    consumer.send(event)
                 }
+                _ => consumer.send(event),
             }
-            seen_file_changes
         });
-        let outcome = engine.run_turn(messages, budget, &tx).await;
-        drop(tx); // close the channel so the forwarder terminates
-        *file_changes += forwarder.await.unwrap_or(0);
+        let outcome = engine
+            .run_turn_with_sender(messages, budget, &filtered)
+            .await;
+        *file_changes += seen_file_changes.load(Ordering::Relaxed);
         outcome
     }
 
@@ -1870,6 +1897,39 @@ impl<'a> Pipeline<'a> {
         });
     }
 
+    /// Whether a witness author independent of the worker can be resolved.
+    ///
+    /// Losing the author costs the run its authored witness, never the task:
+    /// a `false` here routes to the ordinary single-shot path and the
+    /// deterministic/judge verify ladder. Announced once, at the one point
+    /// that decides it, so the run never pays for isolation it cannot use.
+    fn can_author_independent_witness(&self) -> bool {
+        let Ok(worker) = self.resolve_provider(Role::Worker) else {
+            // A worker that won't resolve fails later, on its own terms —
+            // not here, disguised as a witness-independence verdict.
+            return false;
+        };
+        match self.resolve_provider(Role::Judge) {
+            Ok(judge) if judge.model_ref != worker.model_ref => true,
+            Ok(_) => {
+                self.warn(format!(
+                    "no witness author independent of the worker (judge and worker both \
+                     resolved to `{}`); continuing without an authored witness",
+                    worker.model_ref
+                ));
+                false
+            }
+            Err(_) => {
+                self.warn(
+                    "no witness author independent of the worker (the judge role is \
+                     unresolvable); continuing without an authored witness"
+                        .to_string(),
+                );
+                false
+            }
+        }
+    }
+
     fn emit_fallback(&self, fb: &FallbackInfo) {
         self.emit(AgentEvent::ProviderFallback {
             from: fb.from.clone(),
@@ -1886,6 +1946,21 @@ impl<'a> Pipeline<'a> {
             message,
             retryable: true,
         });
+    }
+
+    fn aborted_before_execute(
+        &self,
+        task_class: TaskClass,
+        total_cost: f64,
+        reason: &str,
+    ) -> PipelineOutcome {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let outcome = stage_budget::aborted_before_execute(&tx, task_class, total_cost, reason);
+        drop(tx);
+        while let Ok(event) = rx.try_recv() {
+            self.emit(event);
+        }
+        outcome
     }
 
     fn emit(&self, event: AgentEvent) {

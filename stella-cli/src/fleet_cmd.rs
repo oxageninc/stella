@@ -474,7 +474,7 @@ async fn run_task(
     cfg.workspace_root = root.to_path_buf();
     let provider = agent::build_provider(&cfg)?;
     let registry_options = agent::registry_options(&cfg);
-    let registry = ToolRegistry::new_detected(root.to_path_buf(), registry_options.clone()).await;
+    let registry = agent::new_tool_registry(root.to_path_buf(), registry_options.clone()).await;
     let active_rules = crate::rules::enforce_workspace_rules(&registry, root, &cfg.authority);
     // Claim-on-first-write (crate::claims): tool-level write claims + the
     // transient build lane, coordinated across every writer in the
@@ -512,6 +512,7 @@ async fn run_task(
         crate::OutputFormat::Json,
         execution.clone(),
         cfg.provider.id.to_string(),
+        false,
     );
 
     // The task's control lines (stella-fleet's `WorkerControls`). The stop
@@ -560,11 +561,14 @@ async fn run_task(
             let router = Router::new(wiring.pins.clone(), wiring.profiles.clone(), breaker);
             // Rooted at the fleet worker's own worktree, so a candidate snapshot
             // nests off that worktree's checkout, never the primary repo's.
+            // Fleet workers don't connect MCP at all today (`tools: &claims`
+            // wraps the raw registry directly) — nothing to share, hence `None`.
             let ws_ports = agent::workspace_ports(
                 root.to_path_buf(),
                 &cfg,
                 registry_options,
                 active_rules.clone(),
+                None,
             )?;
             let recall = NoContextRecall;
             let hook_runner = ShellHookRunner;
@@ -584,6 +588,7 @@ async fn run_task(
                     .as_ref()
                     .map(|h| (h, &hook_runner as &dyn stella_core::hooks::HookRunner)),
                 candidate_workspaces: Some(&ws_ports.candidate_workspaces),
+                mcp_prefetch: None,
                 // Headless / fleet: no concurrent input channel to steer from.
                 steering: None,
             };
@@ -933,8 +938,10 @@ mod tests {
             crate::OutputFormat::Json,
             execution.clone(),
             "anthropic".into(),
+            false,
         );
         tx.send(AgentEvent::StepUsage {
+            output_text: None,
             step: 0,
             role: stella_protocol::ModelCallRole::Worker,
             provider: "anthropic".into(),

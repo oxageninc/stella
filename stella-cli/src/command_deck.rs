@@ -78,7 +78,8 @@ use stella_core::router::CircuitBreaker;
 use stella_core::{BudgetGuard, CalibrationMap, Engine, Router, TurnOutcome};
 use stella_model::provider::Provider;
 use stella_pipeline::{
-    ContextRecallPort, NoContextRecall, Pipeline, PipelineConfig, PipelinePorts, PipelineStatus,
+    ContextRecallPort, McpPrefetchPort, NoContextRecall, Pipeline, PipelineConfig, PipelinePorts,
+    PipelineStatus,
 };
 use stella_protocol::{
     AgentEvent, CiStatus, CompletionMessage, CompletionRequest, FileChangeKind, ModelRef, PrStatus,
@@ -287,7 +288,7 @@ pub async fn run_deck_session(
     let provider = agent::build_provider(cfg)?;
     let registry_options = agent::registry_options(cfg);
     let registry: Arc<ToolRegistry> = Arc::new(
-        ToolRegistry::new_detected(cfg.workspace_root.clone(), registry_options.clone()).await,
+        agent::new_tool_registry(cfg.workspace_root.clone(), registry_options.clone()).await,
     );
     agent::populate_schema_index(&registry, &cfg.workspace_root)?;
     let active_rules =
@@ -610,7 +611,10 @@ pub async fn run_deck_session(
     //     `mcp_usage` telemetry table.
     let mcp_disabled: stella_mcp::DisabledServers =
         std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
-    let mcp_slot: Arc<tokio::sync::OnceCell<stella_mcp::McpToolSet>> =
+    // `Arc<McpToolSet>` (not a bare `McpToolSet`) so a turn can cheaply clone
+    // the connected set into the Best-of-N candidate surface + orchestrator
+    // pre-fetch (issue #248 Phase 1) alongside its own `&dyn ToolExecutor`.
+    let mcp_slot: Arc<tokio::sync::OnceCell<Arc<stella_mcp::McpToolSet>>> =
         Arc::new(tokio::sync::OnceCell::new());
     let mcp_configured = spawn_mcp_connect(
         cfg.clone(),
@@ -1039,8 +1043,14 @@ pub async fn run_deck_session(
                     // A stray answer/decision/control with no turn in flight
                     // falls through all four no-ops.
                     Some(other) => {
-                        if !service_mcp_action(&other, cfg, mcp_slot.get(), &mcp_disabled, &in_tx)
-                            .await
+                        if !service_mcp_action(
+                            &other,
+                            cfg,
+                            mcp_slot.get().map(Arc::as_ref),
+                            &mcp_disabled,
+                            &in_tx,
+                        )
+                        .await
                             && !service_registry_action(
                                 &other,
                                 &session_registry,
@@ -1215,11 +1225,14 @@ pub async fn run_deck_session(
         // connected servers join the session the moment the background
         // connect lands, and a turn that beats it runs on native tools —
         // narrated once, never silently degraded.
-        let base_tools: &dyn ToolExecutor = match mcp_slot.get() {
-            Some(set) => set,
+        // Cloned once per turn (an `Arc` clone, not a reconnect) so it can
+        // also be shared into Best-of-N candidates below (issue #248 Ph1).
+        let mcp = mcp_slot.get().cloned();
+        let base_tools: &dyn ToolExecutor = match &mcp {
+            Some(set) => set.as_ref(),
             None => &*registry,
         };
-        if mcp_configured && mcp_slot.get().is_none() && !mcp_pending_noted {
+        if mcp_configured && mcp.is_none() && !mcp_pending_noted {
             mcp_pending_noted = true;
             let _ = in_tx.send(Inbound::Event {
                 agent: LEAD.to_string(),
@@ -1261,6 +1274,7 @@ pub async fn run_deck_session(
                         &lead_holder,
                         &discovery_activation,
                         &steering,
+                        mcp.clone(),
                     )
                     .await
                 } else {
@@ -1812,7 +1826,7 @@ fn spawn_mcp_connect(
     cfg: Config,
     registry: Arc<ToolRegistry>,
     disabled: stella_mcp::DisabledServers,
-    slot: Arc<tokio::sync::OnceCell<stella_mcp::McpToolSet>>,
+    slot: Arc<tokio::sync::OnceCell<Arc<stella_mcp::McpToolSet>>>,
     in_tx: UnboundedSender<Inbound>,
     chrome_tx: UnboundedSender<Inbound>,
     release_splash: impl FnOnce() + Send + 'static,
@@ -1848,7 +1862,11 @@ fn spawn_mcp_connect(
                             &set.connected_names(),
                             set.failed_servers(),
                         )));
-                        let _ = slot.set(set);
+                        // `set` is infallible here (the cell is set exactly once,
+                        // by this task); an in-flight turn keeps its resolved
+                        // executor and the NEXT turn picks the servers up. Arc'd so
+                        // a turn can share it into Best-of-N candidates (#248 Ph1).
+                        let _ = slot.set(Arc::new(set));
                     }
                     Err(error) => {
                         let _ = chrome_tx.send(chrome_note(format!(
@@ -1866,7 +1884,7 @@ fn spawn_mcp_connect(
             }
         }
         // Seed the MCP tab with the configured servers and their live state.
-        send_mcp_snapshot(&cfg, slot.get(), &disabled, &in_tx).await;
+        send_mcp_snapshot(&cfg, slot.get().map(Arc::as_ref), &disabled, &in_tx).await;
         // MCP connect settled (or there was nothing to connect) — the other
         // init leg the launch splash waits on.
         release_splash();
@@ -2589,15 +2607,17 @@ fn ci_status_token(ci: CiStatus) -> &'static str {
 
 async fn gh_json(root: &std::path::Path, args: &[&str]) -> Option<Value> {
     let mut command = tokio::process::Command::new("gh");
-    stella_tools::exec::scrub_sensitive_env(&mut command);
-    let output = command
-        .args(args)
-        .current_dir(root)
-        .kill_on_drop(true)
-        .output()
-        .await
-        .ok()?;
+    command.args(args).current_dir(root).kill_on_drop(true);
+    scrub_gh_command(&mut command);
+    let output = command.output().await.ok()?;
     serde_json::from_slice(&output.stdout).ok()
+}
+
+fn scrub_gh_command(command: &mut tokio::process::Command) {
+    stella_tools::subprocess_env::scrub_sensitive_env_except(
+        command,
+        stella_tools::subprocess_env::GITHUB_CLI_AUTH_ENV_VARS,
+    );
 }
 
 /// Reconcile the workspace's current-branch PR: `gh pr view` for identity
@@ -2889,7 +2909,7 @@ fn memory_hit(
 /// the description its file location (the citation's parenthetical, else
 /// the frame uri), and the inserted text the bare symbol name — the title's
 /// last token.
-fn symbol_hit(frame: &ocp_types::ContextFrame) -> EntityHit {
+fn symbol_hit(frame: &contextgraph_types::ContextFrame) -> EntityHit {
     let label = frame.title.clone();
     let insert = label
         .split_whitespace()
@@ -3862,6 +3882,7 @@ async fn run_lead_pipeline_turn(
     claim_holder: &str,
     activated: &crate::discovery::ActivatedTools,
     steering: &subsession::SteeringTap,
+    mcp: Option<Arc<stella_mcp::McpToolSet>>,
 ) -> Result<(), String> {
     budget.begin_turn();
 
@@ -3925,6 +3946,7 @@ async fn run_lead_pipeline_turn(
             cfg,
             registry_options.clone(),
             active_rules.clone(),
+            mcp,
         )?;
         let no_recall = NoContextRecall;
         let recall: &dyn ContextRecallPort = match memory {
@@ -3948,6 +3970,10 @@ async fn run_lead_pipeline_turn(
                 .as_ref()
                 .map(|h| (h, &hook_runner as &dyn stella_core::hooks::HookRunner)),
             candidate_workspaces: Some(&ws_ports.candidate_workspaces),
+            mcp_prefetch: ws_ports
+                .mcp_prefetch
+                .as_ref()
+                .map(|p| p as &dyn McpPrefetchPort),
             // The deck's per-turn tap: `>` steers the execute engine mid-turn
             // (the same tap the step-loop lead turn uses).
             steering: Some(steering),

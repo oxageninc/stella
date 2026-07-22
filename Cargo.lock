@@ -3047,7 +3047,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "stella-cli"
-version = "0.4.64"
+version = "0.4.67"
 dependencies = [
  "async-trait",
  "clap",
@@ -3084,7 +3084,7 @@ dependencies = [
 
 [[package]]
 name = "stella-context"
-version = "0.4.64"
+version = "0.4.67"
 dependencies = [
  "async-trait",
  "contextgraph-types",
@@ -3100,7 +3100,7 @@ dependencies = [
 
 [[package]]
 name = "stella-core"
-version = "0.4.64"
+version = "0.4.67"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -3115,7 +3115,7 @@ dependencies = [
 
 [[package]]
 name = "stella-fleet"
-version = "0.4.64"
+version = "0.4.67"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -3126,6 +3126,7 @@ dependencies = [
  "stella-core",
  "stella-protocol",
  "stella-store",
+ "stella-tools",
  "tempfile",
  "thiserror 2.0.19",
  "tokio",
@@ -3133,7 +3134,7 @@ dependencies = [
 
 [[package]]
 name = "stella-graph"
-version = "0.4.64"
+version = "0.4.67"
 dependencies = [
  "contextgraph-types",
  "notify",
@@ -3146,7 +3147,11 @@ dependencies = [
  "tokio",
  "toml",
  "tree-sitter",
+ "tree-sitter-c",
+ "tree-sitter-go",
+ "tree-sitter-java",
  "tree-sitter-javascript",
+ "tree-sitter-php",
  "tree-sitter-python",
  "tree-sitter-rust",
  "tree-sitter-sequel",
@@ -3155,7 +3160,7 @@ dependencies = [
 
 [[package]]
 name = "stella-mcp"
-version = "0.4.64"
+version = "0.4.67"
 dependencies = [
  "async-trait",
  "base64",
@@ -3176,7 +3181,7 @@ dependencies = [
 
 [[package]]
 name = "stella-media"
-version = "0.4.64"
+version = "0.4.67"
 dependencies = [
  "async-trait",
  "base64",
@@ -3196,7 +3201,7 @@ dependencies = [
 
 [[package]]
 name = "stella-model"
-version = "0.4.64"
+version = "0.4.67"
 dependencies = [
  "async-trait",
  "base64",
@@ -3217,7 +3222,7 @@ dependencies = [
 
 [[package]]
 name = "stella-observatory"
-version = "0.4.64"
+version = "0.4.67"
 dependencies = [
  "rusqlite",
  "serde",
@@ -3231,7 +3236,7 @@ dependencies = [
 
 [[package]]
 name = "stella-pipeline"
-version = "0.4.64"
+version = "0.4.67"
 dependencies = [
  "async-trait",
  "proptest",
@@ -3246,7 +3251,7 @@ dependencies = [
 
 [[package]]
 name = "stella-protocol"
-version = "0.4.64"
+version = "0.4.67"
 dependencies = [
  "async-trait",
  "serde",
@@ -3256,7 +3261,7 @@ dependencies = [
 
 [[package]]
 name = "stella-serve"
-version = "0.4.64"
+version = "0.4.67"
 dependencies = [
  "async-trait",
  "serde",
@@ -3269,7 +3274,7 @@ dependencies = [
 
 [[package]]
 name = "stella-store"
-version = "0.4.64"
+version = "0.4.67"
 dependencies = [
  "base64",
  "libc",
@@ -3284,7 +3289,7 @@ dependencies = [
 
 [[package]]
 name = "stella-tools"
-version = "0.4.64"
+version = "0.4.67"
 dependencies = [
  "async-trait",
  "base64",
@@ -3309,7 +3314,7 @@ dependencies = [
 
 [[package]]
 name = "stella-tui"
-version = "0.4.64"
+version = "0.4.67"
 dependencies = [
  "arboard",
  "crossterm",
@@ -3321,6 +3326,7 @@ dependencies = [
  "serde",
  "serde_json",
  "stella-protocol",
+ "stella-tools",
  "sysinfo",
  "tachyonfx",
  "tempfile",
@@ -3843,6 +3849,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "tree-sitter-c"
+version = "0.24.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a9b2eb57a55fed6b00812912e730b7a275cf4fe98bfd6a5d76263d4438371728"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-go"
+version = "0.25.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c8560a4d2f835cc0d4d2c2e03cbd0dde2f6114b43bc491164238d333e28b16ea"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-java"
+version = "0.23.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0aa6cbcdc8c679b214e616fd3300da67da0e492e066df01bcf5a5921a71e90d6"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
 name = "tree-sitter-javascript"
 version = "0.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3857,6 +3893,16 @@ name = "tree-sitter-language"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "009994f150cc0cd50ff54917d5bc8bffe8cad10ca10d81c34da2ec421ae61782"
+
+[[package]]
+name = "tree-sitter-php"
+version = "0.24.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0d8c17c3ab69052c5eeaa7ff5cd972dd1bc25d1b97ee779fec391ad3b5df5592"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
 
 [[package]]
 name = "tree-sitter-python"

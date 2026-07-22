@@ -3,6 +3,9 @@
 //! private surface (`CandidateSurface`, `Pipeline::gather_diff`, ...)
 //! stays reachable via `super::*`.
 
+mod management_accounting;
+mod telemetry;
+
 use super::*;
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -500,6 +503,22 @@ fn router() -> Router {
     )
 }
 
+/// Every role pinned to one model — what `--model` alone, a single-provider
+/// account, and the benchmark engine posture all produce.
+fn single_model_router() -> Router {
+    let only = ModelRef::new("scripted", "only");
+    Router::new(
+        RoleTable::new(),
+        vec![ProviderProfile::new(
+            "scripted",
+            only.clone(),
+            only.clone(),
+            only,
+        )],
+        CircuitBreaker::new(Box::new(ZeroClock)),
+    )
+}
+
 fn drain(rx: &mut mpsc::UnboundedReceiver<AgentEvent>) -> Vec<AgentEvent> {
     let mut out = Vec::new();
     while let Ok(e) = rx.try_recv() {
@@ -556,6 +575,7 @@ async fn single_task_with_a_flip_submits_fast_and_skips_the_judge() {
             sleeper: &sleeper,
             hooks: None,
             candidate_workspaces: None,
+            mcp_prefetch: None,
             steering: None,
         },
         tx,
@@ -633,6 +653,7 @@ async fn a_queued_steer_is_injected_into_the_execute_turn() {
             sleeper: &sleeper,
             hooks: None,
             candidate_workspaces: None,
+            mcp_prefetch: None,
             steering: Some(&steering),
         },
         tx,
@@ -702,6 +723,7 @@ async fn misclassified_lookup_that_touches_files_still_gets_verified() {
             sleeper: &sleeper,
             hooks: None,
             candidate_workspaces: None,
+            mcp_prefetch: None,
             steering: None,
         },
         tx,
@@ -761,6 +783,7 @@ async fn clean_lookup_skips_plan_verify_and_judge() {
             sleeper: &sleeper,
             hooks: None,
             candidate_workspaces: None,
+            mcp_prefetch: None,
             steering: None,
         },
         tx,
@@ -806,7 +829,7 @@ async fn paid_headless_scope_review_error_retains_settled_cost() {
     let approvals = FixedGate(ScopeDecision::Approve);
     let sleeper = NoopSleeper;
     let router = router();
-    let (tx, _rx) = mpsc::unbounded_channel();
+    let (tx, mut rx) = mpsc::unbounded_channel();
 
     let config = PipelineConfig {
         headless: true,
@@ -827,6 +850,7 @@ async fn paid_headless_scope_review_error_retains_settled_cost() {
             sleeper: &sleeper,
             hooks: None,
             candidate_workspaces: None,
+            mcp_prefetch: None,
             steering: None,
         },
         tx,
@@ -847,6 +871,17 @@ async fn paid_headless_scope_review_error_retains_settled_cost() {
     assert!(
         (err.total_cost_usd - 0.0002).abs() < 1e-9,
         "triage and plan spend must survive the hard error: {err:?}"
+    );
+    // The error leaves through the `Result`, so without an explicit event the
+    // stream simply stops mid-plan. A consumer reading only events (the bench
+    // adapter, the deck) must still be told why the run ended.
+    let events = drain(&mut rx);
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Error { message, .. } if message.contains("scope review")
+        )),
+        "the headless scope stop announces itself: {events:?}"
     );
 }
 
@@ -883,6 +918,7 @@ async fn user_abort_at_scope_review_is_a_clean_abort() {
             sleeper: &sleeper,
             hooks: None,
             candidate_workspaces: None,
+            mcp_prefetch: None,
             steering: None,
         },
         tx,
@@ -945,6 +981,7 @@ async fn gather_diff_counts_real_new_file_lines_and_excludes_pre_existing() {
             sleeper: &sleeper,
             hooks: None,
             candidate_workspaces: None,
+            mcp_prefetch: None,
             steering: None,
         },
         tx,
@@ -1057,6 +1094,89 @@ async fn witness_authored_command_arms_the_flip_oracle_and_submits_fast() {
     let s = stages(&events);
     assert!(s.contains(&StageKind::Witness), "witness stage emitted");
     assert!(!s.contains(&StageKind::Judge), "judge skipped on the flip");
+}
+
+/// The point of the assessment: triage can route work onto a cheaper path
+/// than the keyword floor would. This goal trips `deterministic_floor`'s
+/// "across the codebase" marker — under the old `max(model, floor)` rule it
+/// bought a plan, an authored witness, and a judge no matter what triage said.
+/// An independent judge model IS available here, so a skipped witness proves
+/// triage's call was honored rather than independence being unavailable.
+#[tokio::test]
+async fn triage_can_route_work_onto_a_cheaper_path_than_the_keyword_floor() {
+    let provider = ScriptedProvider::new(vec![
+        text_result("CLASS: single\nWITNESS: no\nJUDGE: no"),
+        text_result("done"),
+    ]);
+    let (outcome, events, _) = run_unisolated_with_router(
+        &provider,
+        PipelineConfig::default(),
+        "Rename the retry helper across the codebase",
+        router(),
+    )
+    .await;
+    let outcome = outcome.expect("run succeeds");
+
+    assert_eq!(outcome.status, PipelineStatus::Completed);
+    assert_eq!(
+        outcome.task_class,
+        TaskClass::SingleTask,
+        "triage read the goal; the floor only pattern-matched it"
+    );
+    let s = stages(&events);
+    assert!(!s.contains(&StageKind::Plan), "single task plans nothing");
+    assert!(
+        !s.contains(&StageKind::Witness),
+        "triage said no witness: {s:?}"
+    );
+    // Two paid calls: triage and the worker. No witness author, no judge.
+    let calls = events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::StepUsage { .. }))
+        .count();
+    assert_eq!(calls, 2, "ceremony triage declined is never bought: {s:?}");
+}
+
+/// Losing the independent witness author must cost the run its authored
+/// witness, never the whole task. With every role pinned to one model the
+/// pipeline used to abort here after a single model call, having executed
+/// nothing — which is what a benchmark or solo-provider account always hits.
+/// It must instead warn once and fall through to the unauthored verify ladder.
+#[tokio::test]
+async fn single_model_config_degrades_to_unauthored_witness_instead_of_aborting() {
+    // triage → "single"; worker → done; judge → verdict. No witness-author
+    // turn is scripted because no independent author can be resolved.
+    let provider = ScriptedProvider::new(vec![
+        text_result("single"),
+        text_result("done"),
+        text_result("PASS looks right"),
+    ]);
+    let (outcome, events, _) = run_unisolated_with_router(
+        &provider,
+        PipelineConfig::default(),
+        "Fix the retry bug",
+        single_model_router(),
+    )
+    .await;
+    let outcome = outcome.expect("run succeeds");
+
+    assert_eq!(
+        outcome.status,
+        PipelineStatus::Completed,
+        "a single-model config must still complete the task"
+    );
+    assert!(
+        !stages(&events).contains(&StageKind::Witness),
+        "witness authoring is skipped, not attempted without an author"
+    );
+    let warned = events.iter().any(|event| {
+        matches!(
+            event,
+            AgentEvent::Error { message, retryable: true }
+                if message.contains("no witness author independent of the worker")
+        )
+    });
+    assert!(warned, "the degradation is announced once: {events:?}");
 }
 
 /// A witness whose test passes on the unmodified code proves nothing: one
@@ -1190,6 +1310,7 @@ async fn second_consecutive_red_verification_gets_judge_guidance() {
             sleeper: &sleeper,
             hooks: None,
             candidate_workspaces: None,
+            mcp_prefetch: None,
             steering: None,
         },
         tx,
@@ -1235,6 +1356,73 @@ async fn run_isolated(
     Vec<AgentEvent>,
     Vec<CompletionMessage>,
 ) {
+    run_isolated_with_router(provider, port, config, goal, router()).await
+}
+
+/// Run over ordinary *session* ports with no candidate-workspace port, the
+/// path an unauthored run takes. Isolation exists to protect the session tree
+/// from a witness author; with no author there is nothing to protect it from,
+/// so no snapshot machinery is engaged — which is what lets Stella work in a
+/// plain directory that is not a git repository.
+async fn run_unisolated_with_router(
+    provider: &ScriptedProvider,
+    config: PipelineConfig,
+    goal: &str,
+    router: Router,
+) -> (
+    Result<PipelineOutcome, PipelineRunError>,
+    Vec<AgentEvent>,
+    Vec<CompletionMessage>,
+) {
+    let resolver = OneProvider(provider);
+    let runner = ScriptedRunner::new(vec![], "@@ -1 +1 @@\n-a\n+b");
+    let repo_status = SeqRepoStatus::new(vec![vec![]]);
+    let tools = EmptyTools;
+    let recall = NoContextRecall;
+    let repo = NoRepoStructure;
+    let approvals = AutoApproveGate;
+    let sleeper = NoopSleeper;
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let pipeline = Pipeline::new(
+        PipelinePorts {
+            router: &router,
+            providers: &resolver,
+            tools: &tools,
+            recall: &recall,
+            repo: &repo,
+            repo_status: &repo_status,
+            diagnostics: &runner,
+            tests: &runner,
+            approvals: &approvals,
+            sleeper: &sleeper,
+            hooks: None,
+            candidate_workspaces: None,
+            mcp_prefetch: None,
+            steering: None,
+        },
+        tx,
+        config,
+    );
+    let mut messages = vec![CompletionMessage::system("sys")];
+    let mut budget = BudgetGuard::new(BudgetMode::Off, None, None);
+    let outcome = pipeline.run(goal, &mut messages, &mut budget).await;
+    (outcome, drain(&mut rx), messages)
+}
+
+/// [`run_isolated`] over a caller-supplied router, so a test can pin the
+/// roles to one model (the single-model configuration every benchmark and
+/// solo-provider setup uses).
+async fn run_isolated_with_router(
+    provider: &ScriptedProvider,
+    port: &FakeWorkspacePort,
+    config: PipelineConfig,
+    goal: &str,
+    router: Router,
+) -> (
+    Result<PipelineOutcome, PipelineRunError>,
+    Vec<AgentEvent>,
+    Vec<CompletionMessage>,
+) {
     let resolver = OneProvider(provider);
     let diagnostics = NeverRunner;
     let repo_status = NeverRepoStatus;
@@ -1243,7 +1431,6 @@ async fn run_isolated(
     let repo = NoRepoStructure;
     let approvals = AutoApproveGate;
     let sleeper = NoopSleeper;
-    let router = router();
     let (tx, mut rx) = mpsc::unbounded_channel();
     let pipeline = Pipeline::new(
         PipelinePorts {
@@ -1259,6 +1446,7 @@ async fn run_isolated(
             sleeper: &sleeper,
             hooks: None,
             candidate_workspaces: Some(port),
+            mcp_prefetch: None,
             steering: None,
         },
         tx,
@@ -1281,288 +1469,54 @@ fn isolated_config(n: u32) -> PipelineConfig {
     }
 }
 
-/// The core best-of-N isolation contract: every candidate runs against
-/// its own workspace surface (the session ports panic if touched), only
-/// the winner is adopted, and every workspace is removed.
-#[tokio::test]
-async fn best_of_two_adopts_only_the_winner_and_removes_every_workspace() {
-    let provider = ScriptedProvider::new(vec![
-        text_result("single"),
-        text_result("cand0 done"),
-        text_result("cand1 done"),
-    ]);
-    let log = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let port = FakeWorkspacePort::new(
-        vec![
-            // Candidate 0: baseline fail, still failing → Failed.
-            Ok(FakeWorkspace::new(
-                0,
-                vec![false, false],
-                Ok(vec![]),
-                log.clone(),
-            )),
-            // Candidate 1: fail→pass flip → DeterministicPass (winner).
-            Ok(FakeWorkspace::new(
-                1,
-                vec![false, true],
-                Ok(vec![AdoptedChange {
-                    path: "src/x.rs".into(),
-                    kind: FileChangeKind::Modified,
-                }]),
-                log.clone(),
-            )),
-        ],
-        log.clone(),
-    );
-
-    let (outcome, events, messages) =
-        run_isolated(&provider, &port, isolated_config(2), "Fix the failing test").await;
-    let outcome = outcome.expect("run succeeds");
-    assert_eq!(outcome.status, PipelineStatus::Completed);
-    assert_eq!(outcome.candidates_run, 2);
-    assert_eq!(outcome.final_text, "cand1 done");
-    let verdict = outcome.verdict.expect("winner verified");
-    assert!(verdict.passed && verdict.deterministic);
-    // The winner's trajectory (not the loser's) was adopted.
-    assert!(messages.iter().any(|m| m.content == "cand1 done"));
-
-    let log = log.lock().unwrap().clone();
-    assert_eq!(
-        log.iter().filter(|e| *e == "create").count(),
-        2,
-        "one snapshot per candidate: {log:?}"
-    );
-    assert_eq!(
-        log.iter()
-            .filter(|e| e.starts_with("adopt"))
-            .collect::<Vec<_>>(),
-        vec!["adopt:1"],
-        "only the winner is ever adopted: {log:?}"
-    );
-    assert!(
-        log.contains(&"remove:0".to_string()) && log.contains(&"remove:1".to_string()),
-        "every workspace is removed after the run: {log:?}"
-    );
-    // The adopted paths surface as FileChange events (the session's file
-    // tracking never saw the winner's in-snapshot edits).
-    assert!(
-        events.iter().any(|e| matches!(
-            e,
-            AgentEvent::FileChange { path, kind: FileChangeKind::Modified, .. }
-                if path == "src/x.rs"
-        )),
-        "winner adoption must emit FileChange for adopted paths"
-    );
-}
-
-/// The default single-shot path must never touch the workspace port —
-/// zero snapshot machinery when `candidates` is unset.
-#[tokio::test]
-async fn single_shot_never_touches_the_candidate_workspace_port() {
-    let provider = ScriptedProvider::new(vec![text_result("single"), text_result("done")]);
-    let resolver = OneProvider(&provider);
-    let runner = ScriptedRunner::new(vec![false, true], "@@ -1 +1 @@\n-a\n+b");
-    let tools = EmptyTools;
-    let recall = NoContextRecall;
-    let repo = NoRepoStructure;
-    let repo_status = NoRepoStatus;
-    let approvals = AutoApproveGate;
-    let sleeper = NoopSleeper;
-    let router = router();
-    let port = FakeWorkspacePort::untouchable();
-    let (tx, _rx) = mpsc::unbounded_channel();
-    let pipeline = Pipeline::new(
-        PipelinePorts {
-            router: &router,
-            providers: &resolver,
-            tools: &tools,
-            recall: &recall,
-            repo: &repo,
-            repo_status: &repo_status,
-            diagnostics: &runner,
-            tests: &runner,
-            approvals: &approvals,
-            sleeper: &sleeper,
-            hooks: None,
-            candidate_workspaces: Some(&port),
-            steering: None,
-        },
-        tx,
-        PipelineConfig {
-            test_command: Some("cargo test".into()),
-            ..PipelineConfig::default()
-        },
-    );
-    let mut messages = vec![CompletionMessage::system("sys")];
-    let mut budget = BudgetGuard::new(BudgetMode::Off, None, None);
-    let outcome = pipeline
-        .run("Fix the failing test", &mut messages, &mut budget)
-        .await
-        .expect("run succeeds");
-    assert_eq!(outcome.status, PipelineStatus::Completed);
-    assert_eq!(outcome.candidates_run, 1);
-}
-
-/// A candidate whose snapshot fails is scored as aborted — never run in
-/// the shared tree instead — and the remaining candidates continue.
-#[tokio::test]
-async fn a_failed_snapshot_scores_an_aborted_candidate_and_the_run_continues() {
-    // Only ONE worker turn is scripted: candidate 0 must never execute.
-    let provider = ScriptedProvider::new(vec![text_result("single"), text_result("cand1 done")]);
-    let log = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let port = FakeWorkspacePort::new(
-        vec![
-            Err(WorkspaceError::Snapshot {
-                reason: "disk full".into(),
-            }),
-            Ok(FakeWorkspace::new(
-                1,
-                vec![false, true],
-                Ok(vec![]),
-                log.clone(),
-            )),
-        ],
-        log.clone(),
-    );
-
-    let (outcome, events, _) =
-        run_isolated(&provider, &port, isolated_config(2), "Fix the failing test").await;
-    let outcome = outcome.expect("run succeeds");
-    assert_eq!(outcome.status, PipelineStatus::Completed);
-    assert_eq!(outcome.final_text, "cand1 done");
-    assert!(
-        events.iter().any(|e| matches!(
-            e,
-            AgentEvent::Error { message, retryable: true } if message.contains("skipped")
-        )),
-        "the skipped candidate is warned about, never silent"
-    );
-    let log = log.lock().unwrap().clone();
-    assert_eq!(
-        log,
-        vec!["create", "create", "seal:1", "adopt:1", "remove:1"],
-        "no adoption or removal for the never-created workspace"
-    );
-}
-
-/// A winner whose adoption conflicts (the user edited mid-run) aborts the
-/// run loudly — naming the conflicting paths — and preserves the winner's
-/// workspace while still removing the losers'.
-#[tokio::test]
-async fn an_adoption_conflict_aborts_loudly_and_preserves_the_winner_workspace() {
-    let provider = ScriptedProvider::new(vec![
-        text_result("single"),
-        text_result("cand0 done"),
-        text_result("cand1 done"),
-    ]);
-    let log = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let port = FakeWorkspacePort::new(
-        vec![
-            Ok(FakeWorkspace::new(
-                0,
-                vec![false, false],
-                Ok(vec![]),
-                log.clone(),
-            )),
-            Ok(FakeWorkspace::new(
-                1,
-                vec![false, true],
-                Err(WorkspaceError::Adopt {
-                    reason: "`git apply` rejected the patch".into(),
-                    paths: vec!["src/conflict.rs".into()],
-                    workspace: "/tmp/stella_candidate_ws1".into(),
-                }),
-                log.clone(),
-            )),
-        ],
-        log.clone(),
-    );
-
-    let (outcome, _, _) =
-        run_isolated(&provider, &port, isolated_config(2), "Fix the failing test").await;
-    let outcome = outcome.expect("an adoption conflict is a loud abort, not a panic");
-    match &outcome.status {
-        PipelineStatus::Aborted { reason } => {
-            assert!(
-                reason.contains("src/conflict.rs"),
-                "the abort names the conflicting paths: {reason}"
-            );
-            assert!(
-                reason.contains("/tmp/stella_candidate_ws1"),
-                "the abort names the preserved workspace: {reason}"
-            );
-        }
-        other => panic!("expected an aborted run, got {other:?}"),
-    }
-    let log = log.lock().unwrap().clone();
-    assert!(
-        log.contains(&"remove:0".to_string()),
-        "losers are removed: {log:?}"
-    );
-    assert!(
-        !log.contains(&"remove:1".to_string()),
-        "the winner's workspace is preserved for recovery: {log:?}"
-    );
-}
-
-/// Without a workspace port, best-of-N degrades to the historical
-/// shared-tree behavior — and says so out loud.
-#[tokio::test]
-async fn best_of_n_without_a_port_degrades_to_the_shared_tree_with_a_warning() {
-    let provider = ScriptedProvider::new(vec![
-        text_result("single"),
-        text_result("cand0 done"),
-        text_result("cand1 done"),
-    ]);
-    let resolver = OneProvider(&provider);
-    // One shared runner serves both candidates back-to-back.
-    let runner = ScriptedRunner::new(vec![false, false, false, true], "@@ -1 +1 @@\n-a\n+b");
-    let tools = EmptyTools;
-    let recall = NoContextRecall;
-    let repo = NoRepoStructure;
-    let repo_status = NoRepoStatus;
-    let approvals = AutoApproveGate;
-    let sleeper = NoopSleeper;
-    let router = router();
-    let (tx, mut rx) = mpsc::unbounded_channel();
-    let pipeline = Pipeline::new(
-        PipelinePorts {
-            router: &router,
-            providers: &resolver,
-            tools: &tools,
-            recall: &recall,
-            repo: &repo,
-            repo_status: &repo_status,
-            diagnostics: &runner,
-            tests: &runner,
-            approvals: &approvals,
-            sleeper: &sleeper,
-            hooks: None,
-            candidate_workspaces: None,
-            steering: None,
-        },
-        tx,
-        isolated_config(2),
-    );
-    let mut messages = vec![CompletionMessage::system("sys")];
-    let mut budget = BudgetGuard::new(BudgetMode::Off, None, None);
-    let outcome = pipeline
-        .run("Fix the failing test", &mut messages, &mut budget)
-        .await
-        .expect("run succeeds");
-    assert_eq!(outcome.status, PipelineStatus::Completed);
-    assert_eq!(outcome.candidates_run, 2);
-    assert_eq!(outcome.final_text, "cand1 done");
-    assert!(
-        drain(&mut rx).iter().any(|e| matches!(
-            e,
-            AgentEvent::Error { message, retryable: true }
-                if message.contains("shared working tree")
-        )),
-        "shared-tree degradation must be loud"
-    );
-}
-
+/// Best-of-N candidate isolation tests — see the module doc there for why
+/// the shared infra (`run_isolated`, `isolated_config`, ...) stays here.
+mod best_of_n;
+/// The orchestrator MCP pre-fetch hook (issue #248 Phase 1) — split out for
+/// the same file-size-ratchet reason `tests.rs` itself was split from
+/// `pipeline.rs`; a child module, so it reaches the fakes above via
+/// `super::*`.
+mod mcp_prefetch;
 mod task4;
 mod task5;
 mod usage;
+
+/// The headless approval port is `AlwaysAbortGate`, so "bypass scope review"
+/// has to mean *proceed*. Running the review anyway would hand the plan to a
+/// gate that always says no, empty it, and end the turn having done nothing —
+/// the same zero-work outcome as the hard error, just spelled differently.
+#[tokio::test]
+async fn headless_scope_bypass_proceeds_instead_of_asking_a_gate_that_always_aborts() {
+    // Six steps clears the default 5-step threshold, so scope review fires.
+    let provider = ScriptedProvider::new(vec![
+        text_result("CLASS: multi\nWITNESS: no\nJUDGE: no"),
+        text_result(r#"["a","b","c","d","e","f"]"#),
+        text_result("done"),
+    ]);
+    let config = PipelineConfig {
+        headless: true,
+        headless_bypass_scope_review: true,
+        ..PipelineConfig::default()
+    };
+    let (outcome, events, _) = run_unisolated_with_router(
+        &provider,
+        config,
+        "Refactor across the codebase and then update all callers",
+        router(),
+    )
+    .await;
+    let outcome = outcome.expect("bypass must not surface the headless scope error");
+
+    assert_ne!(
+        outcome.status,
+        PipelineStatus::Aborted {
+            reason: "aborted at scope review".to_string()
+        },
+        "a bypassed review must not abort at the gate it bypassed"
+    );
+    let s = stages(&events);
+    assert!(
+        s.contains(&StageKind::Execute),
+        "the run reaches execute rather than ending at the gate: {s:?}"
+    );
+}

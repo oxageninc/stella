@@ -11,6 +11,37 @@ use stella_pipeline::{
     TestRunner,
 };
 
+/// Apply the cross-crate policy shared by every model/repository-controlled
+/// subprocess. Kept as a named seam so the CLI's pipeline-only spawns have a
+/// direct regression test rather than relying only on stella-tools tests.
+fn scrub_model_subprocess(command: &mut tokio::process::Command) {
+    stella_tools::subprocess_env::scrub_sensitive_env(command);
+}
+
+/// The single filesystem-isolation seam for developer script-tool discovery.
+/// Both the session stack and candidate workspaces use this exact report.
+#[cfg(test)]
+pub(crate) fn custom_tool_report_for_workspace(
+    root: &std::path::Path,
+) -> stella_tools::custom::DiscoveryReport {
+    custom_tool_report_for_scopes(root, true)
+}
+
+/// Discover only the custom-tool scopes permitted by the current authority.
+/// Filesystem-isolated benchmark runs omit both workspace and user-global
+/// executable extensions regardless of the ordinary authority policy.
+pub(crate) fn custom_tool_report_for_scopes(
+    root: &std::path::Path,
+    include_workspace: bool,
+) -> stella_tools::custom::DiscoveryReport {
+    if crate::settings::filesystem_settings_disabled() {
+        stella_tools::custom::DiscoveryReport::default()
+    } else {
+        let home = crate::settings::user_home_dir();
+        stella_tools::custom::discover_in_scopes(root, home.as_deref(), include_workspace)
+    }
+}
+
 /// Repo-structure summary via `git ls-files` for the planner's split context.
 pub(crate) struct GitRepoStructure {
     pub(crate) root: std::path::PathBuf,
@@ -20,12 +51,12 @@ pub(crate) struct GitRepoStructure {
 impl RepoStructurePort for GitRepoStructure {
     async fn structure_summary(&self) -> String {
         let mut cmd = tokio::process::Command::new("git");
-        stella_tools::exec::scrub_sensitive_env(&mut cmd);
         cmd.args(["ls-files"]).current_dir(&self.root);
         // Hook-exported GIT_* vars must not re-target this at another repo.
         for var in stella_tools::exec::GIT_REPO_ENV_VARS {
             cmd.env_remove(var);
         }
+        scrub_model_subprocess(&mut cmd);
         let output = cmd.output().await;
         match output {
             Ok(out) if out.status.success() => {
@@ -53,7 +84,6 @@ impl RepoStatusPort for GitRepoStatus {
         // `-z` NUL-delimits paths (robust to spaces/newlines); quotePath off
         // keeps non-ASCII literal. Full stdout is read — never truncated.
         let mut cmd = tokio::process::Command::new("git");
-        stella_tools::exec::scrub_sensitive_env(&mut cmd);
         cmd.args([
             "-c",
             "core.quotePath=false",
@@ -67,6 +97,7 @@ impl RepoStatusPort for GitRepoStatus {
         for var in stella_tools::exec::GIT_REPO_ENV_VARS {
             cmd.env_remove(var);
         }
+        scrub_model_subprocess(&mut cmd);
         let output = cmd.output().await;
         let Ok(listing) = output else {
             return out;
@@ -248,15 +279,24 @@ pub(crate) struct WorkspacePorts {
     pub(crate) test_runner: TypedTestRunner,
     /// Used for best-of-N and for candidate-local authored witnesses at N=1.
     pub(crate) candidate_workspaces: crate::candidate_ws::GitCandidateWorkspaces,
+    /// The orchestrator's Best-of-N MCP pre-fetch adapter (issue #248
+    /// Phase 1), sharing the same MCP toolset threaded into
+    /// `candidate_workspaces` — `None` when the session has no MCP
+    /// servers connected. Inert unless `candidates > 1`, same as above.
+    pub(crate) mcp_prefetch: Option<crate::candidate_ws::McpPrefetchAdapter>,
 }
 
 /// Build the [`WorkspacePorts`] bundle rooted at `root` (the session
-/// workspace, or a fleet worker's own worktree).
+/// workspace, or a fleet worker's own worktree). `mcp`, when the caller has
+/// one connected, is shared into both the candidate tool surface
+/// (`candidate_safe`-filtered) and the orchestrator pre-fetch hook — the
+/// same live connections, no new subprocess (issue #248 Phase 1).
 pub(crate) fn workspace_ports(
     root: std::path::PathBuf,
     cfg: &Config,
     registry_options: stella_tools::RegistryOptions,
     active_rules: crate::rules::ResolvedRules,
+    mcp: Option<Arc<stella_mcp::McpToolSet>>,
 ) -> Result<WorkspacePorts, String> {
     crate::enterprise_telemetry::authorize_execution_surface(
         crate::enterprise_telemetry::ExecutionSurface::WorkspacePorts,
@@ -274,17 +314,22 @@ pub(crate) fn workspace_ports(
         cfg.authority.project_custom_tools_allowed,
     )
     .tools;
+    let mut candidate_workspaces = crate::candidate_ws::GitCandidateWorkspaces::new(
+        root.clone(),
+        registry_options,
+        custom_tools,
+        active_rules,
+    );
+    if let Some(mcp) = &mcp {
+        candidate_workspaces = candidate_workspaces.with_candidate_mcp(Arc::clone(mcp));
+    }
     Ok(WorkspacePorts {
         repo_structure: GitRepoStructure { root: root.clone() },
         repo_status: GitRepoStatus { root: root.clone() },
-        diagnostic_runner: GitDiagnosticRunner { root: root.clone() },
-        test_runner: TypedTestRunner { root: root.clone() },
-        candidate_workspaces: crate::candidate_ws::GitCandidateWorkspaces::new(
-            root,
-            registry_options,
-            custom_tools,
-            active_rules,
-        ),
+        diagnostic_runner: GitDiagnosticRunner::new(root.clone()),
+        test_runner: TypedTestRunner { root },
+        candidate_workspaces,
+        mcp_prefetch: mcp.map(crate::candidate_ws::McpPrefetchAdapter::new),
     })
 }
 
@@ -292,6 +337,54 @@ pub(crate) fn workspace_ports(
 /// paths remain literal arguments and no shell is involved.
 pub(crate) struct GitDiagnosticRunner {
     pub(crate) root: std::path::PathBuf,
+    /// The commit the session started on, resolved eagerly at construction.
+    ///
+    /// A bare `git diff` reports only unstaged working-tree changes, so an
+    /// agent that *commits* its work — with `repo_commit`, a tool this very
+    /// registry ships — leaves a clean tree and reads as having changed
+    /// nothing. Verification then tells it "no changes were made to the
+    /// repository" while the files sit on disk, and the honest conclusion
+    /// available to the model is that its work was lost. Diffing against the
+    /// starting commit instead counts staged, unstaged, and committed work
+    /// alike. `None` means no resolvable HEAD (an empty or non-git tree), in
+    /// which case the plain working-tree diff is already the whole truth.
+    pub(crate) baseline: Option<String>,
+}
+
+impl GitDiagnosticRunner {
+    /// Resolve the baseline NOW, at session/candidate setup — not on the
+    /// first diff.
+    ///
+    /// Every `GitDiff` runs inside `gather_diff`, which happens *after*
+    /// execute. Resolving lazily there would read HEAD once the agent had
+    /// already committed, making the baseline the agent's own commit and the
+    /// diff empty again — reintroducing exactly the bug this fixes, while a
+    /// test that captured early would still pass.
+    pub(crate) fn new(root: std::path::PathBuf) -> Self {
+        let baseline = resolve_head(&root);
+        Self { root, baseline }
+    }
+
+    fn baseline_commit(&self) -> Option<&str> {
+        self.baseline.as_deref()
+    }
+}
+
+/// `git rev-parse HEAD`, or `None` when there is no resolvable commit (an
+/// empty or non-git tree) — where the working-tree diff is already the whole
+/// truth.
+fn resolve_head(root: &std::path::Path) -> Option<String> {
+    let mut cmd = std::process::Command::new("git");
+    cmd.args(["rev-parse", "HEAD"]).current_dir(root);
+    for var in stella_tools::exec::GIT_REPO_ENV_VARS {
+        cmd.env_remove(var);
+    }
+    let out = cmd.output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (sha.len() == 40 && sha.chars().all(|c| c.is_ascii_hexdigit())).then_some(sha)
 }
 
 /// Workspace-rooted typed test runner. It passes an enumerable argv directly
@@ -309,7 +402,6 @@ impl TestRunner for TypedTestRunner {
 
 fn test_process(invocation: &TestInvocation, root: &std::path::Path) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new(&invocation.program);
-    stella_tools::exec::scrub_sensitive_env(&mut cmd);
     cmd.args(&invocation.args)
         .current_dir(root)
         .env("PWD", root);
@@ -326,9 +418,14 @@ impl DiagnosticRunner for GitDiagnosticRunner {
         let mut cmd = tokio::process::Command::new("git");
         stella_tools::exec::scrub_sensitive_env(&mut cmd);
         match invocation {
-            DiagnosticInvocation::GitDiff => {
-                cmd.args(["diff"]);
-            }
+            DiagnosticInvocation::GitDiff => match self.baseline_commit() {
+                Some(baseline) => {
+                    cmd.args(["diff", baseline]);
+                }
+                None => {
+                    cmd.args(["diff"]);
+                }
+            },
             DiagnosticInvocation::UntrackedNumstat { path } => {
                 cmd.args(["diff", "--no-index", "--numstat", "--", "/dev/null", path]);
             }
@@ -663,9 +760,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let odd = "odd;touch owned.txt";
         std::fs::write(dir.path().join(odd), "one\ntwo\n").unwrap();
-        let runner = GitDiagnosticRunner {
-            root: dir.path().to_path_buf(),
-        };
+        let runner = GitDiagnosticRunner::new(dir.path().to_path_buf());
 
         let outcome = runner
             .run_diagnostic(&DiagnosticInvocation::UntrackedNumstat {
@@ -908,5 +1003,114 @@ mod tests {
             assert_eq!(provider, expected_calls, "provider row {name}");
             assert_eq!(is_error, !allowed, "output row {name}");
         }
+    }
+}
+
+#[cfg(test)]
+mod benchmark_tests {
+    use super::*;
+
+    #[test]
+    fn pipeline_test_command_uses_central_credential_scrub_policy() {
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .env("OPENROUTER_API_KEY", "provider-secret")
+            .env("GITHUB_TOKEN", "repo-secret")
+            .env("AWS_SECRET_ACCESS_KEY", "cloud-secret")
+            .env("STELLA_TEST_BENIGN", "visible");
+
+        scrub_model_subprocess(&mut command);
+
+        let overrides: std::collections::HashMap<_, _> = command
+            .as_std()
+            .get_envs()
+            .map(|(name, value)| {
+                (
+                    name.to_string_lossy().into_owned(),
+                    value.map(std::ffi::OsStr::to_os_string),
+                )
+            })
+            .collect();
+        for secret in [
+            "OPENROUTER_API_KEY",
+            "GITHUB_TOKEN",
+            "AWS_SECRET_ACCESS_KEY",
+        ] {
+            assert_eq!(
+                overrides.get(secret),
+                Some(&None),
+                "{secret} was not removed"
+            );
+        }
+        assert_eq!(
+            overrides["STELLA_TEST_BENIGN"].as_deref(),
+            Some(std::ffi::OsStr::new("visible"))
+        );
+    }
+}
+
+#[cfg(test)]
+mod diff_baseline_tests {
+    use super::*;
+    use stella_pipeline::DiagnosticInvocation;
+
+    fn git(root: &std::path::Path, args: &[&str]) {
+        let ok = std::process::Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .expect("git runs")
+            .status
+            .success();
+        assert!(ok, "git {args:?} failed");
+    }
+
+    /// Committing is not the same as doing nothing. A bare `git diff` reports
+    /// only unstaged changes, so an agent that commits its work — with
+    /// `repo_commit`, which this registry ships — left a clean tree and was
+    /// told "no changes were made to the repository" while its files sat on
+    /// disk. Measured on Terminal-Bench `kv-store-grpc`: the task verifier
+    /// passed 5 of 7 sub-tests while the judge insisted the diff was empty.
+    #[tokio::test]
+    async fn committed_work_is_still_visible_to_the_diff() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git(root, &["init", "-q"]);
+        std::fs::write(root.join("seed.txt"), "seed\n").unwrap();
+        git(root, &["add", "-A"]);
+        git(root, &["commit", "-qm", "baseline"]);
+
+        // Construct at session setup and then never touch it again — the
+        // production order. Nothing here forces an early capture; if the
+        // baseline resolved lazily on the first diff it would land AFTER the
+        // commit below and this test would fail, which is the point.
+        let runner = GitDiagnosticRunner::new(root.to_path_buf());
+
+        // The agent writes AND commits — the tree ends clean.
+        std::fs::write(root.join("server.py"), "def serve():\n    return 1\n").unwrap();
+        git(root, &["add", "-A"]);
+        git(root, &["commit", "-qm", "the agent's work"]);
+
+        let out = runner
+            .run_diagnostic(&DiagnosticInvocation::GitDiff)
+            .await;
+        assert!(
+            out.stdout_tail.contains("server.py"),
+            "committed work must appear in the diff, got: {:?}",
+            out.stdout_tail
+        );
+    }
+
+    /// No resolvable HEAD (an empty or non-git tree) leaves the plain
+    /// working-tree diff, which is already the whole truth there.
+    #[tokio::test]
+    async fn a_tree_without_a_commit_falls_back_to_the_working_diff() {
+        let dir = tempfile::tempdir().unwrap();
+        let runner = GitDiagnosticRunner::new(dir.path().to_path_buf());
+        assert!(runner.baseline_commit().is_none());
     }
 }

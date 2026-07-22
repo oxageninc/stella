@@ -184,6 +184,12 @@ pub enum AgentEvent {
         /// configured default. Empty only on legacy events.
         #[serde(default)]
         provider: String,
+        /// Authoritative model output for calls that do not emit a separate
+        /// [`AgentEvent::Text`] (pipeline management and compaction calls).
+        /// Execute calls leave this `None`, avoiding duplicate transcript
+        /// text while keeping older event consumers compatible.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output_text: Option<String>,
         model: String,
         input_tokens: u64,
         output_tokens: u64,
@@ -382,7 +388,7 @@ pub struct ContextFrameRef {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
     pub citation_label: String,
-    /// The OCP provider leg that returned the frame. Empty only when reading
+    /// The CGP provider leg that returned the frame. Empty only when reading
     /// a stream recorded before provider provenance was added.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub provider: String,
@@ -918,8 +924,9 @@ mod tests {
     fn step_usage_roundtrips_as_a_complete_metering_record() {
         let event = AgentEvent::StepUsage {
             step: 3,
-            role: ModelCallRole::Worker,
+            role: ModelCallRole::Plan,
             provider: "zai".into(),
+            output_text: Some(r#"["inspect", "patch"]"#.into()),
             model: "glm-5.2".into(),
             input_tokens: 12_000,
             output_tokens: 450,
@@ -934,11 +941,14 @@ mod tests {
         };
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains("\"type\":\"step_usage\""), "{json}");
+        assert!(json.contains("\"role\":\"plan\""), "{json}");
         assert!(json.contains("\"cache_write_tokens\":2500"), "{json}");
         let back: AgentEvent = serde_json::from_str(&json).unwrap();
         match back {
             AgentEvent::StepUsage {
                 step,
+                role,
+                output_text,
                 cached_input_tokens,
                 cache_write_tokens,
                 estimated_input_tokens,
@@ -947,6 +957,8 @@ mod tests {
                 ..
             } => {
                 assert_eq!(step, 3);
+                assert_eq!(role, ModelCallRole::Plan);
+                assert_eq!(output_text.as_deref(), Some(r#"["inspect", "patch"]"#));
                 assert_eq!(cached_input_tokens, 9_000);
                 assert_eq!(cache_write_tokens, 2_500);
                 assert_eq!(estimated_input_tokens, 11_200);
@@ -969,11 +981,15 @@ mod tests {
         let back: AgentEvent = serde_json::from_str(legacy).unwrap();
         match back {
             AgentEvent::StepUsage {
+                role,
+                output_text,
                 estimated_input_tokens,
                 input_tokens,
                 ..
             } => {
                 assert_eq!(estimated_input_tokens, 0);
+                assert_eq!(role, ModelCallRole::Unknown);
+                assert_eq!(output_text, None);
                 assert_eq!(input_tokens, 12_000);
             }
             other => panic!("unexpected variant: {other:?}"),

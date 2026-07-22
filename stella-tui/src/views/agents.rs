@@ -397,6 +397,7 @@ mod tests {
         model.apply_inbound(&Inbound::Event {
             agent: "lead".into(),
             event: AgentEvent::StepUsage {
+                output_text: None,
                 step: 1,
                 role: stella_protocol::ModelCallRole::Worker,
                 provider: "zai".into(),
@@ -456,6 +457,7 @@ mod tests {
         model.apply_inbound(&Inbound::Event {
             agent: "lead".into(),
             event: AgentEvent::StepUsage {
+                output_text: None,
                 step: 1,
                 role: stella_protocol::event::ModelCallRole::Worker,
                 provider: "anthropic".into(),

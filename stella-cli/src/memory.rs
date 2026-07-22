@@ -10,7 +10,7 @@
 //! Data flow per turn:
 //!
 //! ```text
-//! prompt ──> recall_block(): registry-routed recall (crate::ocp) + select_skills()
+//! prompt ──> recall_block(): registry-routed recall (crate::contextgraph) + select_skills()
 //!            └─ volatile message AFTER the byte-stable system prefix (L-E8)
 //! turn runs …
 //! outcome ─> reflect_and_record(): one cheap model call -> 0-3 lessons
@@ -33,8 +33,8 @@ use stella_context::{
     FactAssertion, HashEmbedder, MemoryInput, NodeInput, NodeKind, SystemClock, format_rfc3339,
 };
 use stella_core::skills::{
-    self, AutoCreateConfig, AutoCreateDecision, LoadSkillsOptions, SelectionConfig, Skill,
-    SkillMineConfig, SkillObservation, SkillSource,
+    self, AutoCreateConfig, AutoCreateDecision, SelectionConfig, Skill, SkillMineConfig,
+    SkillObservation,
 };
 use stella_pipeline::{ContextRecallPort, RecalledFrame};
 use stella_protocol::{CompletionMessage, MessageRole, Provider};
@@ -45,8 +45,13 @@ mod private_state;
 mod projection;
 #[cfg(test)]
 mod quarantine_tests;
+#[path = "memory/skills.rs"]
+mod skill_files;
 use private_state::resolve_context_db_path;
 use projection::{is_quarantined_local_memory, project_recalled_frame};
+#[cfg(test)]
+pub(crate) use skill_files::load_workspace_skills;
+pub(crate) use skill_files::{load_workspace_skills_with_authority, workspace_skills_dir};
 
 /// Marker prefixing a recalled-context message so [`inject_recall_block`]
 /// can find the newest one for dedup. Blocks land at the conversation
@@ -71,13 +76,13 @@ mod reflection;
 use reflection::parse_lessons;
 pub use reflection::{ReflectionReport, reflect_on_turn, turn_warrants_reflection};
 
-/// Session-scoped memory state: the context store, the OCP host that
-/// routes every recall (workspace memory + code graph as in-process OCP
-/// providers — see `crate::ocp`), the domain taxonomy, and the skills
+/// Session-scoped memory state: the context store, the CGP host that
+/// routes every recall (workspace memory + code graph as in-process CGP
+/// providers — see `crate::contextgraph`), the domain taxonomy, and the skills
 /// auto-creation accounting.
 pub struct SessionMemory {
     store: std::sync::Arc<ContextStore>,
-    host: ocp_host::Host,
+    host: contextgraph_host::Host,
     domains: Domains,
     workspace_root: PathBuf,
     include_workspace_skills: bool,
@@ -90,89 +95,6 @@ pub struct SessionMemory {
     /// every `rate`-th turn a deterministic control turn (see
     /// [`SessionMemory::maybe_suppress_recall`]).
     ab_turn: u32,
-}
-
-/// Filesystem-backed [`SkillSource`] reading the workspace + user-global
-/// skill directories. Private: outside consumers go through
-/// [`load_workspace_skills`] / [`load_workspace_skills_with_diagnostics`].
-struct FsSkillSource;
-
-impl SkillSource for FsSkillSource {
-    fn read_skill_files(&self, roots: &[String]) -> Vec<skills::SkillFile> {
-        let mut files = Vec::new();
-        for root in roots {
-            // Flat layout: <root>/<slug>.md
-            if let Ok(entries) = std::fs::read_dir(root) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.extension().is_some_and(|e| e == "md") {
-                        if let Ok(content) = std::fs::read_to_string(&path) {
-                            files.push(skills::SkillFile {
-                                path: path.display().to_string(),
-                                content,
-                            });
-                        }
-                    } else if path.is_dir() {
-                        // Ecosystem layout: <root>/<slug>/SKILL.md
-                        let nested = path.join("SKILL.md");
-                        if let Ok(content) = std::fs::read_to_string(&nested) {
-                            files.push(skills::SkillFile {
-                                path: nested.display().to_string(),
-                                content,
-                            });
-                        }
-                    }
-                }
-            }
-        }
-        files
-    }
-}
-
-/// `<workspace>/.stella/skills` — the workspace-scope skills directory.
-pub(crate) fn workspace_skills_dir(workspace_root: &Path) -> String {
-    workspace_root
-        .join(".stella")
-        .join("skills")
-        .display()
-        .to_string()
-}
-
-/// `~/.config/stella/skills` — the user-global skills directory (empty
-/// string without a home, which the loader skips silently).
-pub(crate) fn user_skills_dir() -> String {
-    std::env::var_os("HOME")
-        .map(|home| {
-            PathBuf::from(home)
-                .join(".config")
-                .join("stella")
-                .join("skills")
-                .display()
-                .to_string()
-        })
-        .unwrap_or_default()
-}
-
-/// Load user-global skills and, when permitted, workspace skill definitions.
-pub(crate) fn load_workspace_skills_with_authority(
-    workspace_root: &Path,
-    include_workspace: bool,
-) -> skills::LoadedSkills {
-    let mut loaded = skills::load_skills_with_diagnostics(
-        &FsSkillSource,
-        &LoadSkillsOptions {
-            workspace_skills_dir: if include_workspace {
-                workspace_skills_dir(workspace_root)
-            } else {
-                String::new()
-            },
-            user_skills_dir: user_skills_dir(),
-        },
-    );
-    // A skill disabled from the SKILLS tab is excluded from recall/selection
-    // and the ⚡ slash menu — its file stays on disk (see `crate::skill_manager`).
-    crate::skill_manager::retain_enabled(&mut loaded.skills, workspace_root);
-    loaded
 }
 
 impl SessionMemory {
@@ -197,6 +119,14 @@ impl SessionMemory {
         warn: bool,
         include_workspace_skills: bool,
     ) -> Option<Self> {
+        // Ephemeral benchmark trials must neither recall task/user-planted
+        // learning state nor create or migrate a context database that can
+        // perturb the task under test. Reflection is separately pinned off
+        // by the launcher; this closes the pre-turn recall side of the same
+        // boundary before the private-state resolver performs any I/O.
+        if crate::settings::filesystem_settings_disabled() {
+            return None;
+        }
         let db_path = resolve_context_db_path(workspace_root, warn, |message| {
             eprintln!("  {} {message}", "!".yellow());
         })?;
@@ -211,7 +141,7 @@ impl SessionMemory {
                     .flatten()
                     .unwrap_or_default();
                 let store = std::sync::Arc::new(store);
-                let host = crate::ocp::session_host(
+                let host = crate::contextgraph::session_host(
                     store.clone(),
                     domains.names(),
                     workspace_root.to_path_buf(),
@@ -689,7 +619,7 @@ impl SessionMemory {
                 return Vec::new();
             }
         };
-        crate::ocp::recall_via_host(&self.host, &query)
+        crate::contextgraph::recall_via_host(&self.host, &query)
             .await
             .into_iter()
             .filter_map(project_recalled_frame)
@@ -910,7 +840,12 @@ mod tests {
         assert_eq!(before, after, "suppressed recall leaves history untouched");
     }
 
-    fn frame(id: &str, kind: ocp_types::FrameKind, label: &str, content: &str) -> RecalledFrame {
+    fn frame(
+        id: &str,
+        kind: contextgraph_types::FrameKind,
+        label: &str,
+        content: &str,
+    ) -> RecalledFrame {
         let kind = serde_json::to_value(kind)
             .unwrap()
             .as_str()
@@ -929,13 +864,13 @@ mod tests {
         }
     }
 
-    fn ocp_frame(
+    fn contextgraph_frame(
         id: &str,
-        kind: ocp_types::FrameKind,
+        kind: contextgraph_types::FrameKind,
         label: &str,
         content: &str,
-    ) -> ocp_types::ContextFrame {
-        ocp_types::ContextFrame {
+    ) -> contextgraph_types::ContextFrame {
+        contextgraph_types::ContextFrame {
             id: id.into(),
             kind,
             title: label.into(),
@@ -958,13 +893,13 @@ mod tests {
         let frames = vec![
             frame(
                 "nod_0123456789abcdef01234567",
-                ocp_types::FrameKind::Memory,
+                contextgraph_types::FrameKind::Memory,
                 "prefer rg",
                 "prefer rg over grep here",
             ),
             frame(
                 "nod_bbb",
-                ocp_types::FrameKind::Snippet,
+                contextgraph_types::FrameKind::Snippet,
                 "src/lib.rs",
                 "fn main",
             ),
@@ -989,7 +924,7 @@ mod tests {
     fn recall_section_without_memories_never_asks_for_citations() {
         let frames = vec![frame(
             "nod_ccc",
-            ocp_types::FrameKind::Snippet,
+            contextgraph_types::FrameKind::Snippet,
             "src/lib.rs",
             "fn main",
         )];
@@ -1003,15 +938,15 @@ mod tests {
 
     #[test]
     fn graph_frame_projection_preserves_provider_and_origin_provenance() {
-        let mut graph = ocp_frame(
+        let mut graph = contextgraph_frame(
             "code-graph:sym:src/lib.rs:7:run",
-            ocp_types::FrameKind::Symbol,
+            contextgraph_types::FrameKind::Symbol,
             "fn run (src/lib.rs:7)",
             "fn run() {}",
         );
         graph.uri = Some("file:///repo/src/lib.rs".into());
         graph.provenance = vec![
-            ocp_types::Provenance {
+            contextgraph_types::Provenance {
                 kind: "file".into(),
                 uri: graph.uri.clone(),
                 range: Some("L7-9".into()),
@@ -1019,7 +954,7 @@ mod tests {
                 method: None,
                 by: Some("git-worktree".into()),
             },
-            ocp_types::Provenance {
+            contextgraph_types::Provenance {
                 kind: "derivation".into(),
                 uri: None,
                 range: None,
@@ -1029,7 +964,7 @@ mod tests {
             },
         ];
 
-        let recalled = project_recalled_frame(crate::ocp::AttributedContextFrame {
+        let recalled = project_recalled_frame(crate::contextgraph::AttributedContextFrame {
             provider: "code-graph".into(),
             frame: graph,
         })
@@ -1053,7 +988,7 @@ mod tests {
         let quarantined = std::collections::HashSet::from(["shared-id".to_string()]);
         let mut local = frame(
             "shared-id",
-            ocp_types::FrameKind::Memory,
+            contextgraph_types::FrameKind::Memory,
             "local",
             "local memory",
         );
@@ -1213,6 +1148,7 @@ mod tests {
         // SAFETY: serialized behind the binary-wide environment lock.
         let previous_home = std::env::var_os("HOME");
         unsafe { std::env::set_var("HOME", &home) };
+        let _test_home = crate::settings::test_user_home(home.clone());
 
         let skills = load_workspace_skills_with_authority(&workspace, false).skills;
         let trusted = load_workspace_skills_with_authority(&workspace, true).skills;
@@ -1228,7 +1164,7 @@ mod tests {
 
         let ordinary = frame(
             "nod_context",
-            ocp_types::FrameKind::Snippet,
+            contextgraph_types::FrameKind::Snippet,
             "src/lib.rs",
             "ordinary recalled evidence",
         );

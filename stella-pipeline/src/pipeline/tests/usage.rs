@@ -61,7 +61,7 @@ async fn run_triage_only(
     provider: &dyn Provider,
     config: PipelineConfig,
     budget: &mut BudgetGuard,
-) -> (Result<TaskClass, PipelineBudgetAbort>, f64, Vec<AgentEvent>) {
+) -> (Result<TaskAssessment, PipelineBudgetAbort>, f64, Vec<AgentEvent>) {
     let resolver = AnyProvider(provider);
     let tools = EmptyTools;
     let recall = NoContextRecall;
@@ -86,6 +86,7 @@ async fn run_triage_only(
             sleeper: &sleeper,
             hooks: None,
             candidate_workspaces: None,
+            mcp_prefetch: None,
             steering: None,
         },
         tx,
@@ -139,7 +140,7 @@ async fn triage_provider_error_emits_content_free_incompleteness() {
     let mut budget = BudgetGuard::new(BudgetMode::Off, None, None);
     let (result, _, events) =
         run_triage_only(&ErrorProvider, PipelineConfig::default(), &mut budget).await;
-    assert_eq!(result.unwrap(), TaskClass::SimpleLookup);
+    assert_eq!(result.unwrap().class, TaskClass::SimpleLookup);
     let usage = usage_events(&events);
     assert_eq!(usage.len(), 1);
     assert_eq!(usage[0]["type"], "usage_incomplete");
@@ -159,7 +160,7 @@ async fn triage_timeout_emits_content_free_incompleteness() {
         ..PipelineConfig::default()
     };
     let (result, _, events) = run_triage_only(&SlowProvider, config, &mut budget).await;
-    assert_eq!(result.unwrap(), TaskClass::SimpleLookup);
+    assert_eq!(result.unwrap().class, TaskClass::SimpleLookup);
     let usage = usage_events(&events);
     assert_eq!(usage.len(), 1);
     assert_eq!(usage[0]["type"], "usage_incomplete");
@@ -197,6 +198,7 @@ async fn plan_and_plan_repair_each_emit_one_paid_call_envelope() {
             sleeper: &sleeper,
             hooks: None,
             candidate_workspaces: None,
+            mcp_prefetch: None,
             steering: None,
         },
         tx,
@@ -286,6 +288,7 @@ async fn distress_guidance_and_engine_revisions_keep_distinct_envelopes() {
             sleeper: &sleeper,
             hooks: None,
             candidate_workspaces: None,
+            mcp_prefetch: None,
             steering: None,
         },
         tx,
@@ -339,6 +342,7 @@ async fn model_judge_call_is_metered_separately_from_worker() {
             sleeper: &sleeper,
             hooks: None,
             candidate_workspaces: None,
+            mcp_prefetch: None,
             steering: None,
         },
         tx,

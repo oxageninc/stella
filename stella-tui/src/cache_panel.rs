@@ -335,6 +335,7 @@ mod tests {
 
     fn step_usage_full(input: u64, cached: u64, write: u64) -> AgentEvent {
         AgentEvent::StepUsage {
+            output_text: None,
             step: 1,
             role: stella_protocol::event::ModelCallRole::Worker,
             provider: "zai".into(),

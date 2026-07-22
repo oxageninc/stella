@@ -4,6 +4,28 @@ use super::skills::{
 };
 use super::*;
 
+#[tokio::test]
+async fn pr_observer_preserves_github_auth_only() {
+    let mut command = tokio::process::Command::new("sh");
+    command
+        .args([
+            "-c",
+            "printf '%s|%s|%s|%s' \"${OPENROUTER_API_KEY-unset}\" \"${GITHUB_TOKEN-unset}\" \"${AWS_SECRET_ACCESS_KEY-unset}\" \"${STELLA_TEST_BENIGN-unset}\"",
+        ])
+        .env("OPENROUTER_API_KEY", "provider-secret")
+        .env("GITHUB_TOKEN", "repository-secret")
+        .env("AWS_SECRET_ACCESS_KEY", "cloud-secret")
+        .env("STELLA_TEST_BENIGN", "visible");
+    scrub_gh_command(&mut command);
+
+    let output = command.output().await.unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "unset|repository-secret|unset|visible"
+    );
+}
+
 #[test]
 fn deck_arg_commands_parse_models_forms_and_leave_sentences_as_prompts() {
     assert!(matches!(
@@ -629,9 +651,9 @@ fn memory_hits_carry_the_preview_provenance_and_citation_suffixes() {
 
 #[test]
 fn symbol_hits_take_the_bare_name_and_the_file_location() {
-    let frame = ocp_types::ContextFrame {
+    let frame = contextgraph_types::ContextFrame {
         id: "code-graph:sym:src/lib.rs:12:issue_row".into(),
-        kind: ocp_types::FrameKind::Symbol,
+        kind: contextgraph_types::FrameKind::Symbol,
         title: "fn issue_row".into(),
         content: "fn issue_row(...) { ... }".into(),
         uri: Some("file:///repo/src/lib.rs".into()),

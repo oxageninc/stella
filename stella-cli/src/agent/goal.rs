@@ -21,7 +21,7 @@ pub(crate) async fn run_raw_one_shot(
     // files-touched ledger is reachable after the turn — the trait object
     // hides it. It still coerces to `&dyn ToolExecutor` for the engine.
     let registry: std::sync::Arc<ToolRegistry> = std::sync::Arc::new(
-        ToolRegistry::new_detected(cfg.workspace_root.clone(), registry_options.clone()).await,
+        new_tool_registry(cfg.workspace_root.clone(), registry_options.clone()).await,
     );
     populate_schema_index(&registry, &cfg.workspace_root)?;
     let active_rules =
@@ -48,7 +48,7 @@ pub(crate) async fn run_raw_one_shot(
         .await?
     };
     let base_tools: &dyn ToolExecutor = match &mcp {
-        Some(set) => set,
+        Some(set) => set.as_ref(),
         None => &*registry,
     };
     let custom_tools = if process_free {
@@ -133,7 +133,10 @@ pub(crate) async fn run_raw_one_shot(
     // staged pipeline it has no post-turn event phase before that terminal
     // barrier. Keep machine streams strict by not dispatching an unframed
     // reflection call after `Complete` (text retains the best-effort loop).
+    // `one_shot_reflection_enabled` additionally honors the benchmark
+    // adapter's `STELLA_DISABLE_REFLECTION` opt-out.
     if format == OutputFormat::Text
+        && one_shot_reflection_enabled(format)
         && turn_warrants_reflection(&messages)
         && let Some(m) = &mut memory
     {
@@ -198,7 +201,7 @@ pub async fn run_goal_cmd(
     let provider = build_provider(cfg)?;
     let registry_options = registry_options(cfg);
     let registry: std::sync::Arc<ToolRegistry> = std::sync::Arc::new(
-        ToolRegistry::new_detected(cfg.workspace_root.clone(), registry_options.clone()).await,
+        new_tool_registry(cfg.workspace_root.clone(), registry_options.clone()).await,
     );
     populate_schema_index(&registry, &cfg.workspace_root)?;
     let active_rules =
@@ -220,7 +223,7 @@ pub async fn run_goal_cmd(
     )
     .await?;
     let base_tools: &dyn ToolExecutor = match &mcp {
-        Some(set) => set,
+        Some(set) => set.as_ref(),
         None => &*registry,
     };
     let custom_tools = discover_custom_tools(cfg, true).await;
@@ -262,6 +265,7 @@ pub async fn run_goal_cmd(
             Some(presence.id()),
             registry_options.clone(),
             active_rules.clone(),
+            mcp.clone(),
         )
         .await
     } else {
@@ -384,6 +388,7 @@ pub(crate) async fn run_goal_turn(
         OutputFormat::Text,
         execution.clone(),
         cfg.provider.id.to_string(),
+        false,
     );
 
     let outcome = {
@@ -493,6 +498,7 @@ async fn run_goal_pipeline_turn(
     session: Option<&str>,
     registry_options: stella_tools::RegistryOptions,
     active_rules: crate::rules::ResolvedRules,
+    mcp: Option<Arc<stella_mcp::McpToolSet>>,
 ) -> Result<(), String> {
     let turn_start = Instant::now();
     let execution = begin_execution(store, "goal", goal, cfg, session);
@@ -550,6 +556,7 @@ async fn run_goal_pipeline_turn(
         OutputFormat::Text,
         execution.clone(),
         cfg.provider.id.to_string(),
+        false,
     );
 
     // Run the loop; the result is folded into `goal_result` so there is exactly
@@ -574,6 +581,7 @@ async fn run_goal_pipeline_turn(
             cfg,
             registry_options,
             active_rules.clone(),
+            mcp,
         )?;
         let no_recall = NoContextRecall;
         let recall: &dyn ContextRecallPort = &no_recall;
@@ -620,6 +628,10 @@ async fn run_goal_pipeline_turn(
                     .as_ref()
                     .map(|h| (h, &hook_runner as &dyn stella_core::hooks::HookRunner)),
                 candidate_workspaces: Some(&ws_ports.candidate_workspaces),
+                mcp_prefetch: ws_ports
+                    .mcp_prefetch
+                    .as_ref()
+                    .map(|p| p as &dyn McpPrefetchPort),
                 // Goal pipeline rounds run without an interactive steer tap.
                 steering: None,
             };
