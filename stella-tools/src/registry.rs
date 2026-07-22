@@ -286,15 +286,6 @@ impl ToolRegistry {
         // the chicken-and-egg gate.
         entries.push(Arc::new(crate::overview::ProjectOverview));
         entries.push(Arc::new(crate::graph::CodeGraphQuery));
-        // Registered unconditionally, unlike `graph_query`: the overview
-        // still answers from static manifests when no index exists, and its
-        // whole purpose is to be the FIRST call — a tool that appears only
-        // for already-initialized workspaces cannot be that.
-        entries.push(Arc::new(crate::overview::ProjectOverview));
-        // Resolver errors advertise the tool so invocation exposes them.
-        if !matches!(crate::graph::graph_available(&root), Ok(false)) {
-            entries.push(Arc::new(crate::graph::CodeGraphQuery));
-        }
         if let Some(media) = media_backend {
             entries.push(match &media_host_context {
                 Some((gate, ids, journal)) => {
@@ -1514,7 +1505,6 @@ mod tests {
         // `bash` is NOT in the default surface — it is the settings opt-in.
         assert!(!names.contains(&"bash".to_string()), "{names:?}");
         assert_eq!(names.len(), 46, "unexpected tool count: {names:?}");
-        assert_eq!(names.len(), 45, "unexpected tool count: {names:?}");
     }
 
     // ---- bash opt-in (default OFF everywhere) -------------------------
