@@ -60,8 +60,12 @@ struct ParsedEdit {
 /// One edit's validate-phase outcome, rendered into the per-edit report.
 enum EditVerdict {
     /// Resolves cleanly; `occurrences` will be replaced.
-    Ok { occurrences: usize },
-    Failed { reason: String },
+    Ok {
+        occurrences: usize,
+    },
+    Failed {
+        reason: String,
+    },
 }
 
 fn parse_edits(input: &Value) -> Result<Vec<ParsedEdit>, String> {
@@ -383,7 +387,10 @@ mod tests {
             .await;
         match result {
             ToolOutput::Ok { content } => {
-                assert!(content.contains("applied 2 edits across 2 file(s)"), "{content}");
+                assert!(
+                    content.contains("applied 2 edits across 2 file(s)"),
+                    "{content}"
+                );
             }
             ToolOutput::Error { message } => panic!("expected ok, got: {message}"),
         }
