@@ -815,8 +815,7 @@ mod tests {
         let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         stream
             // A loopback Host: the DNS-rebinding gate (host_is_local, its
-            // own unit test above) would 403 a non-local name like the bare
-            // `x` this test sent before the gate existed.
+            // own unit test above) would 403 a non-local name.
             .write_all(b"GET /api/overview HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
             .await
             .unwrap();
