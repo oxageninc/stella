@@ -120,6 +120,22 @@ pub struct NeighborhoodSymbol {
     pub start_line: u32,
 }
 
+/// One definition site of a named symbol with its exact source span — the
+/// raw `(path, start..=end)` location behind [`CodeGraph::definitions`]'
+/// rendered frames. Lines are 1-based and inclusive, matching
+/// [`crate::Symbol`]; `kind` is the human citation keyword (`"fn"`,
+/// `"struct"`, …) so callers can label a site the way a frame's citation
+/// does (L-C4).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SymbolSpan {
+    /// Root-relative forward-slash path of the defining file.
+    pub path: String,
+    pub name: String,
+    pub kind: String,
+    pub start_line: u32,
+    pub end_line: u32,
+}
+
 /// The structured neighborhood of one file: its symbols and its import
 /// edges in both directions. Root-relative forward-slash paths throughout.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -238,6 +254,23 @@ impl CodeGraph {
     /// Frames for every definition of `name`.
     pub fn definitions(&self, name: &str) -> Result<Vec<ContextFrame>, GraphError> {
         frames::definitions(&self.inner.read_guard(), &self.inner.root, name)
+    }
+
+    /// Every definition site of `name` with its exact source span — the
+    /// lookup behind the `read_symbol` tool, which needs the faithful
+    /// `(path, start..=end)` range to read (a definition frame renders a
+    /// truncated snippet, not an editable span).
+    pub fn definition_spans(&self, name: &str) -> Result<Vec<SymbolSpan>, GraphError> {
+        Ok(store::definitions(&self.inner.read_guard(), name)?
+            .into_iter()
+            .map(|row| SymbolSpan {
+                path: row.path,
+                name: row.name,
+                kind: row.kind.keyword().to_string(),
+                start_line: row.start_line,
+                end_line: row.end_line,
+            })
+            .collect())
     }
 
     /// Best-effort textual reference frames for `name`.
@@ -484,5 +517,33 @@ mod tests {
     fn all_files_is_empty_on_an_empty_index() {
         let (graph, _ws, _dbdir) = open_graph();
         assert!(graph.all_files().unwrap().is_empty());
+    }
+
+    /// `definition_spans` reports each site's exact 1-based inclusive range —
+    /// the raw span `read_symbol` reads, not a rendered/truncated snippet.
+    #[test]
+    fn definition_spans_carry_the_exact_source_range() {
+        let ws = TempDir::new().unwrap();
+        let dbdir = TempDir::new().unwrap();
+        std::fs::write(
+            ws.path().join("lib.rs"),
+            "fn alpha() {}\n\nfn target() {\n    let x = 1;\n    let y = 2;\n}\n",
+        )
+        .unwrap();
+        let graph = CodeGraph::open(ws.path(), &dbdir.path().join("context.db")).unwrap();
+        graph.index_all().unwrap();
+
+        let spans = graph.definition_spans("target").unwrap();
+        assert_eq!(spans.len(), 1, "{spans:?}");
+        let span = &spans[0];
+        assert_eq!(span.path, "lib.rs");
+        assert_eq!(span.name, "target");
+        assert_eq!(span.kind, "fn");
+        assert_eq!(
+            (span.start_line, span.end_line),
+            (3, 6),
+            "1-based inclusive span of the whole definition"
+        );
+        assert!(graph.definition_spans("no_such_symbol").unwrap().is_empty());
     }
 }
