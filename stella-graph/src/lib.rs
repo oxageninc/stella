@@ -17,7 +17,7 @@
 //! - **Resolves** Python relative imports (`from . import x`,
 //!   `from ..pkg import y`) and TS/JS relative specifiers (`./x`, `../y`,
 //!   `index.*`) to real files; bare package specifiers are recorded
-//!   unresolved (Phase 3 item 3).
+//!   unresolved.
 //! - **Warms at mount** and re-indexes live via an in-process `notify`
 //!   watcher (L-C1).
 //! - **Skips byte-identical content** on re-index (L-C2).

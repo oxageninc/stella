@@ -14,8 +14,7 @@ use super::{
     normalize_name,
 };
 
-// ---- SQL extraction (tree-sitter walk + deterministic token parse) -------
-
+// SQL extraction (tree-sitter walk + deterministic token parse)
 /// Extract every relation definition and column addition from SQL source.
 /// Tree-sitter finds the statement structure (proven node kinds:
 /// `create_table` / `create_view` / `create_type` / `object_reference` /
@@ -432,8 +431,7 @@ fn enum_values(node: Node, src: &[u8]) -> Vec<String> {
     values
 }
 
-// ---- ALTER TABLE … ADD COLUMN (statement-level text scan) ----------------
-
+// ALTER TABLE … ADD COLUMN (statement-level text scan)
 /// Decode `ALTER TABLE t ADD [COLUMN] name type …` statements. Text-level
 /// (split on `;`), so it works even where the grammar's ALTER coverage is
 /// thin — the same conservative posture as the original gate's scan.
@@ -540,8 +538,7 @@ fn extract_alter_additions(source: &str) -> Vec<FieldAddition> {
     out
 }
 
-// ---- COMMENT ON harvesting -----------------------------------------------
-
+// COMMENT ON harvesting
 /// Fold `COMMENT ON TABLE t IS '…'` / `COMMENT ON COLUMN t.c IS '…'`
 /// statements onto the extracted relations (spec §4b "harvested" meaning).
 fn apply_comments(source: &str, relations: &mut [RelationDef]) {

@@ -100,8 +100,7 @@ fn app_label(path: &str) -> Option<String> {
     }
 }
 
-// ---- Django ---------------------------------------------------------------
-
+// Django
 fn decode_django_class(node: Node, src: &[u8], app: Option<&str>) -> Option<RelationDef> {
     if !has_django_model_base(node, src) {
         return None;
@@ -268,8 +267,7 @@ fn meta_class<'a>(class_node: Node<'a>, src: &[u8]) -> Option<Node<'a>> {
     })
 }
 
-// ---- SQLAlchemy -----------------------------------------------------------
-
+// SQLAlchemy
 fn decode_sqlalchemy_class(node: Node, src: &[u8]) -> Option<RelationDef> {
     let body = node.child_by_field_name("body")?;
     let name = class_assignment_string(node, src, "__tablename__")?;
@@ -501,8 +499,7 @@ fn dict_string_entry(node: Node, src: &[u8], key: &str) -> Option<String> {
     }
 }
 
-// ---- Shared Python-tree helpers -------------------------------------------
-
+// Shared Python-tree helpers
 /// Direct assignments of a class/block body (each wrapped in an
 /// `expression_statement`).
 fn assignments<'a>(body: Node<'a>) -> Vec<Node<'a>> {

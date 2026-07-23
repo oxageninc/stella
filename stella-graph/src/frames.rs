@@ -62,8 +62,7 @@ pub(crate) fn definitions(
 
 /// Best-effort textual references: whole-word occurrences of `name` across
 /// indexed files. Linear in the indexed corpus and capped at
-/// [`MAX_REFERENCES`] — the spec labels this "best-effort" retrieval, not an
-/// index ( CLI surface note).
+/// [`MAX_REFERENCES`] — best-effort retrieval, not an index.
 pub(crate) fn references(
     conn: &Connection,
     root: &Path,
@@ -213,8 +212,7 @@ pub(crate) fn query(
     ))
 }
 
-// ---- frame construction --------------------------------------------------
-
+// frame construction
 fn symbol_frame(root: &Path, row: &DefRow, score: f32) -> ContextFrame {
     let citation = format!(
         "{} {} ({}:{})",
@@ -357,8 +355,7 @@ fn derivation(method: &str) -> Provenance {
     }
 }
 
-// ---- helpers -------------------------------------------------------------
-
+// helpers
 fn file_uri(root: &Path, rel: &str) -> String {
     format!("file://{}", root.join(rel).display())
 }

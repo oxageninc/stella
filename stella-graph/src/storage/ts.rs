@@ -67,8 +67,7 @@ pub(super) fn extract(grammars: &Grammars, lang: Language, source: &str) -> Stor
     out
 }
 
-// ---- Drizzle --------------------------------------------------------------
-
+// Drizzle
 const DRIZZLE_TABLE_FNS: &[&str] = &["pgTable", "sqliteTable", "mysqlTable"];
 
 fn extract_drizzle(root: Node, src: &[u8], out: &mut StorageExtract) {
@@ -260,8 +259,7 @@ fn arrow_target_object(arrow: Node, src: &[u8]) -> Option<String> {
         .flatten()
 }
 
-// ---- TypeORM --------------------------------------------------------------
-
+// TypeORM
 const TYPEORM_COLUMN_DECORATORS: &[&str] = &[
     "Column",
     "PrimaryColumn",
@@ -465,8 +463,7 @@ fn arrow_identifier(arrow: Node, src: &[u8]) -> Option<String> {
         .flatten()
 }
 
-// ---- Mongoose -------------------------------------------------------------
-
+// Mongoose
 fn extract_mongoose(root: Node, src: &[u8], out: &mut StorageExtract) {
     // Pre-pass: schema variables (`const s = new Schema({...})`).
     let mut schema_vars: HashMap<String, Node> = HashMap::new();
@@ -647,8 +644,7 @@ fn decode_mongoose_value(value: Node, src: &[u8], path: &str, line: u32, rel: &m
     }
 }
 
-// ---- DynamoDB -------------------------------------------------------------
-
+// DynamoDB
 fn extract_dynamo(root: Node, src: &[u8], out: &mut StorageExtract) {
     // CDK constructs: `new dynamodb.Table(this, "Payments", { partitionKey:
     // {...}, tableName: "payments" })`, plus GSIs added on the variable.
@@ -825,8 +821,7 @@ fn decode_sdk_create_table(object: Node, src: &[u8]) -> Option<RelationDef> {
     (!rel.fields.is_empty()).then_some(rel)
 }
 
-// ---- Shared TS-tree helpers -----------------------------------------------
-
+// Shared TS-tree helpers
 /// Every `variable_declarator` (name, value) in the tree, in source order.
 fn variable_declarators<'a>(root: Node<'a>, src: &'a [u8]) -> Vec<(String, Node<'a>)> {
     let mut nodes = Vec::new();
