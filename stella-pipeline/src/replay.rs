@@ -265,6 +265,14 @@ pub fn event_signature(event: &AgentEvent) -> String {
         AgentEvent::StepManifest { blocks, .. } => {
             format!("step_manifest:blocks={}", blocks.len())
         }
+        // A discarded speculation pool (#415) is a run-to-run scheduling
+        // artifact, excluded from the structural comparison above like
+        // TextDelta / receipts. The signature only keeps this function total:
+        // occurrence plus the speculated tool's name, never the volatile
+        // call_id or human-readable reason.
+        AgentEvent::SpeculationDiscarded { name, .. } => {
+            format!("speculation_discarded:{name}")
+        }
     }
 }
 
@@ -301,12 +309,16 @@ pub fn structural_diff(left: &[AgentEvent], right: &[AgentEvent]) -> Vec<StreamD
     // Context receipts (BlockRegistered/StepManifest) join TextDelta in the
     // exclusion set: they are additive observability a pre-receipt golden
     // stream does not carry, so keeping them would shift every later position.
+    // `SpeculationDiscarded` (#415) joins them: it is a run-to-run scheduling
+    // artifact absent from pre-speculation goldens, so it too must not shift
+    // aligned positions.
     let keep = |e: &&AgentEvent| {
         !matches!(
             e,
             AgentEvent::TextDelta { .. }
                 | AgentEvent::BlockRegistered { .. }
                 | AgentEvent::StepManifest { .. }
+                | AgentEvent::SpeculationDiscarded { .. }
         )
     };
     let left: Vec<&AgentEvent> = left.iter().filter(keep).collect();
