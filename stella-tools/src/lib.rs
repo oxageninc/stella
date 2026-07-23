@@ -23,6 +23,7 @@ pub mod glob;
 pub mod graph;
 pub mod grep;
 pub mod hook_runner;
+pub(crate) mod impact;
 pub mod issue_ops;
 pub mod issues;
 pub mod media;
