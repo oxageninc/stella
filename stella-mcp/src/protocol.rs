@@ -29,9 +29,7 @@ pub fn is_supported_version(version: &str) -> bool {
     SUPPORTED_PROTOCOL_VERSIONS.contains(&version)
 }
 
-// ---------------------------------------------------------------------------
 // JSON-RPC 2.0 envelopes
-// ---------------------------------------------------------------------------
 
 /// An outbound JSON-RPC request (has an `id`, expects a response).
 #[derive(Debug, Clone, Serialize)]
@@ -150,9 +148,7 @@ pub struct JsonRpcErrorObject {
     pub data: Option<Value>,
 }
 
-// ---------------------------------------------------------------------------
 // MCP method payloads
-// ---------------------------------------------------------------------------
 
 /// Name + version of a protocol participant (`clientInfo` / `serverInfo`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

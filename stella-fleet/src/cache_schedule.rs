@@ -194,7 +194,6 @@ mod tests {
                 .collect()
         });
 
-        // Recorded for the PR: warmest-first forfeits fewer prefixes.
         assert_eq!(blind, 3, "ttl-blind baseline forfeits 3 of 4 prefixes");
         assert_eq!(warm, 2, "warmest-first forfeits 2 of 4 prefixes");
         assert!(

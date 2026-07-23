@@ -179,7 +179,7 @@ pub const DEFAULT_SQL_LAYER: &str = "sql";
 /// The implicit layer for MongoDB definitions (Mongoose, Prisma-on-Mongo)
 /// no manifest layer claims. Distinct from [`DEFAULT_SQL_LAYER`] by
 /// construction, so a Mongo collection duplicating a relational table
-/// trips the cross-layer conflict (spec §1 turn-160).
+/// trips the cross-layer conflict (spec §1).
 pub const DEFAULT_MONGO_LAYER: &str = "mongo";
 
 /// The implicit layer for DynamoDB table definitions.
@@ -239,8 +239,7 @@ pub(crate) fn extract_for_path(grammars: &Grammars, path: &str, source: &str) ->
     }
 }
 
-// ---- Names and addresses -------------------------------------------------
-
+// Names and addresses
 /// Normalize a display name for identity: lowercase, `camelCase` and
 /// `kebab-case` folded to `snake_case`, every other character an underscore.
 /// `userId`, `user-id`, and `USER_ID` all normalize to `user_id` — collisions
@@ -324,8 +323,7 @@ pub fn display_address(address: &str) -> String {
     format!("store://{address}")
 }
 
-// ---- Snapshot (the read-side shape the gate and CLI consume) -------------
-
+// Snapshot (the read-side shape the gate and CLI consume)
 /// One layer in a [`StorageSnapshot`] — manifest-declared or the implicit
 /// SQL fallback.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -398,8 +396,7 @@ impl StorageSnapshot {
     }
 }
 
-// ---- Embed cards ---------------------------------------------------------
-
+// Embed cards
 /// The deterministic textual rendering of a relation for embedding and for
 /// `stella storage show` (spec §7a). Includes the parent chain's meaning so
 /// the card is findable by purpose, not only by name. Byte-stable for

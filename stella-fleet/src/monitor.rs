@@ -25,9 +25,7 @@ use stella_protocol::{AgentEvent, CiStatus, PrStatus};
 
 use crate::ledger::CommitRecord;
 
-// ---------------------------------------------------------------------
 // gh port
-// ---------------------------------------------------------------------
 
 /// The port every `gh` command goes through. Real impl ([`SystemGhCli`])
 /// spawns `gh`; tests inject fakes.
@@ -101,9 +99,7 @@ impl GhCli for SystemGhCli {
     }
 }
 
-// ---------------------------------------------------------------------
 // Sleeper (deferred-wait pacing; injectable so caps are testable)
-// ---------------------------------------------------------------------
 
 /// The pacing seam for the poll loop — real impl sleeps, the test impl
 /// advances the injected [`Clock`] instead so a 2h cap is proven in
@@ -124,9 +120,7 @@ impl Sleeper for TokioSleeper {
     }
 }
 
-// ---------------------------------------------------------------------
 // Errors
-// ---------------------------------------------------------------------
 
 #[derive(Debug, thiserror::Error)]
 pub enum MonitorError {
@@ -156,9 +150,7 @@ fn ensure_ok(output: GhOutput, command: &str) -> Result<GhOutput, MonitorError> 
     }
 }
 
-// ---------------------------------------------------------------------
 // CI run model
-// ---------------------------------------------------------------------
 
 /// A CI run's lifecycle status, from `gh run list`'s `status` field.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -320,9 +312,7 @@ impl CiSnapshot {
     }
 }
 
-// ---------------------------------------------------------------------
 // The capped-wait decision (pure — L-E4 cap arithmetic lives here)
-// ---------------------------------------------------------------------
 
 /// Why a watch stopped waiting without a completion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -440,9 +430,7 @@ pub enum CiWatchOutcome {
     },
 }
 
-// ---------------------------------------------------------------------
 // Monitor
-// ---------------------------------------------------------------------
 
 /// PR/CI monitor over a [`GhCli`]. Holds an injected [`Clock`] and [`Sleeper`]
 /// so the capped-wait timing is deterministic in tests.
@@ -622,9 +610,7 @@ fn parse_run_list(stdout: &str) -> Result<CiSnapshot, MonitorError> {
     Ok(CiSnapshot { runs })
 }
 
-// ---------------------------------------------------------------------
 // Emit-shape helpers (protocol event values)
-// ---------------------------------------------------------------------
 
 /// Build an [`AgentEvent::Commit`] from a ledger [`CommitRecord`] — the one
 /// place the fleet turns a recorded commit into the wire event the TUI/JSON
@@ -676,7 +662,7 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    // ---- Fakes --------------------------------------------------------
+    // Fakes
 
     /// A `Clock` whose time only moves when the test (or the advancing
     /// sleeper) says so.
@@ -759,7 +745,7 @@ mod tests {
             .with_sleeper(Box::new(sleeper))
     }
 
-    // ---- pr_status ----------------------------------------------------
+    // pr_status
 
     #[tokio::test]
     async fn pr_status_maps_gh_state_and_draft() {
@@ -799,7 +785,7 @@ mod tests {
         ));
     }
 
-    // ---- snapshot classification --------------------------------------
+    // snapshot classification
 
     #[test]
     fn parse_run_list_reads_status_and_conclusion() {
@@ -847,7 +833,7 @@ mod tests {
         assert_eq!(one_failed.overall_conclusion(), CiConclusion::Failure);
     }
 
-    // ---- decide(): the L-E4 cap arithmetic ----------------------------
+    // decide(): the L-E4 cap arithmetic
 
     #[test]
     fn decide_completes_immediately_when_all_runs_completed() {
@@ -945,7 +931,7 @@ mod tests {
         );
     }
 
-    // ---- watch_ci loop (fake clock + advancing sleeper) ---------------
+    // watch_ci loop (fake clock + advancing sleeper)
 
     #[tokio::test]
     async fn watch_ci_completes_when_runs_finish() {
@@ -1057,7 +1043,7 @@ mod tests {
         ));
     }
 
-    // ---- emit-shape helpers -------------------------------------------
+    // emit-shape helpers
 
     #[test]
     fn commit_and_pr_event_helpers_build_protocol_events() {

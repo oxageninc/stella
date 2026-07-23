@@ -771,7 +771,7 @@ mod tests {
         );
     }
 
-    // ---- for_candidates / CandidateMcpView (issue #248 Phase 1) ----------
+    // for_candidates / CandidateMcpView (issue #248 Phase 1)
 
     #[tokio::test]
     async fn candidate_view_advertises_only_allowlisted_mcp_tools_plus_native() {
@@ -856,7 +856,7 @@ mod tests {
         );
     }
 
-    // ---- prefetch_candidate_context (issue #248 Phase 1) ------------------
+    // prefetch_candidate_context (issue #248 Phase 1)
 
     #[tokio::test]
     async fn prefetch_calls_only_candidate_safe_zero_arg_tools() {

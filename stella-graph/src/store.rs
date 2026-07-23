@@ -453,8 +453,7 @@ fn insert_storage_field(
     Ok(())
 }
 
-// ---- Storage read side (snapshot assembly) -------------------------------
-
+// Storage read side (snapshot assembly)
 /// Every persisted storage entity, grouped into [`RelationEntry`] shape:
 /// relation rows carry their child fields; parentless field rows (`ALTER`
 /// additions) fold onto the relation their address names, or synthesize a
@@ -630,8 +629,7 @@ fn file_sha(tx: &Transaction, rel: &str) -> Result<Option<String>, GraphError> {
     Ok(sha)
 }
 
-// ---- Read side (frames come from these) ----------------------------------
-
+// Read side (frames come from these)
 /// Every symbol named `name`, across the whole indexed tree.
 pub(crate) fn definitions(conn: &Connection, name: &str) -> Result<Vec<DefRow>, GraphError> {
     let mut stmt = conn.prepare(
@@ -758,8 +756,7 @@ fn import_kind_from_tag(tag: &str) -> ImportKind {
     }
 }
 
-// ---- small helpers -------------------------------------------------------
-
+// small helpers
 /// Forward-slash path of `abs` relative to `root` (falls back to the whole
 /// path if `abs` is somehow not under `root`).
 fn rel_path(root: &Path, abs: &Path) -> String {

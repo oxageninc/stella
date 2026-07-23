@@ -20,8 +20,7 @@
 //! pattern, once by the enclosing-type pattern); [`crate::parse`] dedups by
 //! the name node's byte range and lets the more specific `Method` kind win.
 
-// ---- Rust ----------------------------------------------------------------
-
+// Rust
 /// Functions (incl. bodyless trait-method signatures, which are
 /// `function_signature_item` not `function_item`), methods (impl bodies),
 /// structs, enums, traits.
@@ -42,8 +41,7 @@ pub const RUST_IMPORTS: &str = r#"
 (use_declaration argument: (_) @use)
 "#;
 
-// ---- Python --------------------------------------------------------------
-
+// Python
 /// Functions, methods (class bodies), classes.
 pub const PYTHON_SYMBOLS: &str = r#"
 (function_definition name: (_) @name) @fn
@@ -52,16 +50,14 @@ pub const PYTHON_SYMBOLS: &str = r#"
 "#;
 
 /// Both import statement forms; the relative-import decode (dots → package
-/// directory) that the spec calls out ( Phase 3 item 3, "fix the
-/// known thin Python import-edge resolution") happens structurally in
-/// [`crate::parse`] against the captured statement nodes.
+/// directory) happens structurally in [`crate::parse`] against the captured
+/// statement nodes.
 pub const PYTHON_IMPORTS: &str = r#"
 (import_statement) @import
 (import_from_statement) @from_import
 "#;
 
-// ---- JavaScript ----------------------------------------------------------
-
+// JavaScript
 /// Functions (incl. generators + arrow/function-expression consts), classes,
 /// methods. JavaScript has no interfaces/enums, so the query is a strict
 /// subset of the TypeScript one and must be kept separate — compiling the TS
@@ -86,8 +82,7 @@ pub const JS_IMPORTS: &str = r#"
 (call_expression function: (identifier) @callee arguments: (arguments (string (string_fragment) @source)))
 "#;
 
-// ---- TypeScript (also used for TSX) --------------------------------------
-
+// TypeScript (also used for TSX)
 /// Adds interfaces, enums, and abstract classes on top of the JS symbol set.
 /// Shared verbatim by the `typescript` and `tsx` grammars (TSX is a superset
 /// carrying the same declaration node types).
@@ -107,8 +102,7 @@ pub const TS_SYMBOLS: &str = r#"
 /// identical); shared by `typescript` and `tsx`.
 pub const TS_IMPORTS: &str = JS_IMPORTS;
 
-// ---- SQL -----------------------------------------------------------------
-
+// SQL
 /// SQL DDL: tables (with their columns), views, and custom enum/composite
 /// types. SQL has no import concept, so there is no `SQL_IMPORTS`.
 ///
@@ -138,8 +132,7 @@ pub const SQL_SYMBOLS: &str = r#"
 /// shape uniform without introducing a conditional in `parse_file`.
 pub const SQL_IMPORTS: &str = "";
 
-// ---- Go ------------------------------------------------------------------
-
+// Go
 /// Functions, methods (receiver functions), and named types. Go's grammar is
 /// regular enough that these three patterns cover the declaration surface.
 pub const GO_SYMBOLS: &str = r#"
@@ -155,8 +148,7 @@ pub const GO_IMPORTS: &str = r#"
 (import_declaration) @import
 "#;
 
-// ---- Java ----------------------------------------------------------------
-
+// Java
 /// Classes, interfaces, enums, records, and methods. Java carries no free
 /// functions, so every callable is a method on a type.
 pub const JAVA_SYMBOLS: &str = r#"
@@ -173,8 +165,7 @@ pub const JAVA_IMPORTS: &str = r#"
 (import_declaration) @import
 "#;
 
-// ---- C -------------------------------------------------------------------
-
+// C
 /// Function definitions, plus the struct/union/enum and typedef surface.
 /// The declarator nesting is why functions need their own pattern rather
 /// than a bare name capture: the identifier sits under `function_declarator`.
@@ -194,8 +185,7 @@ pub const C_IMPORTS: &str = r#"
 (preproc_include) @import
 "#;
 
-// ---- PHP -----------------------------------------------------------------
-
+// PHP
 /// Classes, interfaces, traits, enums, free functions, and methods.
 pub const PHP_SYMBOLS: &str = r#"
 (class_declaration name: (_) @name) @class

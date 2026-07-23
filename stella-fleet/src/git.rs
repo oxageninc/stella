@@ -476,7 +476,7 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
 
-    // ---- Fake GitCli --------------------------------------------------
+    // Fake GitCli
 
     type GitHandler = Box<dyn Fn(&[String]) -> GitOutput + Send + Sync>;
 
@@ -517,7 +517,7 @@ mod tests {
         WorktreeManager::new(git, "/repo")
     }
 
-    // ---- slugify ------------------------------------------------------
+    // slugify
 
     #[test]
     fn slugify_makes_ids_ref_and_path_safe() {
@@ -528,7 +528,7 @@ mod tests {
         assert_eq!(slugify("t0"), "t0");
     }
 
-    // ---- create -------------------------------------------------------
+    // create
 
     #[tokio::test]
     async fn create_issues_worktree_add_with_branch_and_base() {
@@ -595,7 +595,7 @@ mod tests {
         }
     }
 
-    // ---- commit_paths: the pathspec discipline ------------------------
+    // commit_paths: the pathspec discipline
 
     #[tokio::test]
     async fn commit_paths_always_uses_explicit_pathspecs_never_add_all() {
@@ -672,7 +672,7 @@ mod tests {
         assert!(mgr.git.calls().is_empty());
     }
 
-    // ---- remove: branch cleanup only on unchanged ---------------------
+    // remove: branch cleanup only on unchanged
 
     #[tokio::test]
     async fn remove_deletes_the_branch_when_it_has_no_commits_beyond_base() {
@@ -716,7 +716,7 @@ mod tests {
         assert!(!mgr.git.calls().iter().any(|c| c[0] == "branch"));
     }
 
-    // ---- list parsing -------------------------------------------------
+    // list parsing
 
     #[test]
     fn parse_worktree_list_reads_paths_and_branches() {
@@ -741,7 +741,7 @@ detached
         assert_eq!(entries[2].branch, None, "a detached worktree has no branch");
     }
 
-    // ---- Real-git integration: isolation ------------------------------
+    // Real-git integration: isolation
 
     /// Whether a real `git` is on PATH; the integration tests skip cleanly
     /// (with a printed note) when it isn't — CI has it.

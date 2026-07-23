@@ -1,7 +1,7 @@
 //! End-to-end indexing over real fixture files in tempdirs: symbol extraction
 //! per language, plus the two import-resolution cases the spec calls out —
 //! Python relative imports (`from . import x`, `from ..pkg import y`) and TS
-//! `index.ts` resolution ( Phase 3 item 3).
+//! `index.ts` resolution.
 
 use std::fs;
 use std::path::Path;
@@ -87,7 +87,7 @@ fn rust_symbols_indexed() {
 #[test]
 fn python_relative_imports_resolve_to_files() {
     // `from . import sibling` and `from ..pkg import y` must resolve to actual
-    // files (the spec's explicitly-requested fix).
+    // files.
     let fx = Fixture::build(&[
         ("a/__init__.py", ""),
         ("a/pkg.py", "def y():\n    return 1\n"),

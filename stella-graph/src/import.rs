@@ -1,9 +1,7 @@
 //! Import edges (`file → imported module/file`) and the resolution of
 //! relative specifiers to actual files.
 //!
-//! The spec singles this out ( Phase 3 item 3): "fix the known
-//! thin Python import-edge resolution rather than porting it". So Python
-//! **relative** imports (`from . import x`, `from ..pkg import y`) resolve to
+//! Python **relative** imports (`from . import x`, `from ..pkg import y`) resolve to
 //! real files, and TS/JS relative specifiers (`./x`, `../y`) resolve through
 //! the usual extension/`index.*` candidate ladder. Bare package specifiers
 //! (`react`, `os.path`, a Rust `use` path) are recorded **unresolved** — the
@@ -122,9 +120,7 @@ pub(crate) fn resolve(specs: Vec<ImportSpec>, root: &Path, file_abs: &Path) -> V
 
 /// Append the base directory of a Python relative import: the current
 /// package is the file's own directory (`level` 1), each extra dot climbs one
-/// package (`09-lessons-learned` has no entry here — this is the spec's
-/// explicitly-requested fix). Returns `None` if the dots climb above the FS
-/// root.
+/// package. Returns `None` if the dots climb above the FS root.
 fn py_base_dir(file_dir: &Path, level: usize) -> Option<PathBuf> {
     let mut base = file_dir.to_path_buf();
     for _ in 0..level.saturating_sub(1) {

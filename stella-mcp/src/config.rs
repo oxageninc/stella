@@ -445,7 +445,7 @@ mod tests {
         assert_eq!(http.credential_names(), vec!["Authorization"]);
     }
 
-    // ---- candidate_safe (issue #248 Phase 1) -----------------------------
+    // candidate_safe (issue #248 Phase 1)
 
     #[test]
     fn candidate_safe_parses_true_and_defaults_false_when_absent() {

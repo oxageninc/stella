@@ -322,8 +322,8 @@ fn decode_py_import(node: Node, src: &[u8], out: &mut Vec<ImportSpec>) {
     }
 }
 
-/// `from <module> import <names>` — the relative-import decode the spec asked
-/// for. Counts the leading dots (`import_prefix`) to a package level and
+/// `from <module> import <names>` — the relative-import decode.
+/// Counts the leading dots (`import_prefix`) to a package level and
 /// carries the optional dotted module path plus imported names to
 /// [`crate::import::resolve`].
 fn decode_py_from_import(node: Node, src: &[u8], out: &mut Vec<ImportSpec>) {
