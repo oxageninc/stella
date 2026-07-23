@@ -23,7 +23,7 @@
 //! port, driven by [`Fleet::pause_task`] / [`Fleet::resume_task`] /
 //! [`Fleet::stop_task`]; restart = re-dispatch).
 //!
-//! Design constraints (from the task and): we shell out
+//! Design constraints: we shell out
 //! to the `git`/`gh` binaries via `tokio::process` behind port traits rather
 //! than linking libgit2 (heavy native build), every external interaction is a
 //! port so every test runs against fakes, and there is no `unwrap`/`panic`

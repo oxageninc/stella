@@ -658,7 +658,7 @@ where
         Ok(report)
     }
 
-    // ---- Per-task control: Pause / Resume / Stop ----------------------
+    // Per-task control: Pause / Resume / Stop
 
     /// Pause a live worker at its next safe step boundary (the engine's
     /// `TurnGate` — the same boundary budget aborts use, never mid-tool).
@@ -695,7 +695,7 @@ where
         }
     }
 
-    // ---- Read-through accessors (tests + real callers) ----------------
+    // Read-through accessors (tests + real callers)
 
     /// The parent budget guard's current state (a `Copy` snapshot).
     pub fn budget_snapshot(&self) -> BudgetGuard {
@@ -732,7 +732,7 @@ mod tests {
 
     use crate::git::{GitCli, GitError, GitOutput};
 
-    // ---- Fakes --------------------------------------------------------
+    // Fakes
 
     /// A monotonically-increasing clock so started_at < finished_at without a
     /// real wall clock.
@@ -847,7 +847,7 @@ mod tests {
         Fleet::new(worker, manager, ledger, budget, SeqClock::new(), config).unwrap()
     }
 
-    // ---- dispatch: the seam records everything ------------------------
+    // dispatch: the seam records everything
 
     #[tokio::test]
     async fn dispatch_isolated_task_creates_worktree_and_stamps_ledger() {
@@ -913,7 +913,7 @@ mod tests {
         );
     }
 
-    // ---- claims: cooperative file locks through the workspace store ---
+    // claims: cooperative file locks through the workspace store
 
     fn fleet_with_claims(worker: FakeWorker) -> Fleet<FakeWorker, OkGit, SeqClock> {
         fleet(
@@ -1077,7 +1077,7 @@ mod tests {
         );
     }
 
-    // ---- run_plan: waves, lineage, budget metering, abort -------------
+    // run_plan: waves, lineage, budget metering, abort
 
     #[tokio::test]
     async fn run_plan_executes_all_waves_and_meters_total_spend() {
@@ -1290,7 +1290,7 @@ mod tests {
         assert_eq!(failed, vec!["t1", "t2"], "both failures recorded, sorted");
     }
 
-    // ---- per-task control: pause / resume / stop ----------------------
+    // per-task control: pause / resume / stop
 
     /// A worker that observes its pause line: parks until the fleet flips
     /// it `true` (announcing the sighting on `saw_pause`), then until it
@@ -1444,7 +1444,7 @@ mod tests {
         assert!(!f.stop_task(&id), "a settled task has no live stop line");
     }
 
-    // ---- cache-TTL-aware scheduling (#269) -----------------------------
+    // cache-TTL-aware scheduling (#269)
 
     #[test]
     fn ready_order_is_unchanged_without_a_warmth_lookup() {
