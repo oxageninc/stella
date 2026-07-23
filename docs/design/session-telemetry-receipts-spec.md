@@ -41,6 +41,11 @@ labels each section:
 | §9 Memory write→citation join | **New extension #2** (the user's "memory writes and subsequent citations") |
 | §11 Self-reflection & self-rating | **New extension #3** (the user's "self-reflect and rate their own performance") |
 
+**Build scope.** This spec describes the full telemetry shape, but §14 splits it
+into a **verifiable core to build now** (Tier A) and an **inferred layer gated on
+what the core's data shows** (Tier B) — the two should not be built as one
+program. Every section header's work is tagged A or B in §14 and the appendices.
+
 Sibling audit issues this spec is aware of and must not regress: #359
 (loop-detection evidence), #360/#369 (budget session axis), #363 (error-output
 compaction), #366 (per-turn `files_touched`), #368 (overflow summarizer),
@@ -507,6 +512,11 @@ enum UsefulnessSignal {
 }
 ```
 
+**Build tier (see §14).** `Cited` and `WastedEvicted` are **Tier A** — provable,
+build now. `ReferencedDownstream`, `SelfReported`, and `SurvivedUnreferenced` are
+**Tier B** — inferred, shipped in shadow and gated on data before they are trusted
+in the ledger.
+
 ### 8.3 The derived ledger
 
 Per block, the inspector produces:
@@ -876,56 +886,115 @@ Manifests + block registry make this O(context depth), not O(session length).
 
 ---
 
-## 14. Rollout sequencing
+## 14. Build plan — verifiable core now, inferred layer gated on data
 
-Ordered so each phase is independently useful and strictly additive. Phases 1–2
-are #364's receipt core; 3–5 are the user's three extensions.
+The sections above describe the full shape. They should **not** be built as one
+program. Split by *verifiability*: build the parts that are measurements or
+byte-exact reconstructions now; treat the parts that rest on inferred labels as
+experiments that only earn their place once the core's data shows they would
+change a decision. The dividing question for every item is: *is this a fact the
+fold can prove, or a judgment a heuristic is guessing?*
 
-1. **Block registry + manifest (§4, §5).** Emit `BlockRegistered` +
-   `StepManifest`; close G1/G2. Unlocks reconstruction (§13) immediately.
-   *Gate:* journal-replay equivalence test still passes; a new test asserts
-   manifest-reconstruction is byte-identical to the live `CompletionRequest`.
-2. **Compaction identities + typed decisions (§6).** Add identity fields +
-   `LoopDetected`/`BudgetDenied`/`RetriesExhausted` + the three divergence closers.
-   Cheap; unlocks the mutation diff and decision analytics.
-3. **Cache + usefulness (§7, §8).** `CacheAttribution` + `BlockUsefulness` +
-   cost-of-carry in the inspector. Delivers useful-vs-unuseful-tokens.
-4. **Memory loop (§9).** Extend `ContextWrite`; add `memory_writes`; wire the
-   `RecalledFrame → memory_id` injection log. Delivers the write→citation→payoff
-   scorecard.
-5. **Self-rating (§11) + per-model rollups (§10, §12).** `SelfAssessment` on the
-   existing reflection loop; the `context_efficiency_rollup`. Delivers self-reflection
-   and cross-project comparative model attribution.
+### Tier A — build now (verifiable, rides the fold, debugging ROI)
 
-Every phase: new fields `#[serde(default)]`, new tables `IF NOT EXISTS`, old
-journals and `stream-json` consumers unaffected. No phase adds a daemon, a
+Every item here is a measurement or a byte-exact reconstruction, not a judgment.
+A1–A2 are #364's receipt core (partly already shipping in PR #375); A3 is the
+cost-of-carry number and the two *provable* usefulness signals.
+
+**A1. Block registry + manifest (§4, §5).** Emit `BlockRegistered` +
+`StepManifest`; close G1/G2. Unlocks point-in-time reconstruction (§13).
+*Gate:* journal-replay equivalence still passes; a new test asserts
+manifest-reconstruction is byte-identical to the live `CompletionRequest`.
+
+**A2. Compaction identities + typed decisions + divergence closers (§6).**
+Identity fields on `Compaction`, the `LoopDetected`/`BudgetDenied`/
+`RetriesExhausted` events, and the three transcript/history closers. Cheap;
+unlocks the mutation diff and turns the compaction/cache/budget bugs the audit
+found (#360/#363/#372) into visible data instead of code reads.
+
+**A3. Cache attribution + cost-of-carry + provable usefulness (§7, §8.1, and
+only the provable signals of §8.2).** `CacheAttribution`, the cost-of-carry
+derivation, and only `Cited` (from the existing `cite_memory`) and `WastedEvicted`
+(evicted before any reference). Delivers a *dollar figure* for wasted context
+carry — provable, and directly actionable for compaction tuning.
+
+Tier A is justified independent of self-reflection: it is the instrument that
+catches the next compaction/cache/budget regression, and it is the #364
+differentiator — "proof, per step, of what the model saw and what it cost." Ship
+it even if no one ever self-reflects.
+
+### Gate — measure before building Tier B
+
+After Tier A has run over real sessions, decide with data, not a hunch. Proceed
+to Tier B only where the receipts show the inferred layer would change a decision:
+
+- **Waste headroom.** Is a material fraction of token spend `WastedEvicted`
+  (say ≥ ~20%)? If most context is provably load-bearing and cache hits are
+  healthy, the inferred layer is solving a problem you do not have — stop here.
+- **Label signal.** Do the provable signals leave enough unexplained useful
+  context that an inferred `ReferencedDownstream` detector would add real
+  coverage? If `Cited` + exact-echo already explain usefulness, the fuzzy detector
+  is redundant risk.
+- **Calibration feasibility.** Tier A gives you `SelfAssessment`-shaped slots next
+  to `JudgeVerdict`. Run self-rating in *shadow* first (§11 emitted, not
+  surfaced), and productize only if self-scores correlate with judge verdicts per
+  model. If they do not, self-rating is theater — keep it as a research signal,
+  not a product surface.
+
+### Tier B — gated on the above (experiments, validated against ground truth)
+
+Build these as measured experiments and keep only what pays off. Each is `serde
+(default)`, so **shipping the event for shadow measurement costs nothing and can
+precede the productization decision** — the gate governs whether you build its UI
+and act on it, not whether you can measure it.
+
+**B1. Inferred usefulness (§8.2 `ReferencedDownstream`, §8.4).** The token-overlap
+detector. Emit in shadow, validate its labels against `Cited` + exact-echo ground
+truth before trusting it in the ledger.
+
+**B2. Memory scorecard incl. the "dead weight" verdict (§9.3).** Needs A3 + the
+injection log (§9.2). Promote/quarantine reuse existing thresholds; "dead weight"
+(recalled repeatedly, real carry cost, never cited) is the new, data-dependent
+verdict only computable once A3 exists.
+
+**B3. Self-rating + per-model self-vs-judge rollups (§11, §10.2, §12
+`context_efficiency_rollup`).** The lowest-provability, highest-uncertainty layer,
+and the one the original ask led with. Shadow-measure calibration first;
+productize per model only where it holds.
+
+### Additivity holds for both tiers
+
+Every item: new fields `#[serde(default)]`, new tables `IF NOT EXISTS`, old
+journals and `stream-json` consumers unaffected. No item adds a daemon, a
 background thread, or a network call; all emission rides the existing
 `EventSender` seam (`stella-core/src/event_sender.rs`) and the journal writer.
+Emitting a Tier B event for shadow measurement is not the same as building its UI
+or acting on it — the gate governs the latter.
 
 ---
 
 ## Appendix A — new `AgentEvent` variants at a glance
 
-| Variant | Section | Content-free | Purpose |
-| --- | --- | --- | --- |
-| `BlockRegistered` | §4 | digest only (content local via registry) | birth of a context block |
-| `StepManifest` | §5 | yes | ordered receipt of what step N saw |
-| `Compaction` (extended) | §6.2 | yes | eviction/dedup **identities** + real budget |
-| `LoopDetected` / `BudgetDenied` / `RetriesExhausted` | §6.3 | yes | typed decisions |
-| `ToolResultSynthetic` / `SpeculationDiscarded` / `PolicyDecision` | §6.4 | yes | close transcript/history divergence |
-| `CacheAttribution` | §7 | yes | per-zone cache split + miss culprit |
-| `BlockUsefulness` | §8 | yes | labeled usefulness signal per block/model |
-| `ContextWrite` (extended) | §9.1 | digest only | memory write ids (`nod_…`) |
-| `ContextFrameRef` (extended) | §5.3 | digest + local content | close recall-content gap |
-| `ModelRosterEntry` | §10.1 | yes | first appearance of a model in the session |
-| `SelfAssessment` | §11 | yes | receipt-grounded self-rating |
+| Variant | Section | Tier | Content-free | Purpose |
+| --- | --- | --- | --- | --- |
+| `BlockRegistered` | §4 | A | digest only (content local via registry) | birth of a context block |
+| `StepManifest` | §5 | A | yes | ordered receipt of what step N saw |
+| `Compaction` (extended) | §6.2 | A | yes | eviction/dedup **identities** + real budget |
+| `LoopDetected` / `BudgetDenied` / `RetriesExhausted` | §6.3 | A | yes | typed decisions |
+| `ToolResultSynthetic` / `SpeculationDiscarded` / `PolicyDecision` | §6.4 | A | yes | close transcript/history divergence |
+| `CacheAttribution` | §7 | A | yes | per-zone cache split + miss culprit |
+| `BlockUsefulness` | §8 | A/B | yes | provable signals (A: `Cited`/`WastedEvicted`) + inferred (B) per block/model |
+| `ContextWrite` (extended) | §9.1 | A | digest only | memory write ids (`nod_…`) |
+| `ContextFrameRef` (extended) | §5.3 | A | digest + local content | close recall-content gap |
+| `ModelRosterEntry` | §10.1 | A | yes | first appearance of a model in the session |
+| `SelfAssessment` | §11 | B | yes | receipt-grounded self-rating (shadow-measure first) |
 
 ## Appendix B — the five asks, mapped to sections
 
-| User ask | Delivered by |
-| --- | --- |
-| Optimal shape for one session, many models | §3 coordinate model + §6 invariant (every record carries the model coord) + §10 |
-| LLM self-reflect and rate own performance | §11 (receipt-grounded, adjudicated against JudgeVerdict) |
-| Capture memory writes + subsequent citations | §9 (`nod_…` join key: `ContextWrite.written` ↔ `memory_citations`) + §9.2 every injection |
-| Tokens kept in context — useful vs unuseful | §8 cost-of-carry + labeled usefulness signals; §7 for the cache economics underneath |
-| Inspect turn-loop state at any point (mutations / cached / added / compacted / removed) | §5 manifest + §6 mutations & compaction identities + §7 cache + §13 inspection API |
+| User ask | Delivered by | Tier |
+| --- | --- | --- |
+| Optimal shape for one session, many models | §3 coordinate model + §6 invariant (every record carries the model coord) + §10 | A (coordinate + roster); comparative self-vs-judge is B |
+| LLM self-reflect and rate own performance | §11 (receipt-grounded, adjudicated against JudgeVerdict) | **B — gated on calibration** |
+| Capture memory writes + subsequent citations | §9 (`nod_…` join key: `ContextWrite.written` ↔ `memory_citations`) + §9.2 every injection | A (write/inject/cite join); "dead weight" verdict is B |
+| Tokens kept in context — useful vs unuseful | §8 cost-of-carry + labeled usefulness signals; §7 cache economics underneath | A (cost-of-carry + provable signals); inferred labels B |
+| Inspect turn-loop state at any point (mutations / cached / added / compacted / removed) | §5 manifest + §6 mutations & compaction identities + §7 cache + §13 inspection API | A |
