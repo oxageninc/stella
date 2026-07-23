@@ -19,7 +19,9 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use contextgraph_types::{ContextFrame, ContextQuery, FrameKind, Provenance, Relation};
+use contextgraph_types::{
+    ContextFrame, ContextQuery, FrameKind, Provenance, Relation, Representation,
+};
 use rusqlite::Connection;
 
 use crate::error::GraphError;
@@ -284,15 +286,28 @@ fn frame(
     provenance: Vec<Provenance>,
     relations: Vec<Relation>,
 ) -> ContextFrame {
-    let token_cost = estimate_tokens(&content);
+    // §B3: declared inline cost is the protocol's canonical count over the
+    // content, exact (`budget_tokens` = ceil(bytes/4)), so a host that meters
+    // or budgets these frames is told the truth.
+    let token_cost = contextgraph_types::budget_tokens(&content);
     ContextFrame {
         id,
         kind,
         title,
-        content,
+        content: Some(content),
         uri,
         score,
         token_cost,
+        content_digest: None,
+        representation: Representation::Full,
+        content_fidelity: None,
+        canonical_content_hash: None,
+        content_ref: None,
+        transform: None,
+        minimum_content_fidelity: None,
+        inline_content_requirement: None,
+        canonical_token_cost: None,
+        tokenizer_ref: None,
         valid_from: None,
         valid_to: None,
         recorded_at: None,
@@ -358,12 +373,6 @@ fn derivation(method: &str) -> Provenance {
 // helpers
 fn file_uri(root: &Path, rel: &str) -> String {
     format!("file://{}", root.join(rel).display())
-}
-
-fn estimate_tokens(text: &str) -> u32 {
-    // ~4 chars per token is the conventional cheap approximation; documented
-    // as an estimate so budget accounting stays honest (L-C5).
-    text.len().div_ceil(4).max(1) as u32
 }
 
 fn read_snippet(root: &Path, rel: &str, start: u32, end: u32) -> Option<String> {

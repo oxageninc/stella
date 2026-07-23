@@ -16,7 +16,9 @@
 use std::collections::{HashMap, HashSet};
 
 use contextgraph_types::frame::FrameEmbedding;
-use contextgraph_types::{ContextFrame, ContextQuery, ContextQueryResult, Provenance};
+use contextgraph_types::{
+    ContextFrame, ContextQuery, ContextQueryResult, Provenance, Representation,
+};
 
 use crate::error::ContextError;
 use crate::store::{
@@ -356,10 +358,24 @@ pub(crate) fn frame_from_node(
         id: node.public_id.clone(),
         kind: node.kind.to_frame_kind(),
         title: node.display_name.clone(),
-        content: node.content.clone(),
+        content: Some(node.content.clone()),
         uri: node.uri.clone(),
         score: score.clamp(0.0, 1.0),
-        token_cost: estimate_tokens(&node.content) + estimate_tokens(&node.display_name),
+        // §B3: the declared inline cost must equal the protocol's canonical
+        // count (`budget_tokens` = ceil(bytes/4)) over the content field, with
+        // no tolerance — the title is NOT part of the inline content, so it is
+        // not counted here. `pack_to_budget` packs against this same value.
+        token_cost: contextgraph_types::budget_tokens(&node.content),
+        content_digest: None,
+        representation: Representation::Full,
+        content_fidelity: None,
+        canonical_content_hash: None,
+        content_ref: None,
+        transform: None,
+        minimum_content_fidelity: None,
+        inline_content_requirement: None,
+        canonical_token_cost: None,
+        tokenizer_ref: None,
         valid_from: None,
         valid_to: None,
         recorded_at: Some(node.recorded_at.clone()),
@@ -381,12 +397,6 @@ pub fn is_lexical_fallback(frame: &ContextFrame) -> bool {
         .provenance
         .iter()
         .any(|p| p.method.as_deref() == Some(LEXICAL_FALLBACK_METHOD))
-}
-
-/// A rough token estimate (~4 chars/token). Honest enough for budgeting; a
-/// real tokenizer is a follow-up but would not change the packing invariants.
-pub(crate) fn estimate_tokens(text: &str) -> u32 {
-    (text.chars().count() as u32).div_ceil(4)
 }
 
 /// Cosine similarity, guarding zero-norm vectors (defined as 0 similarity).
@@ -590,10 +600,20 @@ mod tests {
             id: id.into(),
             kind: FrameKind::Snippet,
             title: id.into(),
-            content: String::new(),
+            content: Some(String::new()),
             uri: None,
             score: 0.5,
             token_cost,
+            content_digest: None,
+            representation: Representation::Full,
+            content_fidelity: None,
+            canonical_content_hash: None,
+            content_ref: None,
+            transform: None,
+            minimum_content_fidelity: None,
+            inline_content_requirement: None,
+            canonical_token_cost: None,
+            tokenizer_ref: None,
             valid_from: None,
             valid_to: None,
             recorded_at: None,
@@ -760,6 +780,7 @@ mod tests {
             max_frames: 10,
             max_tokens: 4000,
             as_of: None,
+            representation_preferences: vec![],
         }
     }
 
@@ -821,7 +842,12 @@ mod tests {
             !result.used_lexical_fallback,
             "strong coverage → real grounding, not fallback"
         );
-        assert!(result.frames.iter().any(|f| f.content.contains("sqlite")));
+        assert!(
+            result
+                .frames
+                .iter()
+                .any(|f| f.content.as_deref().unwrap_or("").contains("sqlite"))
+        );
         // Every frame is humanly citable (`L-C4`).
         assert!(result.frames.iter().all(|f| {
             f.citation_label
@@ -829,6 +855,31 @@ mod tests {
                 .map(|l| !l.is_empty())
                 .unwrap_or(false)
         }));
+    }
+
+    #[tokio::test]
+    async fn recalled_frames_declare_honest_token_cost() {
+        // §B3: a full frame's `token_cost` MUST equal `budget_tokens` over its
+        // inline content — exact, no tolerance. This drives the real `recall`
+        // builder with a query that provably surfaces a frame (same shape as
+        // `recall_returns_cited_budget_respecting_frames`), so the check has a
+        // non-empty result to bite on rather than passing vacuously.
+        let (_dir, store) = seeded().await;
+        let q = base_query(
+            "open the database",
+            "open the sqlite connection in wal mode with foreign keys on",
+        );
+        let result = store.recall(&q).await.unwrap();
+        assert!(!result.frames.is_empty(), "the query must surface a frame");
+        for frame in &result.frames {
+            assert!(
+                frame.declares_honest_token_cost(),
+                "frame {:?} declares token_cost {} but its content is worth {} budget tokens (§B3)",
+                frame.id,
+                frame.token_cost,
+                frame.expected_inline_token_cost(),
+            );
+        }
     }
 
     #[tokio::test]
