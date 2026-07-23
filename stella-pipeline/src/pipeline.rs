@@ -123,8 +123,7 @@ const DEFAULT_SYSTEM_PROMPT: &str =
 /// The system prompt for the conversational fast path. Swapped in for
 /// [`DEFAULT_SYSTEM_PROMPT`] when triage classified the input as chat so the
 /// reply reads as a normal, brief conversational turn rather than a work plan.
-const CONVERSATIONAL_SYSTEM_PROMPT: &str =
-    "You are Stella, a careful software engineering agent. The user's latest \
+const CONVERSATIONAL_SYSTEM_PROMPT: &str = "You are Stella, a careful software engineering agent. The user's latest \
      message is a greeting, small talk, or a question about you — not a coding \
      task. Reply briefly and warmly in plain prose: no tools, no code, no plan, \
      no test. Do not invent a task. If it fits, add one short line inviting \
@@ -824,7 +823,10 @@ impl<'a> Pipeline<'a> {
         let resolved = match self.resolve_provider(Role::Worker) {
             Ok(r) => r,
             Err(error) => {
-                return Err(PipelineRunError::new(error.into_pipeline_error(), *total_cost));
+                return Err(PipelineRunError::new(
+                    error.into_pipeline_error(),
+                    *total_cost,
+                ));
             }
         };
         if let Some(fb) = &resolved.fallback {

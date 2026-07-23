@@ -195,8 +195,8 @@ pub fn classify_conversational(text: &str) -> bool {
             "chat" | "greeting" | "smalltalk" | "small_talk" => return true,
             // Any real class token appearing first overrules a later "chat".
             "lookup" | "simple" | "simple_lookup" | "read" | "explain" | "single"
-            | "single_task" | "task" | "fix" | "multi" | "multi_step" | "multistep"
-            | "complex" | "plan" => return false,
+            | "single_task" | "task" | "fix" | "multi" | "multi_step" | "multistep" | "complex"
+            | "plan" => return false,
             _ => {}
         }
     }

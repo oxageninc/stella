@@ -884,7 +884,10 @@ async fn a_greeting_takes_the_conversational_path_and_skips_all_work() {
         StageKind::Verify,
         StageKind::Judge,
     ] {
-        assert!(!s.contains(&forbidden), "{forbidden:?} must not run for chat");
+        assert!(
+            !s.contains(&forbidden),
+            "{forbidden:?} must not run for chat"
+        );
     }
     // The reply reached the user as streamed text.
     assert!(
