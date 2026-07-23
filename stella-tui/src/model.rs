@@ -589,6 +589,12 @@ impl SessionModel {
             // A discarded speculation pool (#415) is store/telemetry
             // bookkeeping; no user-visible panel state depends on it.
             AgentEvent::SpeculationDiscarded { .. } => {}
+            // Typed decision events (receipts spec §6.3/§6.4): parseable
+            // twins of prose already folded above — no extra panel state.
+            AgentEvent::LoopDetected { .. }
+            | AgentEvent::BudgetDenied { .. }
+            | AgentEvent::RetriesExhausted { .. }
+            | AgentEvent::PolicyDecision { .. } => {}
             AgentEvent::Error { message, retryable } => {
                 self.pending_scope_review = None;
                 self.pending_ask_user = None;
@@ -616,6 +622,12 @@ impl SessionModel {
             // Internal accounting for read-only speculation that never
             // committed — no visible model state to update.
             AgentEvent::SpeculationDiscarded { .. } => {}
+            // Typed decision twins (receipts spec §6.3/§6.4) — the prose
+            // events they mirror already updated the visible state.
+            AgentEvent::LoopDetected { .. }
+            | AgentEvent::BudgetDenied { .. }
+            | AgentEvent::RetriesExhausted { .. }
+            | AgentEvent::PolicyDecision { .. } => {}
         }
         self.evict_transcript_overflow();
     }
