@@ -752,6 +752,7 @@ impl<'a> Engine<'a> {
     /// normal path and the budget-abort path: a paid summary is applied even
     /// when the turn is about to abort, since it only shrinks the context the
     /// resumed session reloads.
+    #[allow(clippy::too_many_arguments)]
     fn apply_overflow_summary(
         &self,
         messages: &mut Vec<CompletionMessage>,
