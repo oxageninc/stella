@@ -66,7 +66,7 @@ frozen." Verified on `fa2ec5b`:
 |---|---|
 | Usage emitted per paid call; abort-spend retained | Focused tests green: `stella-store` usage_completeness 5/5, `stella-cli` usage_completeness 3/3, `stella-pipeline` usage 8/8 — incl. `triage_success_emits_usage_before_budget_abort` and `aborted_pipeline_totals_match_every_management_and_execute_usage_record` |
 | Fail-closed accounting | `AgentEvent::UsageIncomplete`; store migration v8→v9 "fail-closed paid-call accounting" (`usage_complete` column) |
-| Reflection opt-out | `STELLA_DISABLE_REFLECTION` present (`stella-cli/src/agent/output.rs`, `agent.rs`, `agent/goal.rs`) |
+| Reflection suppression | Behavior-verified at the gate: `agent::tests::explicit_reflection_opt_out_suppresses_every_one_shot_format` sets `STELLA_DISABLE_REFLECTION` and asserts `one_shot_reflection_enabled()` is `false` for Text/Json/StreamJson (2/2 green, incl. truthy-value parsing). End-to-end "zero post-answer model call" is first confirmed behaviorally by the paid readiness sentinel — this offline gate proves the decision, not the full round trip. |
 | Linux binary rebuilt & frozen | See §1 (SHA `9069b990…`) |
 
 ---
@@ -181,5 +181,5 @@ authorization.
 
 ## 7. Artifact index
 
-- Frozen binary: `target/x86_64-unknown-linux-gnu/release/stella` — sha256 `9069b990…` (rebuild via `bench/harbor_adapter/README.md#install`; provenance guard relaxed from `==origin/main tip` to *ancestor-of-public-ref* because we pin a specific historical-but-public release commit, not the moving tip).
+- Frozen binary: `target/x86_64-unknown-linux-gnu/release/stella` — sha256 `9069b990…` (host-specific reference, see §1 note). This preparation build relaxed the `#install` provenance guard from `==origin/main tip` to *ancestor-of-public-ref* so it could target the specific already-public release commit `fa2ec5b` rather than the moving tip. **The maintainer's actual paid claim build must use the stock, unmodified `#install` procedure (the `==@{upstream}` guard) against the final preregistration commit** — which will be the `origin/main` tip at that point, so the stock guard passes unchanged. Do not copy the relaxed guard into the paid run.
 - Reconciled: `bench/terminal-bench-2.1-protocol.md`, `bench/terminal_bench_analysis/README.md`, `bench/harbor_adapter/tests/test_adapter.py`.
