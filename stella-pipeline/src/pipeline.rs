@@ -763,8 +763,15 @@ impl<'a> Pipeline<'a> {
             Ok(r) => r,
             // Triage resolution failure is soft: fall through to the full path
             // via the deterministic floor. Never fail the run on triage.
+            // The conversational route is still resolved deterministically here
+            // (`resolve_conversational(false, goal)`) — a bare greeting must
+            // route to chat even when the triage provider can't be resolved,
+            // since it never depends on a model answer.
             Err(_) => {
-                return Ok(TaskAssessment::from_class(resolve_task_class(None, goal)));
+                return Ok(TaskAssessment {
+                    conversational: resolve_conversational(false, goal),
+                    ..TaskAssessment::from_class(resolve_task_class(None, goal))
+                });
             }
         };
         if let Some(fb) = &resolved.fallback {
@@ -793,16 +800,23 @@ impl<'a> Pipeline<'a> {
         // The class still goes through `resolve_task_class` so a failed or
         // unparseable triage lands on the deterministic floor exactly as
         // before; a real assessment keeps its own assurance flags.
+        // Resolve the conversational route once, up front: it must hold even
+        // when the triage model call failed/was unparseable (the `None` arm),
+        // because a bare greeting is deterministic and should never depend on a
+        // model answer. `resolve_conversational` also applies the floor veto to
+        // an over-eager model `chat` — a goal with real task signal is work.
+        let model_says_chat = assessment.map(|a| a.conversational).unwrap_or(false);
+        let conversational = resolve_conversational(model_says_chat, goal);
         Ok(match assessment {
             Some(assessment) => TaskAssessment {
                 class: resolve_task_class(Some(assessment.class), goal),
-                // The deterministic floor may VETO a `chat` classification: a
-                // goal carrying real task signal is work no matter what the
-                // cheap triage model guessed (never swallow a task as chat).
-                conversational: resolve_conversational(assessment.conversational, goal),
+                conversational,
                 ..assessment
             },
-            None => TaskAssessment::from_class(resolve_task_class(None, goal)),
+            None => TaskAssessment {
+                conversational,
+                ..TaskAssessment::from_class(resolve_task_class(None, goal))
+            },
         })
     }
 
